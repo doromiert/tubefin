@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.doromiert.TubeFin</id>
+  <name>TubeFin</name>
+  <summary>Watch YouTube and your Jellyfin library</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      TubeFin is a focused, native GNOME client that brings YouTube search and
+      a personal Jellyfin media library into one adaptive libadwaita interface.
+    </p>
+    <p>
+      Search YouTube without an API key, connect to a Jellyfin server, browse
+      libraries, and play compatible media with GStreamer.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.doromiert.TubeFin.desktop</launchable>
+  <url type="homepage">https://github.com/doromiert/tubefin</url>
+  <url type="bugtracker">https://github.com/doromiert/tubefin/issues</url>
+  <developer id="io.github.doromiert">
+    <name>TubeFin contributors</name>
+  </developer>
+  <releases>
+    <release version="0.1.0" date="2026-08-14">
+      <description>
+        <p>Initial preview with YouTube search, Jellyfin browsing, and native playback.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>

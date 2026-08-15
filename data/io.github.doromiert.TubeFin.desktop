@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=TubeFin
+Comment=Watch YouTube and your Jellyfin library
+Exec=tubefin
+Icon=io.github.doromiert.TubeFin
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Player;GTK;
+Keywords=YouTube;Jellyfin;Video;Media;Streaming;
+StartupNotify=true
+DBusActivatable=true
