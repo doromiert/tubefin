@@ -87,15 +87,6 @@ class ConfigStore:
             buffer_seconds = max(5, min(300, int(player.get("buffer_seconds", 20))))
         except (TypeError, ValueError):
             buffer_seconds = 20
-        try:
-            saved_prefetch = max(
-                0, min(1024, int(player.get("home_prefetch_mib", 160)))
-            )
-            home_prefetch_mib = (
-                max(32, saved_prefetch) if saved_prefetch else 0
-            )
-        except (TypeError, ValueError):
-            home_prefetch_mib = 160
         saved_categories = player.get("sponsorblock_categories")
         category_behaviors = dict(SPONSORBLOCK_DEFAULTS)
         if isinstance(saved_categories, dict):
@@ -105,7 +96,6 @@ class ConfigStore:
                     category_behaviors[category] = behavior
         return {
             "buffer_seconds": buffer_seconds,
-            "home_prefetch_mib": home_prefetch_mib,
             "default_caption_language": str(
                 player.get("default_caption_language") or ""
             ).strip(),
@@ -120,7 +110,6 @@ class ConfigStore:
         self,
         *,
         buffer_seconds: int | None = None,
-        home_prefetch_mib: int | None = None,
         default_caption_language: str | None = None,
         preferred_audio_language: str | None = None,
         sponsorblock_enabled: bool | None = None,
@@ -133,11 +122,6 @@ class ConfigStore:
             payload["player"] = player
         if buffer_seconds is not None:
             player["buffer_seconds"] = max(5, min(300, buffer_seconds))
-        if home_prefetch_mib is not None:
-            normalized = max(0, min(1024, home_prefetch_mib))
-            player["home_prefetch_mib"] = (
-                max(32, normalized) if normalized else 0
-            )
         if default_caption_language is not None:
             player["default_caption_language"] = default_caption_language.strip()
         if preferred_audio_language is not None:

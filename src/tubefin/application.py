@@ -4,9 +4,9 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
@@ -53,6 +53,7 @@ from tubefin.models import (  # noqa: E402
 from tubefin.mpris import MprisService  # noqa: E402
 from tubefin.mpv_player import MpvPlayer  # noqa: E402
 from tubefin.oauth import COMMENT_SCOPE, MANAGE_SCOPE, OAuthClient  # noqa: E402
+from tubefin.played_cache import PlayedVideoCache  # noqa: E402
 from tubefin.services import (  # noqa: E402
     JellyfinService,
     SeerrService,
@@ -94,6 +95,17 @@ HOME_SECTION_TITLES = {
     "recommendations": "Recommended · YouTube",
     "watched_channels": "From Channels You Watched · Ranked locally",
 }
+
+
+@dataclass
+class PlaybackLoadTrace:
+    request_id: int
+    title: str
+    source: str
+    started_at: float
+    marks: dict[str, float] = field(default_factory=dict)
+    notes: dict[str, str] = field(default_factory=dict)
+    error: str = ""
 
 
 class VideoAspectFrame(Gtk.AspectFrame):
@@ -325,16 +337,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         }
         self.subscriptions = SubscriptionStore()
         self.prebuffer = PrebufferManager()
-        self.home_prefetch_mib = int(
-            self.player_settings["home_prefetch_mib"]
-        )
-        self.home_prebuffer = PrebufferManager(
-            concurrency=3,
-            capacity=28,
-            seconds=5,
-            memory_budget_bytes=self.home_prefetch_mib << 20,
-        )
-        self.home_prefetch_source = 0
+        self.played_cache = PlayedVideoCache()
+        self.played_cache_source: tuple[str, ResolvedStream] | None = None
+        self.played_cache_buffered: PrebufferedStream | None = None
+        self.played_cache_active: PrebufferedStream | None = None
+        self.played_cache_request_item_id = ""
         self.oauth = OAuthClient(str(oauth_settings["client_id"]))
         self.oauth_accounts: list[OAuthAccount] = list(oauth_settings["accounts"])  # type: ignore[arg-type]
         self.active_oauth_account = next(
@@ -410,6 +417,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.resolved_stream_inflight: dict[str, threading.Event] = {}
         self.resolved_stream_lock = threading.Lock()
         self.playback_request = 0
+        self.playback_load_traces: list[PlaybackLoadTrace] = []
+        self.playback_load_trace_lock = threading.Lock()
+        self.playback_load_window: Adw.Window | None = None
+        self.playback_load_summary: Gtk.Label | None = None
+        self.playback_load_list: Gtk.ListBox | None = None
+        self.playback_load_refresh_source = 0
         self.expected_page = "home"
         self.player_expanded = False
         self.player_navigation_guard_until = 0.0
@@ -420,8 +433,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.queue_loop = False
         self.comment_cursor: str | None = None
         self.comments_loading = False
-        self.prefetched_comments_item_id = ""
-        self.prefetched_comments_future: Future[Any] | None = None
         self.subscription_updates_loading = False
         self.channel_page = 1
         self.channel_loading = False
@@ -716,9 +727,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.home_scroller = scroller
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.get_vadjustment().connect("value-changed", self._home_scroll_changed)
-        scroller.connect("map", lambda *_: self._schedule_home_prefetch())
-        scroller.connect("notify::width", lambda *_: self._schedule_home_prefetch())
-        scroller.connect("notify::height", lambda *_: self._schedule_home_prefetch())
         clamp = Adw.Clamp(maximum_size=2400, tightening_threshold=1600)
         clamp.set_margin_top(18)
         clamp.set_margin_bottom(36)
@@ -2969,7 +2977,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _set_home_section(self, key: str, shelf: SectionShelf) -> None:
         self.home_section_widgets[key] = shelf
         self._rebuild_home_sections()
-        self._schedule_home_prefetch()
 
     def _rebuild_home_sections(self) -> None:
         self._clear_box(self.home_sections)
@@ -2981,7 +2988,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.home_sections.append(shelf)
 
     def _load_home_sections(self, *, refresh_channel_feeds: bool = False) -> None:
-        self.home_prebuffer.clear()
         self._clear_box(self.home_sections)
         self.home_section_widgets = {}
         self.recommendation_generation += 1
@@ -3163,116 +3169,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return videos
 
     def _home_scroll_changed(self, adjustment: Gtk.Adjustment) -> None:
-        self._schedule_home_prefetch()
         if (
             adjustment.get_value() + adjustment.get_page_size()
             >= adjustment.get_upper() - 1400
         ):
             self._load_more_recommendations()
-
-    def _schedule_home_prefetch(self) -> None:
-        if self.home_prefetch_source:
-            GLib.source_remove(self.home_prefetch_source)
-        self.home_prefetch_source = GLib.timeout_add(
-            180, self._refresh_home_prefetch
-        )
-
-    @staticmethod
-    def _widget_position_within(
-        widget: Gtk.Widget, ancestor: Gtk.Widget
-    ) -> tuple[int, int] | None:
-        x = 0
-        y = 0
-        current: Gtk.Widget | None = widget
-        while current is not None and current is not ancestor:
-            allocation = current.get_allocation()
-            x += allocation.x
-            y += allocation.y
-            current = current.get_parent()
-        return (x, y) if current is ancestor else None
-
-    def _refresh_home_prefetch(self) -> bool:
-        self.home_prefetch_source = 0
-        if (
-            self.home_prefetch_mib <= 0
-            or self._visible_page_name() != "home"
-        ):
-            return GLib.SOURCE_REMOVE
-        root = self.home_scroller.get_child()
-        if not root:
-            return GLib.SOURCE_REMOVE
-        adjustment = self.home_scroller.get_vadjustment()
-        viewport_top = adjustment.get_value()
-        viewport_bottom = viewport_top + adjustment.get_page_size()
-        positioned: list[tuple[float, int, float, MediaItem]] = []
-        keys = list(self.home_section_order)
-        keys.extend(
-            key for key in self.home_section_widgets if key not in keys
-        )
-        for key in keys:
-            shelf = self.home_section_widgets.get(key)
-            if not shelf:
-                continue
-            for card in shelf.cards():
-                item = card.item
-                if (
-                    not card.get_mapped()
-                    or not item.playable
-                    or item.source != "youtube"
-                ):
-                    continue
-                position = self._widget_position_within(card, root)
-                if position is None:
-                    continue
-                x, y = position
-                height = max(1, card.get_height())
-                positioned.append((float(y), x, float(y + height), item))
-        positioned.sort(key=lambda value: (value[0], value[1]))
-        visible = [
-            value
-            for value in positioned
-            if value[2] >= viewport_top and value[0] <= viewport_bottom
-        ]
-        below = [value for value in positioned if value[0] > viewport_bottom]
-        above = [value for value in positioned if value[2] < viewport_top]
-        above.reverse()
-        selected: list[MediaItem] = []
-        selected_keys: set[str] = set()
-
-        def add(values: list[tuple[float, int, float, MediaItem]], limit: int) -> None:
-            for _top, _x, _bottom, item in values:
-                key = self.home_prebuffer.key(item)
-                if key in selected_keys:
-                    continue
-                selected_keys.add(key)
-                selected.append(item)
-                if len(selected) >= limit:
-                    return
-
-        add(visible, 20)
-        if len(selected) < 20:
-            add(below, 20)
-        if len(selected) < 20:
-            add(above, 20)
-        add(below, 28)
-        if len(selected) < 28:
-            add(above, 28)
-        self.home_prebuffer.reconcile(
-            selected,
-            self._resolve_home_prefetch_item,
-            self._resolve_home_prefetch_comments,
-        )
-        return GLib.SOURCE_REMOVE
-
-    def _resolve_home_prefetch_item(self, item: MediaItem) -> ResolvedStream:
-        if item.source != "youtube":
-            raise ValueError("Home prefetch only supports YouTube videos")
-        return self.youtube.resolve(item)
-
-    def _resolve_home_prefetch_comments(self, item: MediaItem) -> CommentPage:
-        if item.source != "youtube":
-            raise ValueError("Home prefetch only supports YouTube videos")
-        return self.youtube.comments(item)
 
     def _load_more_recommendations(self) -> None:
         if (
@@ -3339,7 +3240,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 on_share=self._share_item,
             )
             self._set_home_section("recommendations", self.recommendation_shelf)
-        self._schedule_home_prefetch()
         return GLib.SOURCE_REMOVE
 
     def _recommendations_error(self, generation: int, error: Exception) -> bool:
@@ -5558,20 +5458,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.comments_loading_row.set_visible(True)
         self.comments_spinner.start()
-        prefetched = None
-        if (
-            self.comment_cursor is None
-            and self.prefetched_comments_item_id == item.id
-        ):
-            prefetched = self.prefetched_comments_future
-            self.prefetched_comments_item_id = ""
-            self.prefetched_comments_future = None
         run_async(
-            (
-                lambda: prefetched.result()
-                if prefetched is not None
-                else self.youtube.comments(item, cursor=self.comment_cursor)
-            ),
+            lambda: self.youtube.comments(item, cursor=self.comment_cursor),
             lambda page: self._comments_loaded_for(item.id, page),
             self._comments_error,
         )
@@ -6425,21 +6313,292 @@ class TubeFinWindow(Adw.ApplicationWindow):
             in {"music", "audiobooks"}
         )
 
+    def _new_playback_load_trace(
+        self, item: MediaItem, request_id: int
+    ) -> PlaybackLoadTrace:
+        started_at = time.monotonic()
+        trace = PlaybackLoadTrace(
+            request_id=request_id,
+            title=item.title,
+            source=item.source,
+            started_at=started_at,
+            marks={"selected": started_at},
+        )
+        with self.playback_load_trace_lock:
+            self.playback_load_traces.append(trace)
+            del self.playback_load_traces[:-20]
+        return trace
+
+    def _cancel_pending_playback_load_trace(self, request_id: int) -> None:
+        with self.playback_load_trace_lock:
+            trace = next(
+                (
+                    value
+                    for value in reversed(self.playback_load_traces)
+                    if value.request_id == request_id
+                ),
+                None,
+            )
+            if trace and not any(
+                mark in trace.marks
+                for mark in ("first_playback", "failed", "cancelled")
+            ):
+                trace.marks["cancelled"] = time.monotonic()
+
+    def _mark_playback_load(
+        self,
+        request_id: int,
+        mark: str | None = None,
+        *,
+        error: object | None = None,
+        only_once: bool = False,
+        after: str | None = None,
+        **notes: object,
+    ) -> None:
+        with self.playback_load_trace_lock:
+            trace = next(
+                (
+                    value
+                    for value in reversed(self.playback_load_traces)
+                    if value.request_id == request_id
+                ),
+                None,
+            )
+            if trace is None:
+                return
+            if after and after not in trace.marks:
+                return
+            if mark and (not only_once or mark not in trace.marks):
+                trace.marks[mark] = time.monotonic()
+            trace.notes.update(
+                {name: str(value) for name, value in notes.items() if value is not None}
+            )
+            if error is not None:
+                trace.error = str(error)
+        if self.playback_load_window:
+            GLib.idle_add(self._refresh_playback_load_window_once)
+
+    @staticmethod
+    def _load_duration_label(seconds: float) -> str:
+        if seconds < 0.001:
+            return "<1 ms"
+        if seconds < 1:
+            return f"{seconds * 1000:.0f} ms"
+        return f"{seconds:.2f} s"
+
+    @staticmethod
+    def _byte_size_label(size: int) -> str:
+        if size < 1 << 10:
+            return f"{size} B"
+        if size < 1 << 20:
+            return f"{size / (1 << 10):.0f} KiB"
+        return f"{size / (1 << 20):.1f} MiB"
+
+    @staticmethod
+    def _playback_load_segments(
+        trace: PlaybackLoadTrace,
+    ) -> list[tuple[str, str, float | None]]:
+        marks = trace.marks
+        definitions = (
+            ("Player UI setup", "selected", "details_cache_start"),
+            ("Played-details disk cache", "details_cache_start", "details_cache_end"),
+            ("Queue prebuffer wait", "queue_wait_start", "worker_ready"),
+            ("Background worker dispatch", "worker_queued", "worker_started"),
+            ("Stream resolver", "resolver_start", "resolver_end"),
+            ("Played-video disk cache", "played_cache_start", "played_cache_end"),
+            ("Legacy cache validation", "legacy_cache_start", "legacy_cache_end"),
+            ("Worker → GTK handoff", "worker_done", "worker_ready"),
+            ("Cached-prefix proxy", "proxy_start", "proxy_end"),
+            ("mpv file open / first byte", "mpv_load", "file_loaded"),
+            ("file loaded → playback", "file_loaded", "first_playback"),
+        )
+        segments: list[tuple[str, str, float | None]] = []
+        for label, start_name, end_name in definitions:
+            start = marks.get(start_name)
+            end = marks.get(end_name)
+            if start is None:
+                continue
+            if end is None:
+                state = (
+                    "cancelled"
+                    if "cancelled" in marks
+                    else "failed"
+                    if "failed" in marks
+                    else "running…"
+                )
+                segments.append((label, state, None))
+            else:
+                duration = max(0.0, end - start)
+                segments.append((label, TubeFinWindow._load_duration_label(duration), duration))
+        return segments
+
+    def _show_playback_load_window(self) -> None:
+        if self.playback_load_window:
+            self.playback_load_window.present()
+            return
+        window = Adw.Window(
+            transient_for=self,
+            modal=False,
+            title="Video load diagnostics",
+        )
+        window.set_default_size(760, 620)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(
+                title="Video load diagnostics",
+                subtitle="Resolver, cache, proxy, and mpv timing",
+            )
+        )
+        toolbar.add_top_bar(header)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+        summary = Gtk.Label(xalign=0, wrap=True)
+        summary.add_css_class("dim-label")
+        content.append(summary)
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        trace_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        trace_list.add_css_class("boxed-list")
+        scroller.set_child(trace_list)
+        content.append(scroller)
+        toolbar.set_content(content)
+        window.set_content(toolbar)
+        self.playback_load_window = window
+        self.playback_load_summary = summary
+        self.playback_load_list = trace_list
+        window.connect("close-request", self._playback_load_window_closed)
+        self.playback_load_refresh_source = GLib.timeout_add(
+            500, self._refresh_playback_load_window
+        )
+        self._refresh_playback_load_window()
+        window.present()
+
+    def _playback_load_window_closed(self, *_args: object) -> bool:
+        if self.playback_load_refresh_source:
+            GLib.source_remove(self.playback_load_refresh_source)
+            self.playback_load_refresh_source = 0
+        self.playback_load_window = None
+        self.playback_load_summary = None
+        self.playback_load_list = None
+        return False
+
+    def _refresh_playback_load_window_once(self) -> bool:
+        self._refresh_playback_load_window()
+        return GLib.SOURCE_REMOVE
+
+    def _refresh_playback_load_window(self) -> bool:
+        if not self.playback_load_window or not self.playback_load_list:
+            return GLib.SOURCE_REMOVE
+        with self.playback_load_trace_lock:
+            traces = [
+                PlaybackLoadTrace(
+                    request_id=trace.request_id,
+                    title=trace.title,
+                    source=trace.source,
+                    started_at=trace.started_at,
+                    marks=dict(trace.marks),
+                    notes=dict(trace.notes),
+                    error=trace.error,
+                )
+                for trace in self.playback_load_traces
+            ]
+        self._clear_box(self.playback_load_list)
+        now = time.monotonic()
+        if self.playback_load_summary:
+            self.playback_load_summary.set_label(
+                "Start a video to capture a trace. The slowest completed stage is "
+                "called out automatically."
+                if not traces
+                else (
+                    f"{len(traces)} recent load attempt"
+                    f"{'s' if len(traces) != 1 else ''} · newest first"
+                )
+            )
+        for trace in reversed(traces):
+            marks = trace.marks
+            segments = self._playback_load_segments(trace)
+            completed = [segment for segment in segments if segment[2] is not None]
+            slowest = max(completed, key=lambda segment: segment[2] or 0, default=None)
+            finished = (
+                marks.get("first_playback")
+                or marks.get("failed")
+                or marks.get("cancelled")
+            )
+            elapsed = max(0.0, (finished or now) - trace.started_at)
+            status = (
+                f"Failed · {trace.error}"
+                if trace.error
+                else "Playing"
+                if "first_playback" in marks
+                else "Cancelled"
+                if "cancelled" in marks
+                else "mpv opened the file"
+                if "file_loaded" in marks
+                else "Loading"
+            )
+            route = trace.notes.get("route", "Preparing route")
+            heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            heading.set_margin_top(10)
+            heading.set_margin_bottom(10)
+            heading.set_margin_start(12)
+            heading.set_margin_end(12)
+            labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+            title = Gtk.Label(label=trace.title, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            title.add_css_class("heading")
+            labels.append(title)
+            elapsed_label = self._load_duration_label(elapsed)
+            meta = Gtk.Label(
+                label=(
+                    f"{trace.source.capitalize()} · {route} · {status} · "
+                    f"time to playback {elapsed_label}"
+                ),
+                xalign=0,
+                wrap=True,
+            )
+            meta.add_css_class("dim-label")
+            labels.append(meta)
+            details: list[str] = []
+            running = next(
+                (segment for segment in reversed(segments) if segment[1] == "running…"),
+                None,
+            )
+            if running:
+                details.append(f"Currently waiting on: {running[0]}")
+            if slowest:
+                details.append(f"Slowest: {slowest[0]} ({slowest[1]})")
+            details.extend(f"{label}: {value}" for label, value, _duration in segments)
+            note_labels = {
+                "details_cache": "Details cache",
+                "resolver": "Resolver result",
+                "resolver_refresh": "Resolver refresh",
+                "played_cache": "Played cache",
+                "prefix": "Cached prefix",
+                "stream_label": "Stream",
+                "queue_prebuffer": "Queue prebuffer",
+            }
+            details.extend(
+                f"{label}: {trace.notes[name]}"
+                for name, label in note_labels.items()
+                if name in trace.notes
+            )
+            timing = Gtk.Label(label="\n".join(details), xalign=0, wrap=True)
+            timing.set_selectable(False)
+            labels.append(timing)
+            heading.append(labels)
+            row = Gtk.ListBoxRow(child=heading, selectable=False, activatable=False)
+            self.playback_load_list.append(row)
+        return GLib.SOURCE_CONTINUE
+
     def _begin_playback(self, item: MediaItem, reveal_player: bool = True) -> None:
+        self._cancel_pending_playback_load_trace(self.playback_request)
         self.playback_request += 1
         request_id = self.playback_request
+        self._new_playback_load_trace(item, request_id)
         self._detach_playback()
-        if self.prefetched_comments_future is not None:
-            self.home_prebuffer.release_sidecar(
-                self.prefetched_comments_future
-            )
-        self.prefetched_comments_item_id = ""
-        self.prefetched_comments_future = None
-        if item.source == "youtube":
-            comments_future = self.home_prebuffer.take_sidecar(item)
-            if comments_future is not None:
-                self.prefetched_comments_item_id = item.id
-                self.prefetched_comments_future = comments_future
         # Update this before resolving. Navigation must never consult the item
         # from the stream we just retired while a new selection is loading.
         self.current_item = item
@@ -6518,6 +6677,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_title.set_label(item.title)
         self.player_subtitle.set_label(item.subtitle)
         self._set_player_description(item)
+        self._mark_playback_load(request_id, "details_cache_start")
+        cached_details = self.played_cache.details(item)
+        self._mark_playback_load(
+            request_id,
+            "details_cache_end",
+            details_cache="hit" if cached_details is not None else "miss",
+        )
+        if cached_details is not None:
+            description, published_date, _chapters = cached_details
+            self._set_player_description(item, description, published_date)
         if reveal_player:
             self.player_navigation_guard_until = time.monotonic() + 0.75
             self._set_visible_page("player")
@@ -6532,14 +6701,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
         local_stream = self._local_download_stream(item)
         if local_stream:
+            self._mark_playback_load(request_id, route="Local download")
             self._start_playback(item, local_stream, request_id)
             return
-        prefetch_manager = self.home_prebuffer
+        prefetch_manager = self.prebuffer
         prefetched = prefetch_manager.claim(item)
-        if prefetched is None:
-            prefetch_manager = self.prebuffer
-            prefetched = prefetch_manager.claim(item)
         if prefetched is not None:
+            self._mark_playback_load(
+                request_id,
+                "queue_wait_start",
+                route="Queue prebuffer",
+            )
             run_async(
                 prefetched.result,
                 lambda buffered: self._prefetched_stream_ready(
@@ -6553,11 +6725,145 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 ),
             )
             return
+        self._mark_playback_load(request_id, route="Resolve + played cache")
+        self._mark_playback_load(request_id, "worker_queued")
         run_async(
-            lambda: self._resolve_item(item),
-            lambda url: self._start_playback(item, url, request_id),
+            lambda: self._prepare_played_item(item, request_id),
+            lambda prepared: self._played_item_ready(
+                item, prepared, request_id
+            ),
             lambda error: self._playback_error(error, request_id),
         )
+
+    def _prepare_played_item(
+        self, item: MediaItem, request_id: int
+    ) -> tuple[ResolvedStream, PrebufferedStream | None]:
+        self._mark_playback_load(request_id, "worker_started")
+        self._mark_playback_load(request_id, "played_cache_start")
+        cached = self.played_cache.prepare_cached(item)
+        if cached is not None:
+            stream, buffered, needs_refresh = cached
+            if needs_refresh:
+                buffered.defer_upstream()
+            self._mark_playback_load(
+                request_id,
+                "played_cache_end",
+                played_cache=(
+                    "hit; stale URL refreshing behind cached playback"
+                    if needs_refresh
+                    else "hit; resolver bypassed"
+                ),
+                prefix=self._byte_size_label(len(buffered.prefix)),
+                route=(
+                    "Cached prefix + background refresh"
+                    if needs_refresh
+                    else "Played cache fast path"
+                ),
+            )
+            self._mark_playback_load(request_id, "worker_done")
+            return stream, buffered
+        self._mark_playback_load(
+            request_id,
+            "played_cache_end",
+            played_cache="miss or expired stream URL",
+            prefix="none",
+        )
+        self._mark_playback_load(request_id, "resolver_start")
+        stream = self._resolve_item(item, request_id)
+        self._mark_playback_load(request_id, "resolver_end")
+        self._mark_playback_load(request_id, "legacy_cache_start")
+        buffered = self.played_cache.prepare(item, stream)
+        self._mark_playback_load(
+            request_id,
+            "legacy_cache_end",
+            played_cache="legacy hit after resolve" if buffered is not None else "miss",
+            prefix=self._byte_size_label(len(buffered.prefix)) if buffered else "none",
+        )
+        self._mark_playback_load(request_id, "worker_done")
+        return stream, buffered
+
+    def _played_item_ready(
+        self,
+        item: MediaItem,
+        prepared: tuple[ResolvedStream, PrebufferedStream | None],
+        request_id: int,
+    ) -> bool:
+        stream, buffered = prepared
+        self._mark_playback_load(request_id, "worker_ready")
+        if request_id != self.playback_request:
+            if buffered:
+                buffered.close()
+            return GLib.SOURCE_REMOVE
+        if not buffered or not buffered.upstream_is_deferred:
+            self.played_cache_source = (item.id, stream)
+        self.played_cache_buffered = buffered
+        playback_stream = stream
+        if buffered:
+            self.played_cache_active = buffered
+            self._mark_playback_load(request_id, "proxy_start")
+            playback_stream = buffered.playback_stream()
+            self._mark_playback_load(request_id, "proxy_end")
+            if buffered.upstream_is_deferred:
+                run_async(
+                    lambda: self._refresh_cached_playback(
+                        item, buffered, request_id
+                    ),
+                    lambda refreshed: self._cached_playback_refreshed(
+                        item, buffered, refreshed, request_id
+                    ),
+                    lambda error: self._cached_playback_refresh_failed(
+                        buffered, error, request_id
+                    ),
+                )
+        return self._start_playback(item, playback_stream, request_id)
+
+    def _refresh_cached_playback(
+        self,
+        item: MediaItem,
+        buffered: PrebufferedStream,
+        request_id: int,
+    ) -> ResolvedStream:
+        self._mark_playback_load(request_id, "resolver_start")
+        try:
+            stream = self._resolve_item(item, request_id)
+        except Exception:
+            buffered.release_deferred_upstream()
+            self._mark_playback_load(request_id, "resolver_end")
+            raise
+        buffered.replace_upstream(stream)
+        self.played_cache.refresh_stream(item, stream, buffered)
+        self._mark_playback_load(request_id, "resolver_end")
+        return stream
+
+    def _cached_playback_refreshed(
+        self,
+        item: MediaItem,
+        buffered: PrebufferedStream,
+        stream: ResolvedStream,
+        request_id: int,
+    ) -> bool:
+        if request_id != self.playback_request:
+            return GLib.SOURCE_REMOVE
+        self.played_cache_source = (item.id, stream)
+        self.played_cache_buffered = buffered
+        if self.mpv_player:
+            self.mpv_player.set_variants(stream.variants)
+            self.mpv_player.set_audio_tracks(stream.audio_tracks)
+            self.mpv_player.set_chapters(stream.chapters)
+        return GLib.SOURCE_REMOVE
+
+    def _cached_playback_refresh_failed(
+        self,
+        buffered: PrebufferedStream,
+        error: Exception,
+        request_id: int,
+    ) -> bool:
+        buffered.release_deferred_upstream()
+        self._mark_playback_load(
+            request_id,
+            resolver_refresh=f"failed: {error}",
+        )
+        return GLib.SOURCE_REMOVE
 
     def _prefetched_stream_ready(
         self,
@@ -6566,11 +6872,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
         buffered: PrebufferedStream,
         request_id: int,
     ) -> bool:
+        self._mark_playback_load(request_id, "worker_ready")
         if request_id != self.playback_request:
             buffered.close()
             return GLib.SOURCE_REMOVE
+        self.played_cache_source = (item.id, buffered.stream)
+        self.played_cache_buffered = buffered
         try:
+            self._mark_playback_load(request_id, "proxy_start")
             stream = manager.activate(buffered)
+            self._mark_playback_load(
+                request_id,
+                "proxy_end",
+                prefix=self._byte_size_label(len(buffered.prefix)),
+            )
         except Exception as error:
             return self._prefetched_stream_failed(item, error, request_id)
         return self._start_playback(item, stream, request_id)
@@ -6580,9 +6895,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
     ) -> bool:
         if request_id != self.playback_request:
             return GLib.SOURCE_REMOVE
+        self._mark_playback_load(
+            request_id,
+            queue_prebuffer="failed; resolving normally",
+            route="Queue prebuffer fallback",
+        )
+        self._mark_playback_load(request_id, "worker_queued")
         run_async(
-            lambda: self._resolve_item(item),
-            lambda stream: self._start_playback(item, stream, request_id),
+            lambda: self._prepare_played_item(item, request_id),
+            lambda prepared: self._played_item_ready(
+                item, prepared, request_id
+            ),
             lambda error: self._playback_error(error, request_id),
         )
         return GLib.SOURCE_REMOVE
@@ -6652,15 +6975,31 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.player_avatar_picture.set_visible(True)
         return GLib.SOURCE_REMOVE
 
-    def _resolve_item(self, item: MediaItem) -> ResolvedStream:
+    def _resolve_item(
+        self, item: MediaItem, trace_request_id: int | None = None
+    ) -> ResolvedStream:
         local_stream = self._local_download_stream(item)
         if local_stream:
+            if trace_request_id is not None:
+                self._mark_playback_load(
+                    trace_request_id, resolver="local download"
+                )
             return local_stream
         key = f"{item.source}:{item.id}"
+        waited_for_inflight = False
         while True:
             with self.resolved_stream_lock:
                 cached = self.resolved_stream_cache.get(key)
                 if cached and time.monotonic() - cached[0] <= 10 * 60:
+                    if trace_request_id is not None:
+                        self._mark_playback_load(
+                            trace_request_id,
+                            resolver=(
+                                "shared in-flight result"
+                                if waited_for_inflight
+                                else "10-minute memory cache hit"
+                            ),
+                        )
                     return cached[1]
                 if cached:
                     self.resolved_stream_cache.pop(key, None)
@@ -6673,10 +7012,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     owner = False
             if owner:
                 break
+            waited_for_inflight = True
+            if trace_request_id is not None:
+                self._mark_playback_load(
+                    trace_request_id, resolver="waiting for an in-flight resolver"
+                )
             if not event.wait(90):
                 raise TimeoutError("Timed out while preparing the stream.")
 
         try:
+            if trace_request_id is not None:
+                self._mark_playback_load(
+                    trace_request_id, resolver=f"fresh {item.source} request"
+                )
             if item.source == "youtube":
                 stream = self.youtube.resolve(item)
             elif item.source == "jellyfin":
@@ -6762,6 +7110,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         else:
             url = stream
             default_label = "Auto"
+        self._mark_playback_load(
+            request_id,
+            "mpv_load",
+            stream_label=default_label,
+        )
         self.playback_started_at = time.monotonic()
         self.queue_advance_item_id = ""
         self.mini_title.set_label(item.title)
@@ -6804,6 +7157,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _mpv_ready(self) -> None:
+        self._mark_playback_load(
+            self.playback_request,
+            "file_loaded",
+            only_once=True,
+            after="mpv_load",
+        )
         self.player_spinner.stop()
         self.player_status_box.set_visible(False)
         if (
@@ -6829,6 +7188,34 @@ class TubeFinWindow(Adw.ApplicationWindow):
             toast.set_action_name("win.resume-playback")
             self.toast_overlay.add_toast(toast)
             self.resume_offer_shown = True
+
+    def _cache_current_played_video(self) -> None:
+        if not self.current_item or not self.played_cache_source:
+            return
+        item = self.current_item
+        if self.played_cache_request_item_id == item.id:
+            return
+        item_id, stream = self.played_cache_source
+        if (
+            item.id != item_id
+            or item.source not in {"youtube", "jellyfin"}
+            or stream.default_label == "Local download"
+        ):
+            return
+        self.played_cache_request_item_id = item.id
+        buffered = self.played_cache_buffered
+
+        def cache() -> None:
+            if buffered:
+                self.played_cache.cache_buffered(item, buffered)
+            else:
+                self.played_cache.cache_played(item, stream)
+
+        threading.Thread(
+            target=cache,
+            daemon=True,
+            name=f"played-video-cache-{item.id[:12]}",
+        ).start()
 
     @staticmethod
     def _time_label(seconds: float) -> str:
@@ -6921,6 +7308,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._load_jellyfin_current()
 
     def _mpv_error(self, message: str) -> None:
+        self._mark_playback_load(
+            self.playback_request,
+            "failed",
+            error=message,
+            only_once=True,
+            after="mpv_load",
+        )
         self.player_spinner.stop()
         self.player_status.set_label(f"Playback failed: {message}")
         self.player_status_box.set_visible(True)
@@ -7309,6 +7703,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _playback_error(self, error: Exception, request_id: int) -> bool:
         if request_id != self.playback_request:
             return GLib.SOURCE_REMOVE
+        self._mark_playback_load(
+            request_id,
+            "failed",
+            error=error,
+            only_once=True,
+        )
         if self.current_item:
             with self.resolved_stream_lock:
                 self.resolved_stream_cache.pop(
@@ -7522,6 +7922,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._select_page("browse", record=False)
 
     def _stop_playback(self) -> None:
+        self._cancel_pending_playback_load_trace(self.playback_request)
         self.playback_request += 1
         self._detach_playback()
         self.current_item = None
@@ -7537,6 +7938,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.mini_player.set_visible(False)
 
     def _close_mini_player(self) -> None:
+        self._cancel_pending_playback_load_trace(self.playback_request)
         self.playback_request += 1
         self._detach_playback()
         self.current_item = None
@@ -7558,6 +7960,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
             )
         if self.mpv_player:
             self.mpv_player.stop()
+        if self.played_cache_active:
+            self.played_cache_active.close()
+            self.played_cache_active = None
+        self.played_cache_source = None
+        self.played_cache_buffered = None
+        self.played_cache_request_item_id = ""
 
     def _report_jellyfin_playback(
         self,
@@ -7576,11 +7984,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _close_player(self, *_args: object) -> bool:
         self.mpris.close()
-        if self.home_prefetch_source:
-            GLib.source_remove(self.home_prefetch_source)
-            self.home_prefetch_source = 0
         self.prebuffer.close()
-        self.home_prebuffer.close()
         sync_client = self.sync_client
         self.sync_client = None
         jellyfin_sync_client = self.jellyfin_sync_client
@@ -7626,13 +8030,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.navigation_history.append(state)
         self.expected_page = name
         player = name == "player"
-        if name == "home":
-            self._schedule_home_prefetch()
-        elif current == "home":
-            if player:
-                GLib.idle_add(self._clear_home_prefetch)
-            else:
-                self.home_prebuffer.clear()
         self.player_page_active = player
         self.player_expanded = player
         if player:
@@ -7713,10 +8110,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
             name != "player" and bool(self.current_item or self.queue)
         )
 
-    def _clear_home_prefetch(self) -> bool:
-        self.home_prebuffer.clear()
-        return GLib.SOURCE_REMOVE
-
     def _visible_page_name(self) -> str | None:
         if hasattr(self, "player_revealer") and self.player_revealer.get_reveal_child():
             return "player"
@@ -7780,6 +8173,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.last_playback_position = position
         self.last_playback_duration = duration
         self.last_playback_paused = paused
+        if position > 0 and not paused:
+            self._mark_playback_load(
+                self.playback_request,
+                "first_playback",
+                only_once=True,
+                after="file_loaded",
+            )
+            self._cache_current_played_video()
         if (
             self.current_item
             and self.queue
@@ -9073,38 +9474,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         playback.add(audio_language)
 
-        prefetch_row = Adw.ActionRow(
-            title="Home prefetch memory",
-            subtitle=(
-                "RAM cap for comments, metadata, and the first five seconds of "
-                "up to 28 visible or nearby YouTube videos. Set to 0 to disable."
-            ),
-        )
-        prefetch_adjustment = Gtk.Adjustment(
-            value=self.home_prefetch_mib,
-            lower=0,
-            upper=1024,
-            step_increment=32,
-            page_increment=128,
-        )
-        prefetch_value = Gtk.SpinButton(
-            adjustment=prefetch_adjustment,
-            numeric=True,
-            valign=Gtk.Align.CENTER,
-        )
-        prefetch_value.set_width_chars(4)
-        prefetch_value.set_tooltip_text("Home prefetch RAM limit in MiB")
-        prefetch_suffix = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
-        )
-        prefetch_suffix.append(prefetch_value)
-        prefetch_suffix.append(Gtk.Label(label="MiB"))
-        prefetch_row.add_suffix(prefetch_suffix)
-        prefetch_value.connect(
-            "value-changed", self._home_prefetch_memory_changed
-        )
-        playback.add(prefetch_row)
-
         sponsorblock = Adw.SwitchRow(
             title="SponsorBlock",
             subtitle="Choose how each crowd-sourced segment category is handled.",
@@ -9295,27 +9664,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.mpv_player.set_default_audio_language(
                 self.preferred_audio_language
             )
-
-    def _home_prefetch_memory_changed(
-        self, spin: Gtk.SpinButton
-    ) -> None:
-        requested = round(spin.get_value())
-        normalized = (
-            0
-            if requested <= 0
-            else max(32, min(1024, round(requested / 32) * 32))
-        )
-        if requested != normalized:
-            spin.set_value(normalized)
-            return
-        self.home_prefetch_mib = normalized
-        self.config.save_player_settings(
-            home_prefetch_mib=self.home_prefetch_mib
-        )
-        self.home_prebuffer.set_memory_budget(
-            self.home_prefetch_mib << 20
-        )
-        self._schedule_home_prefetch()
 
     def _sponsorblock_changed(
         self, row: Adw.SwitchRow, _property: GObject.ParamSpec
@@ -9657,6 +10005,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         state: Gdk.ModifierType,
     ) -> bool:
         page = self._visible_page_name()
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        if (
+            control
+            and shift
+            and alt
+            and keyval in (Gdk.KEY_d, Gdk.KEY_D)
+        ):
+            self._show_playback_load_window()
+            return True
         if (
             keyval == Gdk.KEY_Escape
             and page == "player"
@@ -9680,8 +10039,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 return False
             focused = focused.get_parent()
 
-        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         if control and keyval in (Gdk.KEY_f, Gdk.KEY_F, Gdk.KEY_l, Gdk.KEY_L):
             self._select_page("browse")
             self.global_search.grab_focus()

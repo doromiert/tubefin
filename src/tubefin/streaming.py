@@ -147,6 +147,7 @@ class PrebufferedStream:
         self.content_type = "application/octet-stream"
         self.total: int | None = None
         self.proxy: StreamProxy | None = None
+        self.upstream_ready: threading.Event | None = None
 
     def warm(
         self, finish_early: Callable[[], bool] | None = None
@@ -225,12 +226,13 @@ class PrebufferedStream:
                                 self.wfile.write(upstream.prefix[start:])
                                 self.wfile.flush()
                                 if upstream.total is None or remainder_start < upstream.total:
-                                    headers = dict(upstream.stream.headers)
+                                    stream = upstream.wait_for_upstream()
+                                    headers = dict(stream.headers)
                                     headers["Range"] = f"bytes={remainder_start}-"
                                     headers["Accept-Encoding"] = "identity"
                                     remainder = urllib.request.urlopen(
                                         urllib.request.Request(
-                                            upstream.stream.url, headers=headers
+                                            stream.url, headers=headers
                                         ),
                                         timeout=30,
                                     )
@@ -249,12 +251,13 @@ class PrebufferedStream:
                                     remainder.close()
 
                     def _forward_range(self, start: int, body: bool) -> None:
-                        headers = dict(upstream.stream.headers)
+                        stream = upstream.wait_for_upstream()
+                        headers = dict(stream.headers)
                         headers["Range"] = f"bytes={start}-"
                         headers["Accept-Encoding"] = "identity"
                         try:
                             response = urllib.request.urlopen(
-                                urllib.request.Request(upstream.stream.url, headers=headers),
+                                urllib.request.Request(stream.url, headers=headers),
                                 timeout=30,
                             )
                         except (OSError, urllib.error.URLError, TimeoutError):
@@ -302,6 +305,27 @@ class PrebufferedStream:
             published_date=self.stream.published_date,
             chapters=self.stream.chapters,
         )
+
+    @property
+    def upstream_is_deferred(self) -> bool:
+        return self.upstream_ready is not None and not self.upstream_ready.is_set()
+
+    def defer_upstream(self) -> None:
+        self.upstream_ready = threading.Event()
+
+    def replace_upstream(self, stream: ResolvedStream) -> None:
+        self.stream = stream
+        if self.upstream_ready:
+            self.upstream_ready.set()
+
+    def release_deferred_upstream(self) -> None:
+        if self.upstream_ready:
+            self.upstream_ready.set()
+
+    def wait_for_upstream(self) -> ResolvedStream:
+        if self.upstream_ready:
+            self.upstream_ready.wait(90)
+        return self.stream
 
     def close(self) -> None:
         if self.proxy:
