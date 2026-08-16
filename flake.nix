@@ -55,6 +55,7 @@
             dependencies = [
               python.pkgs.pygobject3
               pythonMpv
+              python.pkgs.websocket-client
             ];
 
             checkPhase = ''
@@ -84,8 +85,9 @@
 
             preFixup = ''
               gappsWrapperArgs+=(
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp pkgs.ffmpeg pkgs.libsecret ]}
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.mpv pkgs.libglvnd ]}
+                --set-default GSK_RENDERER ngl
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${
                   pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
                     pkgs.gst_all_1.gst-plugins-base
@@ -151,6 +153,7 @@
           python = pkgs.python3.withPackages (ps: [
             ps.pygobject3
             pythonMpv
+            ps.websocket-client
           ]);
         in
         {
@@ -170,12 +173,15 @@
               pkgs.gst_all_1.gst-plugins-ugly
               pkgs.gst_all_1.gst-libav
               pkgs.yt-dlp
+              pkgs.ffmpeg
+              pkgs.libsecret
               pkgs.ruff
             ];
 
             shellHook = ''
               export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"
               export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.mpv pkgs.libglvnd ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+              export GSK_RENDERER=ngl
               export GST_PLUGIN_SYSTEM_PATH_1_0=${
                 pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
                   pkgs.gst_all_1.gst-plugins-base

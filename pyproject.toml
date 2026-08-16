@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
 authors = [{ name = "TubeFin contributors" }]
-dependencies = []
+dependencies = ["websocket-client>=1.8"]
 
 [project.scripts]
 tubefin = "tubefin.main:main"
@@ -23,7 +23,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-tubefin = ["style.css"]
+tubefin = ["style.css", "icons/*.svg"]
 
 [tool.ruff]
 line-length = 100
