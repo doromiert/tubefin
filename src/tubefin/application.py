@@ -343,6 +343,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.mpv_player: MpvPlayer | None = None
         self.connection_window: ConnectionWindow | None = None
         self.settings_window: Adw.Window | None = None
+        self.seerr_login_window: Adw.Window | None = None
         self.jellyfin_history: list[tuple[str, str]] = []
         self.jellyfin_parent_id = ""
         self.jellyfin_loaded = False
@@ -475,9 +476,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.requests_navigation_row = Adw.ActionRow(title="Requests")
         self.requests_navigation_row.set_name("requests")
         self.requests_navigation_row.add_prefix(
-            Gtk.Image.new_from_icon_name("emblem-downloads-symbolic")
+            Gtk.Image.new_from_icon_name("edit-find-symbolic")
         )
-        self.requests_navigation_row.set_visible(False)
+        self.requests_navigation_row.set_visible(self.jellyfin.session is not None)
         self.navigation.append(self.requests_navigation_row)
 
         spacer = Gtk.Box(vexpand=True)
@@ -781,10 +782,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.seerr_search = Gtk.SearchEntry(
             placeholder_text="Search movies and shows", hexpand=True
         )
+        self.seerr_search.set_sensitive(False)
         self.seerr_search.connect("activate", self._seerr_search_requested)
         search_row.append(self.seerr_search)
-        self.seerr_connect = Gtk.Button(label="Sign in", icon_name="network-server-symbolic")
-        self.seerr_connect.connect("clicked", lambda *_: self._seerr_quick_connect())
+        self.seerr_connect = Gtk.Button(label="Configure Seerr")
+        self.seerr_connect.set_tooltip_text("Set the Seerr address in Settings")
+        self.seerr_connect.connect("clicked", self._seerr_connect_clicked)
         search_row.append(self.seerr_connect)
         page.append(search_row)
         self.seerr_status = Adw.StatusPage(
@@ -2989,7 +2992,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _seerr_discovered(self, url: str) -> bool:
         self.seerr_available = bool(url)
         if hasattr(self, "requests_navigation_row"):
-            self.requests_navigation_row.set_visible(self.seerr_available)
+            self.requests_navigation_row.set_visible(self.jellyfin.session is not None)
+        if hasattr(self, "seerr_search"):
+            self.seerr_search.set_sensitive(self.seerr_available)
+        if hasattr(self, "seerr_connect"):
+            self.seerr_connect.set_label(
+                "Sign in to Seerr" if url else "Configure Seerr"
+            )
+            self.seerr_connect.set_tooltip_text(
+                "Sign in to Seerr with your Jellyfin account"
+                if url
+                else "Set the Seerr address in Settings"
+            )
+            self.seerr_connect.set_sensitive(True)
         if hasattr(self, "seerr_status"):
             self.seerr_status.set_title(
                 "Find something to watch" if url else "Seerr was not found"
@@ -2998,13 +3013,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 "Search Seerr, then request a movie or every season of a show."
                 if url
                 else (
-                    "Set the Seerr address in Settings if it is not on Jellyfin's "
-                    "host at port 5055."
+                    "Automatic discovery could not reach Seerr. Set its address "
+                    "in Settings, then return here to search and request media."
                 )
             )
-        if not url and self._visible_page_name() == "requests":
-            self._select_page("library")
         return GLib.SOURCE_REMOVE
+
+    def _seerr_connect_clicked(self, _button: Gtk.Button) -> None:
+        if not self.seerr_available:
+            self.open_settings()
+            return
+        self._open_seerr_login()
 
     def _seerr_search_requested(self, entry: Gtk.SearchEntry) -> None:
         query = entry.get_text().strip()
@@ -3114,42 +3133,92 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
         return GLib.SOURCE_REMOVE
 
-    def _seerr_quick_connect(self) -> None:
-        self.seerr_connect.set_sensitive(False)
-        run_async(
-            self._complete_seerr_quick_connect,
-            self._seerr_quick_connected,
-            self._seerr_quick_error,
+    def _open_seerr_login(self) -> None:
+        if self.seerr_login_window:
+            self.seerr_login_window.present()
+            return
+        window = Adw.Window(transient_for=self, modal=True, title="Sign in to Seerr")
+        window.set_default_size(480, 300)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(title="Sign in to Seerr", subtitle="Jellyfin account")
         )
+        toolbar.add_top_bar(header)
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="Jellyfin account",
+            description=(
+                "Sign in through Seerr with your Jellyfin username and password. "
+                "The password is not saved by TubeFin."
+            ),
+        )
+        username = Adw.EntryRow(title="Username")
+        if self.jellyfin.session:
+            username.set_text(self.jellyfin.session.username)
+        password = Adw.PasswordEntryRow(title="Password")
+        group.add(username)
+        group.add(password)
+        action = Adw.ActionRow(
+            title="Seerr session",
+            subtitle="Use an API key in Settings if password sign-in is disabled.",
+        )
+        sign_in = Gtk.Button(label="Sign in", valign=Gtk.Align.CENTER)
+        sign_in.add_css_class("suggested-action")
+        sign_in.connect(
+            "clicked",
+            lambda *_: self._seerr_credentials_login(
+                username, password, sign_in, window
+            ),
+        )
+        action.add_suffix(sign_in)
+        group.add(action)
+        page.add(group)
+        toolbar.set_content(page)
+        window.set_content(toolbar)
+        self.seerr_login_window = window
+        window.connect("close-request", self._seerr_login_closed)
+        window.present()
 
-    def _complete_seerr_quick_connect(self) -> str:
-        initiated = self.seerr.quick_connect_initiate()
-        code = str(initiated.get("code") or "")
-        secret = str(initiated.get("secret") or "")
-        if not code or not secret:
-            raise RuntimeError("Seerr did not return a Quick Connect code.")
-        GLib.idle_add(
-            lambda: self.toast_overlay.add_toast(
-                Adw.Toast(title=f"Enter Seerr Quick Connect code: {code}", timeout=12)
+    def _seerr_credentials_login(
+        self,
+        username: Adw.EntryRow,
+        password: Adw.PasswordEntryRow,
+        button: Gtk.Button,
+        window: Adw.Window,
+    ) -> None:
+        name = username.get_text().strip()
+        secret = password.get_text()
+        if not name or not secret:
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Enter your Jellyfin username and password")
             )
+            return
+        button.set_label("Signing in…")
+        button.set_sensitive(False)
+        run_async(
+            lambda: self.seerr.jellyfin_login(name, secret),
+            lambda _result: self._seerr_credentials_connected(window),
+            lambda error: self._seerr_credentials_error(button, error),
         )
-        for _attempt in range(60):
-            if self.seerr.quick_connect_check(secret):
-                self.seerr.quick_connect_authenticate(secret)
-                return code
-            time.sleep(2)
-        raise RuntimeError("Seerr Quick Connect timed out.")
 
-    def _seerr_quick_connected(self, _code: str) -> bool:
-        self.seerr_connect.set_sensitive(True)
-        self.seerr_connect.set_label("Connected")
+    def _seerr_credentials_connected(self, window: Adw.Window) -> bool:
+        self.seerr_connect.set_label("Connected to Seerr")
+        window.close()
         self.toast_overlay.add_toast(Adw.Toast(title="Connected to Seerr"))
         return GLib.SOURCE_REMOVE
 
-    def _seerr_quick_error(self, error: Exception) -> bool:
-        self.seerr_connect.set_sensitive(True)
+    def _seerr_credentials_error(
+        self, button: Gtk.Button, error: Exception
+    ) -> bool:
+        button.set_label("Sign in")
+        button.set_sensitive(True)
         self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
         return GLib.SOURCE_REMOVE
+
+    def _seerr_login_closed(self, _window: Adw.Window) -> bool:
+        self.seerr_login_window = None
+        return False
 
     def _load_offline(self) -> None:
         self._clear_box(self.offline_grid)
@@ -4433,16 +4502,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.details_series_spinner.stop()
         self.details_series_loading.set_visible(False)
         self.details_seasons.set_visible(True)
+        seasons_group = Adw.PreferencesGroup()
         for index, section in enumerate(sections):
-            expander = Gtk.Expander(label=section.title)
-            expander.add_css_class("series-season")
+            episode_count = len(section.items)
+            expander = Adw.ExpanderRow(
+                title=section.title,
+                subtitle=f"{episode_count} episode{'s' if episode_count != 1 else ''}",
+            )
             expander.set_expanded(index == 0)
-            episodes = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-            episodes.add_css_class("boxed-list")
             for episode in section.items:
-                episodes.append(self._series_episode_row(episode))
-            expander.set_child(episodes)
-            self.details_seasons.append(expander)
+                expander.add_row(self._series_episode_row(episode))
+            seasons_group.add(expander)
+        if sections:
+            self.details_seasons.append(seasons_group)
         if not sections:
             empty = Adw.StatusPage(
                 icon_name="folder-videos-symbolic",
@@ -4468,6 +4540,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 f"{episode_number} · {episode.duration_label or 'Episode'}{progress}"
             ),
         )
+        row.set_margin_top(8)
+        row.set_margin_bottom(8)
         picture = Gtk.Picture(width_request=128, height_request=72)
         picture.set_content_fit(Gtk.ContentFit.COVER)
         picture.set_overflow(Gtk.Overflow.HIDDEN)
@@ -7116,7 +7190,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         requests.add(seerr_key)
         seerr_save_row = Adw.ActionRow(
             title="Requests tab",
-            subtitle="The sidebar tab appears only after TubeFin can reach Seerr.",
+            subtitle="The sidebar tab appears whenever Jellyfin is connected.",
         )
         seerr_save = Gtk.Button(label="Save and check", valign=Gtk.Align.CENTER)
         seerr_save.connect(
@@ -7158,43 +7232,31 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "color-set", lambda *_: self._sync_identity_changed(sync_name, sync_color)
         )
 
-        captions_row = Adw.ActionRow(
+        captions_language = Adw.EntryRow(
             title="Default closed captions",
-            subtitle=(
-                "Enter a language name or code. TubeFin chooses the closest available "
-                "track; leave blank to keep captions off."
-            ),
         )
-        captions_language = Gtk.Entry(
-            text=self.default_caption_language,
-            placeholder_text="Off",
-            valign=Gtk.Align.CENTER,
+        captions_language.set_text(self.default_caption_language)
+        captions_language.set_tooltip_text(
+            "Enter a language name or code. TubeFin chooses the closest available "
+            "track; leave blank to keep captions off."
         )
-        captions_language.set_width_chars(18)
         captions_language.connect(
             "changed", lambda entry: self._default_caption_language_changed(entry)
         )
-        captions_row.add_suffix(captions_language)
-        playback.add(captions_row)
+        playback.add(captions_language)
 
-        audio_row = Adw.ActionRow(
+        audio_language = Adw.EntryRow(
             title="Preferred dubbed audio",
-            subtitle=(
-                "Enter a language name or code. TubeFin uses the closest available "
-                "YouTube dub; leave blank for the original audio."
-            ),
         )
-        audio_language = Gtk.Entry(
-            text=self.preferred_audio_language,
-            placeholder_text="Original",
-            valign=Gtk.Align.CENTER,
+        audio_language.set_text(self.preferred_audio_language)
+        audio_language.set_tooltip_text(
+            "Enter a language name or code. TubeFin uses the closest available "
+            "YouTube dub; leave blank for the original audio."
         )
-        audio_language.set_width_chars(18)
         audio_language.connect(
             "changed", lambda entry: self._preferred_audio_language_changed(entry)
         )
-        audio_row.add_suffix(audio_language)
-        playback.add(audio_row)
+        playback.add(audio_language)
 
         sponsorblock = Adw.SwitchRow(
             title="SponsorBlock",
@@ -7229,11 +7291,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         content.append(self.home_order_group)
         self._rebuild_home_order_settings()
 
-        advanced = Gtk.Expander(label="Optional YouTube API access")
+        advanced_group = Adw.PreferencesGroup()
+        advanced = Adw.ExpanderRow(title="Optional YouTube API access")
         account_page = self._build_account_page()
         account_page.set_size_request(-1, 520)
-        advanced.set_child(account_page)
-        content.append(advanced)
+        advanced.add_row(account_page)
+        advanced_group.add(advanced)
+        content.append(advanced_group)
 
         data = Adw.PreferencesGroup(
             title="App data",
@@ -7349,7 +7413,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         button.set_sensitive(True)
         return GLib.SOURCE_REMOVE
 
-    def _default_caption_language_changed(self, entry: Gtk.Entry) -> None:
+    def _default_caption_language_changed(self, entry: Adw.EntryRow) -> None:
         self.default_caption_language = entry.get_text().strip()
         self.config.save_player_settings(
             default_caption_language=self.default_caption_language
@@ -7357,7 +7421,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if self.mpv_player:
             self.mpv_player.default_caption_language = self.default_caption_language
 
-    def _preferred_audio_language_changed(self, entry: Gtk.Entry) -> None:
+    def _preferred_audio_language_changed(self, entry: Adw.EntryRow) -> None:
         self.preferred_audio_language = entry.get_text().strip()
         self.config.save_player_settings(
             preferred_audio_language=self.preferred_audio_language
@@ -7672,6 +7736,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.account_row.set_subtitle(session.server_url)
         self.disconnect_action.set_enabled(True)
         self.watch_jellyfin_button.set_sensitive(not self._synctube_active())
+        self.requests_navigation_row.set_visible(True)
 
     def disconnect_jellyfin(self) -> None:
         if self._jellyfin_syncplay_active():
@@ -7679,6 +7744,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.config.clear_session()
         self.jellyfin.session = None
         self._seerr_discovered("")
+        if self._visible_page_name() == "requests":
+            self._select_page("library")
         self.jellyfin_loaded = False
         self.browse_cache = {
             key: value

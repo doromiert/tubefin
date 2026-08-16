@@ -2021,7 +2021,28 @@ class SeerrService:
                 host = parsed.hostname
                 if ":" in host:
                     host = f"[{host}]"
-                candidates.append(f"{parsed.scheme or 'http'}://{host}:5055")
+                jellyfin_scheme = parsed.scheme or "http"
+                # Seerr commonly listens over plain HTTP on 5055 even when
+                # Jellyfin itself sits behind an HTTPS reverse proxy.
+                for scheme in dict.fromkeys(("http", jellyfin_scheme, "https")):
+                    candidates.append(f"{scheme}://{host}:5055")
+
+                hostname = parsed.hostname
+                labels = hostname.split(".")
+                if len(labels) > 2 and labels[0].casefold() in {
+                    "jellyfin",
+                    "media",
+                    "jf",
+                }:
+                    parent = ".".join(labels[1:])
+                    for prefix in ("seerr", "jellyseerr", "requests", "overseerr"):
+                        candidates.append(f"{jellyfin_scheme}://{prefix}.{parent}")
+
+                origin = f"{jellyfin_scheme}://{host}"
+                if parsed.port:
+                    origin += f":{parsed.port}"
+                for path in ("seerr", "jellyseerr", "requests", "overseerr"):
+                    candidates.append(f"{origin}/{path}")
         except ValueError:
             pass
         for candidate in dict.fromkeys(candidates):
@@ -2029,7 +2050,7 @@ class SeerrService:
                 self.base_url = candidate
                 self.status()
                 return candidate
-            except ServiceError:
+            except (ServiceError, ValueError):
                 continue
         self.base_url = self._normalize(configured_url)
         return ""
@@ -2048,6 +2069,15 @@ class SeerrService:
         if media_type == "tv":
             body["seasons"] = "all"
         result = self._request("/request", method="POST", body=body)
+        return result if isinstance(result, dict) else {}
+
+    def jellyfin_login(self, username: str, password: str) -> dict[str, Any]:
+        result = self._request(
+            "/auth/jellyfin",
+            method="POST",
+            body={"username": username, "password": password},
+            authenticated=False,
+        )
         return result if isinstance(result, dict) else {}
 
     def quick_connect_initiate(self) -> dict[str, Any]:
