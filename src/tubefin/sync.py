@@ -29,6 +29,9 @@ SYNCTUBE_EVENTS = {
     "user.name": 12,
     "user.color": 14,
     "user.group": 15,
+    "chat.add": 20,
+    "chat.remove": 21,
+    "chat.clear": 22,
     "playlist.add": 30,
     "playlist.play": 35,
     "player.play": 40,
@@ -244,6 +247,7 @@ class SyncTubeClient:
             "add": [0, 1, 2],
             "play": [1, 2],
             "seek": [1, 2],
+            "chat": [0, 1, 2],
         }
         self.offset = 0.0
         self.closed = threading.Event()
@@ -376,6 +380,20 @@ class SyncTubeClient:
         if client_id:
             self._send("user.group", {"id": client_id, "group": 1 if can_control else 0})
 
+    def send_chat(self, text: str) -> None:
+        message = text.strip()
+        if not message:
+            return
+        if not self.connected or not self.socket:
+            raise ConnectionError("Connect to a SyncTube room before sending a message.")
+        if not self.has_permission("chat"):
+            raise PermissionError("This room does not allow you to send chat messages.")
+        try:
+            self._send("chat.add", {"msg": message[:200]})
+        except (OSError, websocket.WebSocketException) as error:
+            self.connected = False
+            raise ConnectionError("SyncTube chat disconnected.") from error
+
     def ping(self) -> None:
         return
 
@@ -455,6 +473,7 @@ class SyncTubeClient:
                     "role": self.role,
                     "url": f"{self.BASE_URL}/room/{self.room}",
                     "members": list(self.members.values()),
+                    "chat": self._normalize_chat_history(payload.get("chat")),
                 }
             )
             self._created_room = False
@@ -519,6 +538,17 @@ class SyncTubeClient:
                     }
                 )
             return
+        if name == "chat.add":
+            message = self._normalize_chat_message(payload)
+            if message:
+                self.on_message({"type": "chat_message", "message": message})
+            return
+        if name == "chat.remove":
+            self.on_message({"type": "chat_remove", "message_id": str(payload or "")})
+            return
+        if name == "chat.clear":
+            self.on_message({"type": "chat_clear"})
+            return
         if name == "playlist.add":
             candidates = payload if isinstance(payload, list) else [payload]
             for candidate in candidates:
@@ -575,6 +605,65 @@ class SyncTubeClient:
 
     def _emit_members(self) -> None:
         self.on_message({"type": "members", "members": list(self.members.values())})
+
+    def _normalize_chat_history(self, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, dict) or not isinstance(value.get("log"), list):
+            return []
+        return [
+            message
+            for entry in value["log"]
+            if (message := self._normalize_chat_message(entry)) is not None
+        ]
+
+    def _normalize_chat_message(self, value: Any) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        user_id = str(value.get("uid") or "")
+        member = self.members.get(user_id, {})
+        author = str(member.get("name") or "Anonymous")
+        color = str(member.get("color") or "#8f5bd7")
+        parts: list[str] = []
+        nodes = value.get("nodes") or []
+        if isinstance(nodes, list):
+            for index, node in enumerate(nodes):
+                if not isinstance(node, dict):
+                    continue
+                kind = str(node.get("type") or "")
+                if kind == "txt":
+                    node_text = str(node.get("txt") or "")
+                    if index == 0 and ":" in node_text:
+                        encoded_author, _, node_text = node_text.partition(":")
+                        if not member and encoded_author.strip():
+                            author = encoded_author.strip()
+                        style = node.get("style")
+                        if isinstance(style, dict) and style.get("color"):
+                            color = str(style["color"])
+                        node_text = node_text.lstrip(" \u00a0")
+                    parts.append(node_text)
+                elif kind == "url":
+                    parts.append(str(node.get("href") or ""))
+                elif kind == "icon":
+                    parts.append(
+                        str(node.get("txt") or node.get("name") or "[emote]")
+                    )
+                elif kind == "img":
+                    parts.append("[image]")
+        text = "".join(parts).strip()
+        for prefix in (f"{author}:\u00a0", f"{author}: ", f"{author}:"):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                break
+        if not text:
+            text = str(value.get("msg") or "").strip()
+        if not text:
+            return None
+        return {
+            "id": str(value.get("id") or ""),
+            "user_id": user_id,
+            "author": author,
+            "color": color,
+            "text": text,
+        }
 
     def _load_media(self, media: Any, playing: bool, position: Any) -> None:
         if not isinstance(media, dict):

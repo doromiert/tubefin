@@ -1396,7 +1396,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="1.1.2"'
+        'DeviceId="tubefin-desktop", Version="1.2.0"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:

@@ -59,6 +59,10 @@ The artifacts are written to `dist/`. The Flatpak build requires Flathub and
 from Flathub. Arch users can also build the native package with
 `makepkg -si` from `packaging/arch`.
 
+For each version bump, push the matching `vX.Y.Z` tag. The tag starts the release
+workflow and publishes the AppImage, Flatpak bundle, and Arch package; a version
+change by itself does not create a GitHub release.
+
 ## Jellyfin
 
 Open **Jellyfin** and select **Connect to Jellyfin**. Enter a full server address,

@@ -93,6 +93,27 @@ HOME_SECTION_TITLES = {
 }
 
 
+class VideoAspectFrame(Gtk.AspectFrame):
+    """Aspect frame with a non-zero height inside a vertical scroll viewport."""
+
+    def __init__(self) -> None:
+        super().__init__(ratio=16 / 9, obey_child=False)
+        self._requested_video_height = 360
+        self.set_size_request(-1, self._requested_video_height)
+
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        Gtk.AspectFrame.do_size_allocate(self, width, height, baseline)
+        requested = max(1, round(width * 9 / 16))
+        if requested != self._requested_video_height:
+            self._requested_video_height = requested
+            GLib.idle_add(self._apply_video_height, requested)
+
+    def _apply_video_height(self, requested: int) -> bool:
+        if requested == self._requested_video_height:
+            self.set_size_request(-1, requested)
+        return GLib.SOURCE_REMOVE
+
+
 def run_async(
     operation: Callable[[], Any],
     on_success: Callable[[Any], None],
@@ -579,7 +600,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         watch_menu.append(self.watch_jellyfin_button)
         self.watch_together_popover = Gtk.Popover(child=watch_menu)
         self.watch_together_button = Gtk.MenuButton(
-            child=icon_label("Watch together", "network-transmit-receive-symbolic"),
+            icon_name="people-symbolic",
             tooltip_text="Start or join a watch party",
             popover=self.watch_together_popover,
         )
@@ -1383,11 +1404,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_heading = Gtk.Label()
         self.player_heading.add_css_class("heading")
         self.player_heading.set_ellipsize(Pango.EllipsizeMode.END)
-        self.player_comments_button = Gtk.ToggleButton(
-            icon_name="user-available-symbolic", tooltip_text="Comments"
+        self.player_live_chat_button = Gtk.ToggleButton(
+            icon_name="chat-bubbles-empty-symbolic", tooltip_text="Live chat"
         )
-        self.player_comments_button.connect("toggled", self._toggle_player_comments)
-        self.header.pack_end(self.player_comments_button)
+        self.player_live_chat_button.connect("toggled", self._toggle_player_live_chat)
+        self.header.pack_end(self.player_live_chat_button)
         self.queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.queue_box.set_margin_top(10)
         self.queue_box.set_margin_bottom(10)
@@ -1400,15 +1421,28 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.header.pack_end(self.queue_button)
         self.player_header_controls = [
             back,
-            self.player_comments_button,
+            self.player_live_chat_button,
             self.queue_button,
         ]
         for control in self.player_header_controls:
             control.set_visible(False)
         self.player_bar = self.header
 
+        self.player_controls_host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.player_controls_host.set_visible(False)
+        self.reparenting_player_controls = False
+        page.append(self.player_controls_host)
+        self.player_scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.player_scroller.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        player_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        player_content.set_hexpand(True)
+        self.player_scroller.set_child(player_content)
+        page.append(self.player_scroller)
+
         playback = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        playback.set_vexpand(True)
+        playback.set_hexpand(True)
         stage = Gtk.Overlay()
         stage.add_css_class("player-stage")
         stage.set_hexpand(True)
@@ -1439,6 +1473,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.fullscreen_title.set_can_target(False)
         self.fullscreen_title.set_visible(False)
         stage.add_overlay(self.fullscreen_title)
+        self.fullscreen_live_chat_button = Gtk.ToggleButton(
+            icon_name="chat-bubbles-empty-symbolic", tooltip_text="Live chat"
+        )
+        self.fullscreen_live_chat_button.add_css_class("fullscreen-chat-button")
+        self.fullscreen_live_chat_button.set_halign(Gtk.Align.END)
+        self.fullscreen_live_chat_button.set_valign(Gtk.Align.START)
+        self.fullscreen_live_chat_button.set_margin_top(16)
+        self.fullscreen_live_chat_button.set_margin_end(16)
+        self.fullscreen_live_chat_button.set_visible(False)
+        self.fullscreen_live_chat_button.connect(
+            "toggled", self._toggle_player_live_chat
+        )
+        stage.add_overlay(self.fullscreen_live_chat_button)
         self.seek_feedback = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=6
         )
@@ -1480,7 +1527,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         player_status_box.append(self.player_status)
         stage.add_overlay(player_status_box)
         self.player_status_box = player_status_box
-        playback.append(stage)
+        stage_frame = VideoAspectFrame()
+        stage_frame.set_hexpand(True)
+        stage_frame.set_child(stage)
+        playback.append(stage_frame)
 
         self.player_comments_panel = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=340
@@ -1515,7 +1565,46 @@ class TubeFinWindow(Adw.ApplicationWindow):
         comments_scroller.set_child(self.comments_box)
         self.player_comments_panel.append(comments_scroller)
         playback.append(self.player_comments_panel)
-        page.append(playback)
+
+        self.player_live_chat_panel = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=340
+        )
+        self.player_live_chat_panel.add_css_class("live-chat-sidebar")
+        self.player_live_chat_panel.set_visible(False)
+        live_chat_title = Gtk.Label(label="Live chat", xalign=0)
+        live_chat_title.add_css_class("title-2")
+        self.player_live_chat_panel.append(live_chat_title)
+        self.live_chat_status = Gtk.Label(xalign=0, wrap=True)
+        self.live_chat_status.add_css_class("dim-label")
+        self.player_live_chat_panel.append(self.live_chat_status)
+        self.live_chat_scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.live_chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.live_chat_rows: dict[str, Gtk.Widget] = {}
+        self.live_chat_scroller.set_child(self.live_chat_box)
+        self.player_live_chat_panel.append(self.live_chat_scroller)
+        live_chat_input = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.live_chat_entry = Gtk.Entry(
+            placeholder_text="Send a message…", hexpand=True, max_length=200
+        )
+        self.live_chat_entry.connect("activate", lambda *_: self._send_live_chat())
+        live_chat_input.append(self.live_chat_entry)
+        self.live_chat_send = Gtk.Button(
+            icon_name="paper-plane-symbolic", tooltip_text="Send message"
+        )
+        self.live_chat_send.connect("clicked", lambda *_: self._send_live_chat())
+        live_chat_input.append(self.live_chat_send)
+        self.player_live_chat_panel.append(live_chat_input)
+        playback.append(self.player_live_chat_panel)
+        self.player_playback_row = playback
+        player_content.append(playback)
+        self.player_inline_controls_host = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL
+        )
+        player_content.append(self.player_inline_controls_host)
+        self._set_player_controls_sticky(False)
+        self.player_scroller.get_vadjustment().connect(
+            "value-changed", self._player_scroll_changed
+        )
 
         self.player_details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         details = self.player_details
@@ -1569,7 +1658,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_subscribe.connect("clicked", lambda *_: self._toggle_current_subscription())
         channel_cluster.append(self.player_subscribe)
         player_actions.append(channel_cluster)
-        save_current = labeled_button("Save", "list-add-symbolic")
+        save_current = Gtk.Button(
+            icon_name="list-add-symbolic", tooltip_text="Save to playlist"
+        )
         save_current.set_valign(Gtk.Align.CENTER)
         save_current.connect(
             "clicked", lambda *_: self.current_item and self._save_item(self.current_item)
@@ -1583,22 +1674,28 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "clicked", lambda *_: self.current_item and self._share_item(self.current_item)
         )
         player_actions.append(share_current)
-        self.player_download = labeled_button("Download", "folder-download-symbolic")
+        self.player_download = Gtk.Button(
+            icon_name="folder-download-symbolic", tooltip_text="Download"
+        )
         self.player_download.set_valign(Gtk.Align.CENTER)
         self.player_download.connect(
             "clicked", lambda *_: self.current_item and self._download_item(self.current_item)
         )
         player_actions.append(self.player_download)
+        self.player_comments_button = Gtk.ToggleButton(
+            icon_name="user-available-symbolic", tooltip_text="Comments"
+        )
+        self.player_comments_button.set_valign(Gtk.Align.CENTER)
+        self.player_comments_button.connect("toggled", self._toggle_player_comments)
+        player_actions.append(self.player_comments_button)
         details.append(player_actions)
         self.player_description = Gtk.Label(
             xalign=0, yalign=0, wrap=True, selectable=True
         )
         self.player_description.add_css_class("dim-label")
         self.player_description.set_hexpand(True)
-        self.player_description.set_ellipsize(Pango.EllipsizeMode.END)
-        self.player_description.set_lines(3)
         details.append(self.player_description)
-        page.append(details)
+        player_content.append(details)
         self._refresh_queue()
         return page
 
@@ -5077,9 +5174,106 @@ class TubeFinWindow(Adw.ApplicationWindow):
         visible = button.get_active() and bool(
             self.current_item and self.current_item.source == "youtube"
         )
+        if visible and self.player_live_chat_button.get_active():
+            self.player_live_chat_button.set_active(False)
         self.player_comments_panel.set_visible(visible)
         if visible and not self.comments_box.get_first_child():
             self._load_comments()
+
+    def _toggle_player_live_chat(self, button: Gtk.ToggleButton) -> None:
+        visible = button.get_active() and self._synctube_active()
+        for toggle in (
+            self.player_live_chat_button,
+            self.fullscreen_live_chat_button,
+        ):
+            if toggle is not button and toggle.get_active() != visible:
+                toggle.set_active(visible)
+        if visible and self.player_comments_button.get_active():
+            self.player_comments_button.set_active(False)
+        self.player_live_chat_panel.set_visible(visible)
+        self._refresh_live_chat_controls()
+        if visible:
+            GLib.idle_add(self._scroll_live_chat_to_bottom)
+
+    def _refresh_live_chat_controls(self) -> None:
+        connected = self._synctube_active()
+        allowed = bool(
+            connected
+            and self.sync_client
+            and self.sync_client.has_permission("chat")
+        )
+        self.live_chat_entry.set_sensitive(allowed)
+        self.live_chat_send.set_sensitive(allowed)
+        if not connected:
+            status = "Join a SyncTube room to use live chat."
+        elif not allowed:
+            status = "This room does not allow you to send chat messages."
+        else:
+            status = "Messages are shared with everyone in the SyncTube room."
+        self.live_chat_status.set_label(status)
+
+    def _send_live_chat(self) -> None:
+        message = self.live_chat_entry.get_text().strip()
+        if not message or not self.sync_client:
+            return
+        try:
+            self.sync_client.send_chat(message)
+        except (ConnectionError, PermissionError, OSError) as error:
+            self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
+            self._refresh_live_chat_controls()
+            return
+        self.live_chat_entry.set_text("")
+
+    def _replace_live_chat(self, values: object) -> None:
+        self._clear_box(self.live_chat_box)
+        self.live_chat_rows.clear()
+        messages = values if isinstance(values, list) else []
+        for message in messages:
+            self._append_live_chat_message(message, scroll=False)
+        GLib.idle_add(self._scroll_live_chat_to_bottom)
+
+    def _append_live_chat_message(self, value: object, *, scroll: bool = True) -> None:
+        if not isinstance(value, dict):
+            return
+        author_text = str(value.get("author") or "Anonymous")
+        message_text = str(value.get("text") or "").strip()
+        if not message_text:
+            return
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        card.add_css_class("live-chat-message")
+        author = Gtk.Label(label=author_text, xalign=0)
+        author.add_css_class("heading")
+        color = str(value.get("color") or "")
+        rgba = Gdk.RGBA()
+        if color and rgba.parse(color):
+            author.set_markup(
+                f'<span foreground="{color}">{GLib.markup_escape_text(author_text)}</span>'
+            )
+        card.append(author)
+        text = Gtk.Label(label=message_text, xalign=0, wrap=True, selectable=True)
+        text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        card.append(text)
+        self.live_chat_box.append(card)
+        message_id = str(value.get("id") or "")
+        if message_id:
+            self.live_chat_rows[message_id] = card
+        if scroll:
+            GLib.idle_add(self._scroll_live_chat_to_bottom)
+
+    def _remove_live_chat_message(self, message_id: object) -> None:
+        row = self.live_chat_rows.pop(str(message_id or ""), None)
+        if row:
+            self.live_chat_box.remove(row)
+
+    def _scroll_live_chat_to_bottom(self) -> bool:
+        adjustment = self.live_chat_scroller.get_vadjustment()
+        adjustment.set_value(
+            max(
+                adjustment.get_lower(),
+                adjustment.get_upper() - adjustment.get_page_size(),
+            )
+        )
+        return GLib.SOURCE_REMOVE
 
     def _comments_scroll_changed(self, adjustment: Gtk.Adjustment) -> None:
         if (
@@ -5281,6 +5475,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.comments_loading_row.set_visible(False)
         self._clear_box(self.comments_box)
         self.player_comments_button.set_visible(item.source == "youtube")
+        live_chat_supported = item.source == "youtube" and self._synctube_active()
+        live_chat_available = bool(
+            live_chat_supported
+            and (reveal_player or self._visible_page_name() == "player")
+        )
+        self.player_live_chat_button.set_visible(live_chat_available)
+        self.fullscreen_live_chat_button.set_visible(
+            live_chat_available and self._player_is_fullscreen()
+        )
+        if not live_chat_supported:
+            self.player_live_chat_button.set_active(False)
+            self.player_live_chat_panel.set_visible(False)
+        self._refresh_live_chat_controls()
         self.player_subscribe.set_visible(
             item.source == "youtube" and bool(item.payload.get("channel_url"))
         )
@@ -6065,6 +6272,84 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.window_title.set_subtitle(self.current_item.source.capitalize())
         self.mini_player.set_visible(False)
 
+    def _set_player_controls_sticky(self, sticky: bool) -> None:
+        if (
+            not self.mpv_player
+            or self.mpv_player.fullscreen_mode
+            or self.reparenting_player_controls
+        ):
+            return
+        controls = self.mpv_player.controls
+        destination = (
+            self.player_controls_host if sticky else self.player_inline_controls_host
+        )
+        if controls.get_parent() == destination:
+            self.player_controls_host.set_visible(sticky)
+            return
+        self.reparenting_player_controls = True
+        try:
+            minimum, natural, _minimum_baseline, _natural_baseline = controls.measure(
+                Gtk.Orientation.VERTICAL, -1
+            )
+            controls_height = max(1, controls.get_height(), minimum, natural)
+            self._detach_player_controls()
+            if sticky:
+                self.player_inline_controls_host.set_size_request(-1, controls_height)
+                controls.set_valign(Gtk.Align.FILL)
+                self.player_controls_host.append(controls)
+                self.player_controls_host.set_visible(True)
+            else:
+                self.player_controls_host.set_visible(False)
+                self.player_inline_controls_host.set_size_request(-1, -1)
+                controls.set_valign(Gtk.Align.FILL)
+                self.player_inline_controls_host.append(controls)
+        finally:
+            self.reparenting_player_controls = False
+
+    def _detach_player_controls(self) -> None:
+        if not self.mpv_player:
+            return
+        controls = self.mpv_player.controls
+        parent = controls.get_parent()
+        if parent == self.mpv_player.playback_overlay:
+            self.mpv_player.playback_overlay.remove_overlay(controls)
+        elif parent == self.player_controls_host:
+            self.player_controls_host.remove(controls)
+        elif parent == self.player_inline_controls_host:
+            self.player_inline_controls_host.remove(controls)
+
+    def _player_scroll_changed(self, adjustment: Gtk.Adjustment) -> None:
+        if (
+            not self.mpv_player
+            or self.mpv_player.fullscreen_mode
+            or self.reparenting_player_controls
+        ):
+            return
+        controls_top = max(1, self.player_playback_row.get_height())
+        self._set_player_controls_sticky(
+            adjustment.get_value() >= controls_top - 1
+        )
+
+    def _set_player_controls_fullscreen(self, fullscreen: bool) -> None:
+        if not self.mpv_player:
+            return
+        controls = self.mpv_player.controls
+        self.reparenting_player_controls = True
+        try:
+            self._detach_player_controls()
+            self.player_controls_host.set_visible(False)
+            if fullscreen:
+                controls.set_valign(Gtk.Align.END)
+                self.mpv_player.playback_overlay.add_overlay(controls)
+                return
+            self.player_inline_controls_host.set_size_request(-1, -1)
+            controls.set_valign(Gtk.Align.FILL)
+            self.player_inline_controls_host.append(controls)
+        finally:
+            self.reparenting_player_controls = False
+
+        self._player_scroll_changed(self.player_scroller.get_vadjustment())
+
     def _player_is_fullscreen(self) -> bool:
         return self.is_fullscreen()
 
@@ -6087,6 +6372,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.fullscreen_title.set_visible(False)
             self.fullscreen_title.set_opacity(0)
             self.mpv_player.set_fullscreen_mode(False)
+            self._set_player_controls_fullscreen(False)
+            self.fullscreen_live_chat_button.set_visible(False)
             self._update_transport_buttons()
             return
         self.pre_fullscreen_sidebar_widths = (
@@ -6102,8 +6389,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.header.set_visible(False)
         self.player_details.set_visible(False)
         self.sync_banner.set_visible(False)
+        self.player_scroller.get_vadjustment().set_value(0)
+        self._set_player_controls_fullscreen(True)
         self.fullscreen_title.set_visible(True)
         self.fullscreen_title.set_opacity(1)
+        self.fullscreen_live_chat_button.set_visible(
+            bool(
+                self._synctube_active()
+                and self.current_item
+                and self.current_item.source == "youtube"
+            )
+        )
         self.mpv_player.set_fullscreen_mode(True)
         self._update_transport_buttons()
 
@@ -6279,6 +6575,23 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if hasattr(self, "player_header_controls"):
             for control in self.player_header_controls:
                 control.set_visible(player)
+            self.player_live_chat_button.set_visible(
+                bool(
+                    player
+                    and self._synctube_active()
+                    and self.current_item
+                    and self.current_item.source == "youtube"
+                )
+            )
+            self.fullscreen_live_chat_button.set_visible(
+                bool(
+                    player
+                    and self._player_is_fullscreen()
+                    and self._synctube_active()
+                    and self.current_item
+                    and self.current_item.source == "youtube"
+                )
+            )
         if hasattr(self, "playlist_header_controls"):
             for control in self.playlist_header_controls:
                 control.set_visible(playlist and not self.remote_playlist_active)
@@ -6538,6 +6851,25 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.syncplay_button.add_css_class("suggested-action")
         else:
             self.syncplay_button.remove_css_class("suggested-action")
+        live_chat_supported = bool(
+            active
+            and self.current_item
+            and self.current_item.source == "youtube"
+        )
+        live_chat_available = bool(
+            live_chat_supported
+            and self._visible_page_name() == "player"
+        )
+        self.player_live_chat_button.set_visible(live_chat_available)
+        self.fullscreen_live_chat_button.set_visible(
+            live_chat_available and self._player_is_fullscreen()
+        )
+        if not live_chat_supported:
+            self.player_live_chat_button.set_active(False)
+            self.player_live_chat_panel.set_visible(False)
+        if not active:
+            self._replace_live_chat([])
+        self._refresh_live_chat_controls()
         self.home_jellyfin_button.set_visible(not active)
         self.watch_jellyfin_button.set_sensitive(
             bool(self.jellyfin.session) and not active
@@ -7068,6 +7400,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.syncplay_button.set_tooltip_text(
                 f"Connected to SyncTube room {room} as {role}"
             )
+            self._replace_live_chat(message.get("chat"))
             self._set_synctube_mode(True)
         elif kind == "members":
             if self.sync_members_list:
@@ -7085,11 +7418,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.sync_status_label.set_label(f"Room permission changed: {role}.")
         elif kind == "room_permission":
             permission = str(message.get("permission") or "room")
+            if permission == "chat":
+                self._refresh_live_chat_controls()
             if self.sync_status_label:
                 state = "allowed" if message.get("allowed") else "disabled"
                 self.sync_status_label.set_label(
                     f"Your {permission} permission is now {state}."
                 )
+        elif kind == "chat_message":
+            self._append_live_chat_message(message.get("message"))
+        elif kind == "chat_remove":
+            self._remove_live_chat_message(message.get("message_id"))
+        elif kind == "chat_clear":
+            self._replace_live_chat([])
         elif kind in {"error", "disconnected", "room_closed"}:
             if self.sync_status_label:
                 self.sync_status_label.set_label(
@@ -8085,6 +8426,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         state: Gdk.ModifierType,
     ) -> bool:
         page = self._visible_page_name()
+        focused = self.get_focus()
+        while focused:
+            if isinstance(focused, (Gtk.Editable, Gtk.TextView)):
+                if (
+                    keyval == Gdk.KEY_Escape
+                    and page == "player"
+                    and self.mpv_player
+                ):
+                    self.mpv_player.grab_focus()
+                    return True
+                return False
+            focused = focused.get_parent()
+
         control = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if control and keyval in (Gdk.KEY_f, Gdk.KEY_F, Gdk.KEY_l, Gdk.KEY_L):
             self._select_page("browse")
@@ -8098,6 +8452,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return True
         if page == "player" and self.mpv_player:
             modifiers = state & Gtk.accelerator_get_default_mod_mask()
+            if keyval in (Gdk.KEY_c, Gdk.KEY_C) and not modifiers:
+                live_chat_available = bool(
+                    self._synctube_active()
+                    and self.current_item
+                    and self.current_item.source == "youtube"
+                )
+                if live_chat_available:
+                    self.player_live_chat_button.set_active(True)
+                    self.live_chat_entry.grab_focus()
+                    return True
             if keyval in (Gdk.KEY_f, Gdk.KEY_F) and not modifiers:
                 self._toggle_fullscreen()
                 return True
@@ -8125,6 +8489,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Focus search", accelerator="<Control>F"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Leave player", accelerator="Escape"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Fullscreen", accelerator="f"))
+        group.add_shortcut(Gtk.ShortcutsShortcut(title="Focus live chat", accelerator="c"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Seek backward", accelerator="h"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Seek forward", accelerator="l"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Play or pause", accelerator="space"))

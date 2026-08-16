@@ -1,5 +1,5 @@
 pkgname=tubefin
-pkgver=1.1.2
+pkgver=1.2.0
 pkgrel=1
 pkgdesc='Native GTK YouTube and Jellyfin client'
 arch=('any')

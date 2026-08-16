@@ -278,6 +278,22 @@
   box-shadow: 0 2px 8px alpha(black, 0.35);
 }
 
+.fullscreen-chat-button {
+  min-width: 42px;
+  min-height: 42px;
+  border-radius: 999px;
+  color: white;
+  background: alpha(black, 0.72);
+  box-shadow: 0 2px 8px alpha(black, 0.35);
+}
+
+.fullscreen-chat-button:hover,
+.fullscreen-chat-button:active,
+.fullscreen-chat-button:checked {
+  color: white;
+  background: alpha(@accent_bg_color, 0.92);
+}
+
 .seek-feedback {
   min-width: 112px;
   padding: 16px 22px;
@@ -307,10 +323,17 @@
   background: color-mix(in srgb, currentColor 6%, transparent);
 }
 
-.comments-sidebar {
+.comments-sidebar,
+.live-chat-sidebar {
   padding: 14px;
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: @view_bg_color;
+}
+
+.live-chat-message {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, currentColor 5%, transparent);
 }
 
 .settings-strip {

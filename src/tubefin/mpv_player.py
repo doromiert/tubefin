@@ -192,6 +192,7 @@ class MpvPlayer(Gtk.Box):
         default_audio_language: str = "",
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.set_focusable(True)
         self.on_ready = on_ready
         self.on_error = on_error
         self.on_ended = on_ended
@@ -678,6 +679,7 @@ class MpvPlayer(Gtk.Box):
         x: float,
         _y: float,
     ) -> None:
+        self.grab_focus()
         if self.settings_popover.get_visible():
             self.settings_popover.popdown()
             self.reveal_controls()

@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.2.0" date="2026-08-16">
+      <description>
+        <p>Adds SyncTube room live chat with history, permissions, real-time messages, fullscreen access, and a keyboard shortcut; gives the video a scrollable 16:9 safe area with sticky playback controls; and streamlines player actions.</p>
+      </description>
+    </release>
     <release version="1.1.2" date="2026-08-16">
       <description>
         <p>Fixes timestamp-based queue auto-advance, preserves expanded or mini-player state across skips, queues an entire show when an episode starts, warms upcoming videos for smoother transitions, closes playback options after picker choices, centers channel avatars, adds release dates and descriptions beneath videos, normalizes the details download button, and improves graphics compatibility for packaged builds.</p>
