@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.3.0" date="2026-08-16">
+      <description>
+        <p>Adds authenticated YouTube comment posting, replies, likes, and deletion; chapter-aware seeking and shortcuts; resizable full-height comments and live-chat panels with fullscreen access; channel sharing; and touch-friendly scrolling.</p>
+      </description>
+    </release>
     <release version="1.2.0" date="2026-08-16">
       <description>
         <p>Adds SyncTube room live chat with history, permissions, real-time messages, fullscreen access, and a keyboard shortcut; gives the video a scrollable 16:9 safe area with sticky playback controls; and streamlines player actions.</p>

@@ -222,6 +222,25 @@
   min-height: 44px;
 }
 
+.content-header-background {
+  min-height: 47px;
+  background: transparent;
+}
+
+.content-header-background.player-header-background {
+  background: @headerbar_bg_color;
+}
+
+.content-header-overlay {
+  background: transparent;
+  box-shadow: none;
+}
+
+.player-sidebar-header-background {
+  border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  background: @view_bg_color;
+}
+
 .mpv-controls {
   padding: 10px 14px;
   background: @headerbar_bg_color;
@@ -230,6 +249,16 @@
 .player-timestamp {
   font-family: monospace;
   font-variant-numeric: tabular-nums;
+}
+
+.chapter-label {
+  min-height: 20px;
+  padding: 24px 16px 8px;
+  font-size: 0.9em;
+  font-weight: 600;
+  color: white;
+  text-shadow: 0 1px 3px alpha(black, 0.9);
+  background: linear-gradient(to bottom, transparent, alpha(black, 0.72));
 }
 
 .fullscreen-transport {
@@ -278,18 +307,35 @@
   box-shadow: 0 2px 8px alpha(black, 0.35);
 }
 
-.fullscreen-chat-button {
-  min-width: 42px;
+.fullscreen-sidebar-button {
   min-height: 42px;
-  border-radius: 999px;
+  padding: 0 14px;
+  border-radius: 10px;
   color: white;
   background: alpha(black, 0.72);
   box-shadow: 0 2px 8px alpha(black, 0.35);
 }
 
-.fullscreen-chat-button:hover,
-.fullscreen-chat-button:active,
-.fullscreen-chat-button:checked {
+.fullscreen-sidebar-button:hover,
+.fullscreen-sidebar-button:active,
+.fullscreen-sidebar-button:checked {
+  color: white;
+  background: alpha(@accent_bg_color, 0.92);
+}
+
+.fullscreen-comments-button {
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  border-radius: 10px;
+  color: white;
+  background: alpha(black, 0.72);
+  box-shadow: 0 2px 8px alpha(black, 0.35);
+}
+
+.fullscreen-comments-button:hover,
+.fullscreen-comments-button:active,
+.fullscreen-comments-button:checked {
   color: white;
   background: alpha(@accent_bg_color, 0.92);
 }
@@ -318,16 +364,73 @@
 }
 
 .comment-card {
-  padding: 14px 16px;
+  padding: 0;
   border-radius: 12px;
   background: color-mix(in srgb, currentColor 6%, transparent);
 }
 
+.comment-card:hover {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.comment-summary {
+  padding: 14px 16px 4px;
+}
+
+.comment-actions {
+  padding: 4px 10px 10px;
+}
+
+.comment-reply {
+  padding: 4px 0;
+}
+
+.comment-reply-composer {
+  padding: 8px 14px 14px;
+}
+
+.comment-replies-control {
+  color: @view_fg_color;
+}
+
 .comments-sidebar,
 .live-chat-sidebar {
-  padding: 14px;
+  min-width: 280px;
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: @view_bg_color;
+}
+
+.player-sidebar-content {
+  padding: 14px;
+}
+
+.comment-composer {
+  padding-bottom: 10px;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  background: @view_bg_color;
+}
+
+textview.comment-entry {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+textview.comment-entry text {
+  background: transparent;
+}
+
+.comment-placeholder {
+  padding: 10px 12px;
+  color: alpha(currentColor, 0.58);
+}
+
+.player-sidebar-resize-handle {
+  min-width: 10px;
+}
+
+.player-sidebar-resize-handle:hover {
+  background: alpha(@accent_bg_color, 0.28);
 }
 
 .live-chat-message {

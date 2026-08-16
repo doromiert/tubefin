@@ -12,8 +12,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ from tubefin.models import (
     SponsorSegment,
     StreamVariant,
     SubtitleTrack,
+    VideoChapter,
     VideoDetails,
     YouTubeBrowserSession,
 )
@@ -611,6 +612,534 @@ class YouTubeService:
             with suppress(FileNotFoundError):
                 os.unlink(cookie_path)
 
+    def browser_create_comment(
+        self, item: MediaItem, text_value: str, author: str = "You"
+    ) -> Comment:
+        try:
+            with self._browser_comment_connection(item) as connection:
+                opener, api_key, context, headers, html = connection
+                create_params = self._create_comment_params(html)
+                if not create_params:
+                    comments = self._browser_comments_response(
+                        opener, api_key, context, headers, html, item.id
+                    )
+                    create_params = self._find_nested_string(
+                        comments, "createCommentParams"
+                    )
+                if not create_params:
+                    raise ServiceError(
+                        "YouTube did not offer a comment box for this video."
+                    )
+                result = self._browser_innertube_request(
+                    opener,
+                    api_key,
+                    "comment/create_comment",
+                    headers,
+                    {
+                        "context": context,
+                        "createCommentParams": create_params,
+                        "commentText": text_value,
+                    },
+                )
+            comment_id = self._find_nested_string(result, "commentId")
+            delete_endpoint = self._find_labeled_mapping(
+                result,
+                ("delete", "remove"),
+                "performCommentActionEndpoint",
+            )
+            return Comment(
+                comment_id,
+                author or "You",
+                text_value,
+                is_own=True,
+                delete_action=str(
+                    (delete_endpoint.get("action") if delete_endpoint else "")
+                    or ""
+                ),
+            )
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.load(error)
+                message = detail.get("error", {}).get("message")
+            except (ValueError, AttributeError):
+                message = f"HTTP {error.code}"
+            raise ServiceError(f"YouTube rejected the comment: {message}.") from error
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
+            raise ServiceError("Could not post the comment to YouTube.") from error
+
+    def browser_reply_to_comment(
+        self,
+        item: MediaItem,
+        parent_comment_id: str,
+        text_value: str,
+        author: str = "You",
+    ) -> Comment:
+        try:
+            with self._browser_comment_connection(item) as connection:
+                opener, api_key, context, headers, html = connection
+                comments = self._browser_comments_response(
+                    opener, api_key, context, headers, html, item.id
+                )
+                renderer = self._find_comment_renderer(
+                    comments, parent_comment_id
+                )
+                if not renderer:
+                    raise ServiceError(
+                        "YouTube did not return that comment's reply action."
+                    )
+                create_params = self._find_nested_string(
+                    renderer, "createReplyParams"
+                ) or self._find_nested_string(renderer, "createCommentParams")
+                if not create_params:
+                    raise ServiceError("Replies are unavailable for this comment.")
+                result = self._browser_innertube_request(
+                    opener,
+                    api_key,
+                    "comment/create_comment",
+                    headers,
+                    {
+                        "context": context,
+                        "createCommentParams": create_params,
+                        "commentText": text_value,
+                    },
+                )
+            comment_id = self._find_nested_string(result, "commentId")
+            delete_endpoint = self._find_labeled_mapping(
+                result,
+                ("delete", "remove"),
+                "performCommentActionEndpoint",
+            )
+            return Comment(
+                comment_id,
+                author or "You",
+                text_value,
+                parent_id=parent_comment_id,
+                is_own=True,
+                delete_action=str(
+                    (delete_endpoint.get("action") if delete_endpoint else "")
+                    or ""
+                ),
+            )
+        except urllib.error.HTTPError as error:
+            raise ServiceError(
+                f"YouTube rejected the reply (HTTP {error.code})."
+            ) from error
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
+            raise ServiceError("Could not post the reply to YouTube.") from error
+
+    def browser_like_comment(
+        self,
+        item: MediaItem,
+        comment_id: str,
+        parent_comment_id: str = "",
+    ) -> None:
+        try:
+            with self._browser_comment_connection(item) as connection:
+                opener, api_key, context, headers, html = connection
+                comments = self._browser_comments_response(
+                    opener, api_key, context, headers, html, item.id
+                )
+                renderer = self._find_comment_renderer(comments, comment_id)
+                if not renderer and parent_comment_id:
+                    parent_renderer = self._find_comment_renderer(
+                        comments, parent_comment_id
+                    )
+                    continuation = (
+                        self._find_nested_string(parent_renderer, "token")
+                        if parent_renderer
+                        else ""
+                    )
+                    if continuation:
+                        replies = self._browser_innertube_request(
+                            opener,
+                            api_key,
+                            "next",
+                            headers,
+                            {
+                                "context": context,
+                                "continuation": continuation,
+                                "videoId": item.id,
+                            },
+                        )
+                        renderer = self._find_comment_renderer(
+                            replies, comment_id
+                        )
+                if not renderer:
+                    raise ServiceError(
+                        "YouTube did not return that comment's like action."
+                    )
+                like_endpoint = self._find_nested_mapping(
+                    renderer, "likeEndpoint"
+                )
+                if like_endpoint:
+                    self._browser_innertube_request(
+                        opener,
+                        api_key,
+                        "like/like",
+                        headers,
+                        {"context": context, **like_endpoint},
+                    )
+                    return
+                perform = self._find_labeled_mapping(
+                    renderer,
+                    ("like",),
+                    "performCommentActionEndpoint",
+                )
+                action = perform.get("action") if perform else None
+                if not isinstance(action, str) or not action:
+                    raise ServiceError("Liking is unavailable for this comment.")
+                self._browser_innertube_request(
+                    opener,
+                    api_key,
+                    "comment/perform_comment_action",
+                    headers,
+                    {"context": context, "actions": [action]},
+                )
+        except urllib.error.HTTPError as error:
+            raise ServiceError(
+                f"YouTube rejected the like (HTTP {error.code})."
+            ) from error
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
+            raise ServiceError("Could not like the comment on YouTube.") from error
+
+    def browser_delete_comment(
+        self,
+        item: MediaItem,
+        comment_id: str,
+        delete_action: str = "",
+        parent_comment_id: str = "",
+    ) -> None:
+        try:
+            with self._browser_comment_connection(item) as connection:
+                opener, api_key, context, headers, html = connection
+                action: object = delete_action
+                if not action:
+                    comments = self._browser_comments_response(
+                        opener, api_key, context, headers, html, item.id
+                    )
+                    renderer = self._find_comment_renderer(comments, comment_id)
+                    if not renderer and parent_comment_id:
+                        parent_renderer = self._find_comment_renderer(
+                            comments, parent_comment_id
+                        )
+                        continuation = (
+                            self._find_nested_string(parent_renderer, "token")
+                            if parent_renderer
+                            else ""
+                        )
+                        if continuation:
+                            replies = self._browser_innertube_request(
+                                opener,
+                                api_key,
+                                "next",
+                                headers,
+                                {
+                                    "context": context,
+                                    "continuation": continuation,
+                                    "videoId": item.id,
+                                },
+                            )
+                            renderer = self._find_comment_renderer(
+                                replies, comment_id
+                            )
+                    if not renderer:
+                        raise ServiceError(
+                            "YouTube did not return that comment's delete action."
+                        )
+                    perform = self._find_labeled_mapping(
+                        renderer,
+                        ("delete", "remove"),
+                        "performCommentActionEndpoint",
+                    )
+                    action = perform.get("action") if perform else None
+                if not isinstance(action, str) or not action:
+                    raise ServiceError("This comment cannot be deleted.")
+                self._browser_innertube_request(
+                    opener,
+                    api_key,
+                    "comment/perform_comment_action",
+                    headers,
+                    {"context": context, "actions": [action]},
+                )
+        except urllib.error.HTTPError as error:
+            raise ServiceError(
+                f"YouTube rejected the deletion (HTTP {error.code})."
+            ) from error
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
+            raise ServiceError("Could not delete the comment on YouTube.") from error
+
+    @contextmanager
+    def _browser_comment_connection(
+        self, item: MediaItem
+    ) -> Iterator[
+        tuple[
+            urllib.request.OpenerDirector,
+            object,
+            dict[str, Any],
+            dict[str, str],
+            str,
+        ]
+    ]:
+        if not self.browser:
+            raise ServiceError("Connect a browser session before using comments.")
+        cookie_path = self._export_browser_cookies()
+        try:
+            jar = http.cookiejar.MozillaCookieJar(cookie_path)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(jar)
+            )
+            video_url = str(
+                item.payload.get("webpage_url")
+                or f"https://www.youtube.com/watch?v={item.id}"
+            )
+            request = urllib.request.Request(
+                video_url,
+                headers={
+                    "Accept-Language": "en-US,en;q=0.8",
+                    "User-Agent": "Mozilla/5.0 TubeFin/1.3",
+                },
+            )
+            with opener.open(request, timeout=30) as response:
+                html = response.read(12 * 1024 * 1024).decode(
+                    "utf-8", errors="ignore"
+                )
+            config = self._youtube_page_config(html)
+            api_key = config.get("INNERTUBE_API_KEY")
+            context = config.get("INNERTUBE_CONTEXT")
+            if not api_key or not isinstance(context, dict):
+                raise ServiceError("YouTube did not expose its comment endpoint.")
+            headers = self._browser_innertube_headers(config, jar)
+            yield opener, api_key, context, headers, html
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(cookie_path)
+
+    def _browser_comments_response(
+        self,
+        opener: urllib.request.OpenerDirector,
+        api_key: object,
+        context: dict[str, Any],
+        headers: dict[str, str],
+        html: str,
+        video_id: str,
+    ) -> dict[str, Any]:
+        continuation = self._comment_continuation(html)
+        if not continuation:
+            raise ServiceError("YouTube did not expose its comments.")
+        return self._browser_innertube_request(
+            opener,
+            api_key,
+            "next",
+            headers,
+            {
+                "context": context,
+                "continuation": continuation,
+                "videoId": video_id,
+            },
+        )
+
+    @staticmethod
+    def _browser_innertube_headers(
+        config: dict[str, Any], jar: http.cookiejar.MozillaCookieJar
+    ) -> dict[str, str]:
+        sapisid = next(
+            (
+                cookie.value
+                for cookie in jar
+                if cookie.name in {"SAPISID", "__Secure-3PAPISID"}
+            ),
+            "",
+        )
+        if not sapisid:
+            raise ServiceError("The browser session is missing YouTube sign-in cookies.")
+        timestamp = int(time.time())
+        origin = "https://www.youtube.com"
+        digest = hashlib.sha1(
+            f"{timestamp} {sapisid} {origin}".encode(), usedforsecurity=False
+        ).hexdigest()
+        context = config.get("INNERTUBE_CONTEXT")
+        client = context.get("client") if isinstance(context, dict) else {}
+        if not isinstance(client, dict):
+            client = {}
+        return {
+            "Authorization": f"SAPISIDHASH {timestamp}_{digest}",
+            "Content-Type": "application/json",
+            "Origin": origin,
+            "X-Origin": origin,
+            "X-Goog-AuthUser": "0",
+            "X-Youtube-Bootstrap-Logged-In": "true",
+            "X-Youtube-Client-Name": str(
+                config.get("INNERTUBE_CONTEXT_CLIENT_NAME") or "1"
+            ),
+            "X-Youtube-Client-Version": str(client.get("clientVersion") or ""),
+            "User-Agent": "Mozilla/5.0 TubeFin/1.3",
+        }
+
+    @staticmethod
+    def _browser_innertube_request(
+        opener: urllib.request.OpenerDirector,
+        api_key: object,
+        endpoint: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = urllib.request.Request(
+            (
+                f"https://www.youtube.com/youtubei/v1/{endpoint}"
+                f"?key={urllib.parse.quote(str(api_key))}&prettyPrint=false"
+            ),
+            data=json.dumps(body, separators=(",", ":")).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with opener.open(request, timeout=30) as response:
+            payload = response.read()
+            return json.loads(payload) if payload else {}
+
+    @staticmethod
+    def _find_nested_string(value: object, key: str) -> str:
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+            for child in value.values():
+                found = YouTubeService._find_nested_string(child, key)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = YouTubeService._find_nested_string(child, key)
+                if found:
+                    return found
+        return ""
+
+    @staticmethod
+    def _find_nested_mapping(
+        value: object, key: str
+    ) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+            for child in value.values():
+                found = YouTubeService._find_nested_mapping(child, key)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = YouTubeService._find_nested_mapping(child, key)
+                if found is not None:
+                    return found
+        return None
+
+    @classmethod
+    def _find_comment_renderer(
+        cls, value: object, comment_id: str
+    ) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            for key in ("commentRenderer", "commentViewModel"):
+                renderer = value.get(key)
+                if isinstance(renderer, dict) and (
+                    str(renderer.get("commentId") or "") == comment_id
+                    or cls._find_nested_string(renderer, "commentId")
+                    == comment_id
+                ):
+                    return renderer
+            for child in value.values():
+                found = cls._find_comment_renderer(child, comment_id)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = cls._find_comment_renderer(child, comment_id)
+                if found is not None:
+                    return found
+        return None
+
+    @classmethod
+    def _find_labeled_mapping(
+        cls,
+        value: object,
+        labels: tuple[str, ...],
+        endpoint_key: str,
+    ) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            for child in value.values():
+                found = cls._find_labeled_mapping(
+                    child, labels, endpoint_key
+                )
+                if found is not None:
+                    return found
+            endpoint = value.get(endpoint_key)
+            if not isinstance(endpoint, dict):
+                for wrapper_key in (
+                    "serviceEndpoint",
+                    "navigationEndpoint",
+                    "innertubeCommand",
+                ):
+                    wrapper = value.get(wrapper_key)
+                    if isinstance(wrapper, dict) and isinstance(
+                        wrapper.get(endpoint_key), dict
+                    ):
+                        endpoint = wrapper[endpoint_key]
+                        break
+            if isinstance(endpoint, dict):
+                serialized = json.dumps(value, ensure_ascii=False).casefold()
+                if any(label.casefold() in serialized for label in labels):
+                    return endpoint
+        elif isinstance(value, list):
+            for child in value:
+                found = cls._find_labeled_mapping(
+                    child, labels, endpoint_key
+                )
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _create_comment_params(html: str) -> str:
+        match = re.search(
+            r'"createCommentParams":"((?:\\.|[^"\\])*)"', html
+        )
+        if not match:
+            return ""
+        try:
+            return str(json.loads(f'"{match.group(1)}"'))
+        except json.JSONDecodeError:
+            return ""
+
+    @classmethod
+    def _comment_continuation(cls, html: str) -> str:
+        match = re.search(r"var ytInitialData = (\{.*?\});</script>", html, re.DOTALL)
+        if not match:
+            return ""
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return ""
+
+        def walk(value: object) -> str:
+            if isinstance(value, dict):
+                section = value.get("itemSectionRenderer")
+                if isinstance(section, dict) and (
+                    section.get("sectionIdentifier") == "comment-item-section"
+                    or section.get("targetId") == "comments-section"
+                ):
+                    return cls._find_nested_string(section, "token")
+                for child in value.values():
+                    found = walk(child)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = walk(child)
+                    if found:
+                        return found
+            return ""
+
+        return walk(data)
+
     def _export_browser_cookies(self) -> str:
         if not self.executable:
             raise ServiceError("yt-dlp is not installed.")
@@ -847,7 +1376,35 @@ class YouTubeService:
             audio_tracks,
             description=str(data.get("description") or ""),
             published_date=str(data.get("upload_date") or data.get("release_date") or ""),
+            chapters=self._chapters(data),
         )
+
+    @staticmethod
+    def _chapters(data: dict[str, Any]) -> list[VideoChapter]:
+        values = [value for value in data.get("chapters") or [] if isinstance(value, dict)]
+        duration = float(data.get("duration") or 0)
+        chapters: list[VideoChapter] = []
+        for index, value in enumerate(values):
+            try:
+                start = max(0.0, float(value.get("start_time") or 0))
+                following = values[index + 1] if index + 1 < len(values) else {}
+                end = float(
+                    value.get("end_time")
+                    or following.get("start_time")
+                    or duration
+                )
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            chapters.append(
+                VideoChapter(
+                    str(value.get("title") or f"Section {index + 1}"),
+                    start,
+                    end,
+                )
+            )
+        return chapters
 
     @staticmethod
     def _audio_tracks(data: dict[str, Any]) -> list[AudioTrack]:
@@ -1106,6 +1663,7 @@ class YouTubeService:
             timestamp=YouTubeService._integer(data.get("timestamp")),
             like_count=YouTubeService._integer(data.get("like_count")) or 0,
             parent_id=str(data["parent"]) if data.get("parent") is not None else None,
+            author_id=str(data.get("author_id") or ""),
         )
 
     @staticmethod
@@ -1187,6 +1745,86 @@ class YouTubeService:
                     "resourceId": {"kind": "youtube#video", "videoId": video_id},
                 }
             },
+        )
+
+    def api_create_comment(
+        self,
+        access_token: str,
+        video_id: str,
+        channel_id: str,
+        text: str,
+    ) -> Comment:
+        if not channel_id:
+            video = self._api(
+                "videos",
+                access_token,
+                {"part": "snippet", "id": video_id, "maxResults": 1},
+            )
+            first = next(iter(video.get("items") or []), {})
+            if isinstance(first, dict):
+                channel_id = str(
+                    (first.get("snippet") or {}).get("channelId") or ""
+                )
+        if not channel_id:
+            raise ServiceError("YouTube did not return the channel for this video.")
+        snippet: dict[str, Any] = {
+            "channelId": channel_id,
+            "videoId": video_id,
+            "topLevelComment": {"snippet": {"textOriginal": text}},
+        }
+        result = self._api(
+            "commentThreads",
+            access_token,
+            {"part": "snippet"},
+            method="POST",
+            body={"snippet": snippet},
+        )
+        top_level = (result.get("snippet") or {}).get("topLevelComment") or {}
+        value = top_level.get("snippet") or {}
+        return Comment(
+            id=str(top_level.get("id") or result.get("id") or ""),
+            author=str(value.get("authorDisplayName") or "You"),
+            text=str(value.get("textOriginal") or value.get("textDisplay") or text),
+            like_count=int(value.get("likeCount") or 0),
+            is_own=True,
+        )
+
+    def api_reply_to_comment(
+        self, access_token: str, parent_comment_id: str, text: str
+    ) -> Comment:
+        result = self._api(
+            "comments",
+            access_token,
+            {"part": "snippet"},
+            method="POST",
+            body={
+                "snippet": {
+                    "parentId": parent_comment_id,
+                    "textOriginal": text,
+                }
+            },
+        )
+        value = result.get("snippet") or {}
+        author_channel = value.get("authorChannelId") or {}
+        return Comment(
+            id=str(result.get("id") or ""),
+            author=str(value.get("authorDisplayName") or "You"),
+            text=str(value.get("textOriginal") or value.get("textDisplay") or text),
+            parent_id=parent_comment_id,
+            author_id=str(
+                author_channel.get("value")
+                if isinstance(author_channel, dict)
+                else ""
+            ),
+            is_own=True,
+        )
+
+    def api_delete_comment(self, access_token: str, comment_id: str) -> None:
+        self._api(
+            "comments",
+            access_token,
+            {"id": comment_id},
+            method="DELETE",
         )
 
     def api_feed(
@@ -1396,7 +2034,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="1.2.0"'
+        'DeviceId="tubefin-desktop", Version="1.3.0"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:
@@ -2173,7 +2811,7 @@ class SeerrService:
         url = f"{self.base_url}/api/v1{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
-        headers = {"Accept": "application/json", "User-Agent": "TubeFin/1.1"}
+        headers = {"Accept": "application/json", "User-Agent": "TubeFin/1.3"}
         if authenticated and self.api_key:
             headers["X-Api-Key"] = self.api_key
         payload = None

@@ -281,6 +281,7 @@ class PrebufferedStream:
             default_label=self.stream.default_label,
             description=self.stream.description,
             published_date=self.stream.published_date,
+            chapters=self.stream.chapters,
         )
 
     def close(self) -> None:

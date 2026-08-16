@@ -12,7 +12,7 @@ It currently supports:
 - Conditional Seerr movie and show search/request support with Quick Connect
 - Search within Jellyfin
 - Thumbnail caching and native libmpv video/audio playback
-- Video details, channels, paginated comments/replies, captions, dubbed audio, and quality selection
+- Video details, channels, authenticated comments, chapter seeking, captions, dubbed audio, and quality selection
 - A mixed YouTube/Jellyfin queue with reordering, looping, prebuffering, and auto-advance
 - Multi-audio YouTube and metadata-preserving Jellyfin downloads, an offline library, and local playlists
 - Google desktop OAuth with subscriptions, liked videos, activity, and playlist management
@@ -89,7 +89,7 @@ Use TubeFin in accordance with YouTube's terms and the laws in your jurisdiction
 
 Account features require a Google OAuth **Desktop app** client ID with the YouTube
 Data API enabled. Open **YouTube account**, paste the client ID, and choose either
-read-only access or the explicit playlist-management scope. Authorization uses PKCE
+standard access with commenting or the explicit playlist-management scope. Authorization uses PKCE
 and a temporary loopback callback. Refresh tokens are stored through Secret Service
 (`libsecret`), never in `config.json`; signing out revokes the grant and removes the
 keyring entry.

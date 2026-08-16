@@ -44,6 +44,7 @@ class ResolvedStream:
     default_label: str = "Auto"
     description: str = ""
     published_date: str = ""
+    chapters: list[VideoChapter] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -68,6 +69,13 @@ class AudioTrack:
     headers: dict[str, str] = field(default_factory=dict)
     format_id: str = ""
     original: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class VideoChapter:
+    title: str
+    start: float
+    end: float
 
 
 class Availability(StrEnum):
@@ -110,6 +118,9 @@ class Comment:
     timestamp: int | None = None
     like_count: int = 0
     parent_id: str | None = None
+    author_id: str = ""
+    is_own: bool = False
+    delete_action: str = ""
     replies: list[Comment] = field(default_factory=list)
 
 

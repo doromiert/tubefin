@@ -22,6 +22,7 @@ from tubefin.services import ServiceError
 
 READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 MANAGE_SCOPE = "https://www.googleapis.com/auth/youtube"
+COMMENT_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 PROFILE_SCOPES = ["openid", "email", "profile"]
 
 
@@ -144,7 +145,9 @@ class OAuthClient:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/callback"
-        scopes = [*PROFILE_SCOPES, MANAGE_SCOPE if manage_playlists else READONLY_SCOPE]
+        scopes = [*PROFILE_SCOPES, READONLY_SCOPE, COMMENT_SCOPE]
+        if manage_playlists:
+            scopes.append(MANAGE_SCOPE)
         authorize_query = urllib.parse.urlencode(
             {
                 "client_id": self.client_id,

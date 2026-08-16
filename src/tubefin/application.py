@@ -35,6 +35,7 @@ from tubefin.models import (  # noqa: E402
     Availability,
     ChannelDetails,
     ChannelSubscription,
+    Comment,
     CommentPage,
     DownloadRecord,
     DownloadStatus,
@@ -45,12 +46,13 @@ from tubefin.models import (  # noqa: E402
     ResolvedStream,
     SponsorSegment,
     StreamVariant,
+    VideoChapter,
     VideoDetails,
     YouTubeBrowserSession,
 )
 from tubefin.mpris import MprisService  # noqa: E402
 from tubefin.mpv_player import MpvPlayer  # noqa: E402
-from tubefin.oauth import MANAGE_SCOPE, OAuthClient  # noqa: E402
+from tubefin.oauth import COMMENT_SCOPE, MANAGE_SCOPE, OAuthClient  # noqa: E402
 from tubefin.services import (  # noqa: E402
     JellyfinService,
     SeerrService,
@@ -96,14 +98,19 @@ HOME_SECTION_TITLES = {
 class VideoAspectFrame(Gtk.AspectFrame):
     """Aspect frame with a non-zero height inside a vertical scroll viewport."""
 
-    def __init__(self) -> None:
+    def __init__(self, height_limit: Callable[[], int | None] | None = None) -> None:
         super().__init__(ratio=16 / 9, obey_child=False)
+        self._height_limit = height_limit
         self._requested_video_height = 360
         self.set_size_request(-1, self._requested_video_height)
 
     def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
         Gtk.AspectFrame.do_size_allocate(self, width, height, baseline)
         requested = max(1, round(width * 9 / 16))
+        if self._height_limit:
+            limit = self._height_limit()
+            if limit is not None and limit > 0:
+                requested = min(requested, limit)
         if requested != self._requested_video_height:
             self._requested_video_height = requested
             GLib.idle_add(self._apply_video_height, requested)
@@ -547,6 +554,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _build_content(self) -> Adw.NavigationPage:
         toolbar = Adw.ToolbarView()
         self.header = Adw.HeaderBar()
+        self.header.add_css_class("content-header-overlay")
         self.window_title = Adw.WindowTitle(title="TubeFin", subtitle="")
         self.global_search = Gtk.SearchEntry(placeholder_text="Search")
         self.global_search.set_hexpand(True)
@@ -554,7 +562,22 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.global_search_clamp = Adw.Clamp(maximum_size=400)
         self.global_search_clamp.set_child(self.global_search)
         self.header.set_title_widget(self.global_search_clamp)
-        toolbar.add_top_bar(self.header)
+        header_overlay = Gtk.Overlay()
+        self.header_overlay = header_overlay
+        header_background = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.header_background = header_background
+        header_background.add_css_class("content-header-background")
+        header_background.append(Gtk.Box(hexpand=True))
+        self.header_sidebar_background = Gtk.Box(width_request=340)
+        self.header_sidebar_background.add_css_class(
+            "player-sidebar-header-background"
+        )
+        self.header_sidebar_background.set_visible(False)
+        header_background.append(self.header_sidebar_background)
+        header_overlay.set_child(header_background)
+        header_overlay.add_overlay(self.header)
+        header_overlay.set_measure_overlay(self.header, True)
+        toolbar.add_top_bar(header_overlay)
         self.context_back = Gtk.Button(
             icon_name="go-previous-symbolic", tooltip_text="Back", visible=False
         )
@@ -614,8 +637,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.syncplay_button = self.watch_together_button
         self.header.pack_end(self.watch_together_button)
 
+        self.content_overlay = Gtk.Overlay()
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        toolbar.set_content(content)
+        self.content_overlay.set_child(content)
+        toolbar.set_content(self.content_overlay)
         self.sync_banner = Adw.Banner(
             title="Connected to SyncTube, Jellyfin streaming is unsupported"
         )
@@ -677,7 +702,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.get_vadjustment().connect("value-changed", self._home_scroll_changed)
         clamp = Adw.Clamp(maximum_size=2400, tightening_threshold=1600)
-        clamp.set_margin_top(54)
+        clamp.set_margin_top(18)
         clamp.set_margin_bottom(36)
         clamp.set_margin_start(24)
         clamp.set_margin_end(24)
@@ -1197,9 +1222,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         content.set_margin_bottom(18)
         intro = Gtk.Label(
             label=(
-                "Only configure this when developing TubeFin or when you need remote YouTube "
-                "playlist editing. Sign-in, personal feeds, browsing, and playback use the "
-                "browser session above."
+                "Configure this when developing TubeFin, posting YouTube comments, or editing "
+                "remote YouTube playlists. Sign-in, personal feeds, browsing, and playback use "
+                "the browser session above."
             ),
             xalign=0,
             wrap=True,
@@ -1221,15 +1246,15 @@ class TubeFinWindow(Adw.ApplicationWindow):
         content.append(group)
 
         access = Adw.PreferencesGroup(title="API account access")
-        read_only = Adw.ActionRow(
-            title="Read-only account",
-            subtitle="Read subscriptions, likes, history, and playlists.",
+        standard = Adw.ActionRow(
+            title="Standard account",
+            subtitle="Read account activity and post comments.",
         )
         sign_in = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER)
         sign_in.add_css_class("suggested-action")
         sign_in.connect("clicked", lambda *_: self._oauth_sign_in(False))
-        read_only.add_suffix(sign_in)
-        access.add(read_only)
+        standard.add_suffix(sign_in)
+        access.add(standard)
         managed = Adw.ActionRow(
             title="Playlist editing account",
             subtitle="Also create, edit, and delete remote YouTube playlists.",
@@ -1330,6 +1355,15 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.channel_notifications.set_valign(Gtk.Align.CENTER)
         self.channel_notifications.connect("toggled", self._channel_notifications_toggled)
         heading.append(self.channel_notifications)
+        self.channel_share = Gtk.Button(
+            icon_name="send-to-symbolic", tooltip_text="Copy channel link"
+        )
+        self.channel_share.add_css_class("square-button")
+        self.channel_share.set_size_request(40, 40)
+        self.channel_share.set_valign(Gtk.Align.CENTER)
+        self.channel_share.set_sensitive(False)
+        self.channel_share.connect("clicked", lambda *_: self._share_channel())
+        heading.append(self.channel_share)
         self.channel_more_spinner = Gtk.Spinner(tooltip_text="Loading more videos")
         self.channel_more_spinner.set_visible(False)
         heading.append(self.channel_more_spinner)
@@ -1397,7 +1431,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return page
 
     def _build_player_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        page = Gtk.Overlay()
+        self.player_page_overlay = page
+        player_column = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=0, hexpand=True
+        )
+        self.player_column = player_column
+        page.set_child(player_column)
         back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back")
         back.connect("clicked", lambda *_: self._leave_player())
         self.header.pack_start(back)
@@ -1431,7 +1471,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_controls_host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.player_controls_host.set_visible(False)
         self.reparenting_player_controls = False
-        page.append(self.player_controls_host)
+        player_column.append(self.player_controls_host)
         self.player_scroller = Gtk.ScrolledWindow(vexpand=True)
         self.player_scroller.set_policy(
             Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
@@ -1439,7 +1479,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         player_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         player_content.set_hexpand(True)
         self.player_scroller.set_child(player_content)
-        page.append(self.player_scroller)
+        player_column.append(self.player_scroller)
 
         playback = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         playback.set_hexpand(True)
@@ -1473,19 +1513,39 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.fullscreen_title.set_can_target(False)
         self.fullscreen_title.set_visible(False)
         stage.add_overlay(self.fullscreen_title)
-        self.fullscreen_live_chat_button = Gtk.ToggleButton(
-            icon_name="chat-bubbles-empty-symbolic", tooltip_text="Live chat"
+        self.fullscreen_comments_button = Gtk.ToggleButton(
+            icon_name="user-available-symbolic",
+            tooltip_text="Comments",
         )
-        self.fullscreen_live_chat_button.add_css_class("fullscreen-chat-button")
-        self.fullscreen_live_chat_button.set_halign(Gtk.Align.END)
-        self.fullscreen_live_chat_button.set_valign(Gtk.Align.START)
-        self.fullscreen_live_chat_button.set_margin_top(16)
-        self.fullscreen_live_chat_button.set_margin_end(16)
+        self.fullscreen_comments_button.add_css_class("fullscreen-comments-button")
+        self.fullscreen_comments_button.set_size_request(42, 42)
+        self.fullscreen_comments_button.set_visible(False)
+        self.fullscreen_comments_button.connect(
+            "toggled", self._toggle_player_comments
+        )
+        self.fullscreen_live_chat_button = Gtk.ToggleButton(
+            label="Live chat",
+            icon_name="chat-bubbles-empty-symbolic",
+            tooltip_text="Live chat",
+        )
+        self.fullscreen_live_chat_button.add_css_class(
+            "fullscreen-sidebar-button"
+        )
         self.fullscreen_live_chat_button.set_visible(False)
         self.fullscreen_live_chat_button.connect(
             "toggled", self._toggle_player_live_chat
         )
-        stage.add_overlay(self.fullscreen_live_chat_button)
+        self.fullscreen_sidebar_controls = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+        self.fullscreen_sidebar_controls.set_halign(Gtk.Align.END)
+        self.fullscreen_sidebar_controls.set_valign(Gtk.Align.START)
+        self.fullscreen_sidebar_controls.set_margin_top(16)
+        self.fullscreen_sidebar_controls.set_margin_end(16)
+        self.fullscreen_sidebar_controls.append(self.fullscreen_comments_button)
+        self.fullscreen_sidebar_controls.append(self.fullscreen_live_chat_button)
+        stage.add_overlay(self.fullscreen_sidebar_controls)
         self.seek_feedback = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=6
         )
@@ -1527,16 +1587,31 @@ class TubeFinWindow(Adw.ApplicationWindow):
         player_status_box.append(self.player_status)
         stage.add_overlay(player_status_box)
         self.player_status_box = player_status_box
-        stage_frame = VideoAspectFrame()
+        stage_frame = VideoAspectFrame(self._normal_video_height_limit)
         stage_frame.set_hexpand(True)
         stage_frame.set_child(stage)
         playback.append(stage_frame)
 
+        self.player_sidebar_width = 340
+        self.player_sidebar_drag_width = self.player_sidebar_width
+        self.player_page_active = False
         self.player_comments_panel = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=340
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=0,
+            width_request=self.player_sidebar_width,
         )
         self.player_comments_panel.add_css_class("comments-sidebar")
+        self.player_comments_panel.set_halign(Gtk.Align.END)
+        self.player_comments_panel.set_valign(Gtk.Align.FILL)
+        self.player_comments_panel.set_vexpand(True)
         self.player_comments_panel.set_visible(False)
+        comments_resize = self._player_sidebar_resize_handle()
+        self.player_comments_panel.append(comments_resize)
+        comments_content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True
+        )
+        comments_content.add_css_class("player-sidebar-content")
+        self.player_comments_panel.append(comments_content)
         comments_heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         comments_title = Gtk.Label(label="Comments", xalign=0, hexpand=True)
         comments_title.add_css_class("title-2")
@@ -1545,7 +1620,67 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.comments_more.connect("clicked", lambda *_: self._load_comments())
         self.comments_more.set_visible(False)
         comments_heading.append(self.comments_more)
-        self.player_comments_panel.append(comments_heading)
+        comments_close = Gtk.Button(
+            icon_name="window-close-symbolic", tooltip_text="Close comments"
+        )
+        comments_close.add_css_class("flat")
+        comments_close.connect(
+            "clicked", lambda *_: self._close_player_sidebar()
+        )
+        comments_heading.append(comments_close)
+        comments_content.append(comments_heading)
+        self.comment_composer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        self.comment_composer.add_css_class("comment-composer")
+        editor_overlay = Gtk.Overlay()
+        comment_editor = Gtk.ScrolledWindow()
+        self.comment_editor = comment_editor
+        comment_editor.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        comment_editor.set_min_content_height(44)
+        comment_editor.set_max_content_height(128)
+        comment_editor.set_propagate_natural_height(True)
+        self.comment_entry = Gtk.TextView(
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            accepts_tab=False,
+            hexpand=True,
+        )
+        self.comment_entry.add_css_class("comment-entry")
+        self.comment_entry.get_buffer().connect(
+            "changed", lambda *_: self._comment_text_changed()
+        )
+        comment_keys = Gtk.EventControllerKey()
+        comment_keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        comment_keys.connect("key-pressed", self._comment_entry_key_pressed)
+        self.comment_entry.add_controller(comment_keys)
+        comment_editor.set_child(self.comment_entry)
+        editor_overlay.set_child(comment_editor)
+        self.comment_placeholder = Gtk.Label(
+            label="Add a comment…", xalign=0, yalign=0, wrap=True
+        )
+        self.comment_placeholder.add_css_class("comment-placeholder")
+        self.comment_placeholder.set_halign(Gtk.Align.FILL)
+        self.comment_placeholder.set_valign(Gtk.Align.START)
+        self.comment_placeholder.set_can_target(False)
+        editor_overlay.add_overlay(self.comment_placeholder)
+        self.comment_composer.append(editor_overlay)
+        comment_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        comment_actions.append(Gtk.Box(hexpand=True))
+        self.comment_send = Gtk.Button(tooltip_text="Post comment")
+        comment_send_content = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+        )
+        comment_send_content.append(Gtk.Label(label="Post comment"))
+        comment_send_content.append(
+            Gtk.Image.new_from_icon_name("paper-plane-symbolic")
+        )
+        self.comment_send.set_child(comment_send_content)
+        self.comment_send.connect("clicked", lambda *_: self._post_comment())
+        comment_actions.append(self.comment_send)
+        self.comment_composer.append(comment_actions)
+        self.comment_posting = False
+        comments_content.append(self.comment_composer)
         self.comments_loading_row = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=8
         )
@@ -1555,7 +1690,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.comments_loading_label = Gtk.Label(label="Loading comments…")
         self.comments_loading_row.append(self.comments_loading_label)
         self.comments_loading_row.set_visible(False)
-        self.player_comments_panel.append(self.comments_loading_row)
+        comments_content.append(self.comments_loading_row)
         comments_scroller = Gtk.ScrolledWindow(vexpand=True)
         self.comments_scroller = comments_scroller
         comments_scroller.get_vadjustment().connect(
@@ -1563,25 +1698,49 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.comments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         comments_scroller.set_child(self.comments_box)
-        self.player_comments_panel.append(comments_scroller)
-        playback.append(self.player_comments_panel)
+        comments_content.append(comments_scroller)
+        self.content_overlay.add_overlay(self.player_comments_panel)
 
         self.player_live_chat_panel = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=340
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=0,
+            width_request=self.player_sidebar_width,
         )
         self.player_live_chat_panel.add_css_class("live-chat-sidebar")
+        self.player_live_chat_panel.set_halign(Gtk.Align.END)
+        self.player_live_chat_panel.set_valign(Gtk.Align.FILL)
+        self.player_live_chat_panel.set_vexpand(True)
         self.player_live_chat_panel.set_visible(False)
-        live_chat_title = Gtk.Label(label="Live chat", xalign=0)
+        live_chat_resize = self._player_sidebar_resize_handle()
+        self.player_live_chat_panel.append(live_chat_resize)
+        live_chat_content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True
+        )
+        live_chat_content.add_css_class("player-sidebar-content")
+        self.player_live_chat_panel.append(live_chat_content)
+        live_chat_heading = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+        )
+        live_chat_title = Gtk.Label(label="Live chat", xalign=0, hexpand=True)
         live_chat_title.add_css_class("title-2")
-        self.player_live_chat_panel.append(live_chat_title)
+        live_chat_heading.append(live_chat_title)
+        live_chat_close = Gtk.Button(
+            icon_name="window-close-symbolic", tooltip_text="Close live chat"
+        )
+        live_chat_close.add_css_class("flat")
+        live_chat_close.connect(
+            "clicked", lambda *_: self._close_player_sidebar()
+        )
+        live_chat_heading.append(live_chat_close)
+        live_chat_content.append(live_chat_heading)
         self.live_chat_status = Gtk.Label(xalign=0, wrap=True)
         self.live_chat_status.add_css_class("dim-label")
-        self.player_live_chat_panel.append(self.live_chat_status)
+        live_chat_content.append(self.live_chat_status)
         self.live_chat_scroller = Gtk.ScrolledWindow(vexpand=True)
         self.live_chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.live_chat_rows: dict[str, Gtk.Widget] = {}
         self.live_chat_scroller.set_child(self.live_chat_box)
-        self.player_live_chat_panel.append(self.live_chat_scroller)
+        live_chat_content.append(self.live_chat_scroller)
         live_chat_input = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.live_chat_entry = Gtk.Entry(
             placeholder_text="Send a message…", hexpand=True, max_length=200
@@ -1593,8 +1752,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.live_chat_send.connect("clicked", lambda *_: self._send_live_chat())
         live_chat_input.append(self.live_chat_send)
-        self.player_live_chat_panel.append(live_chat_input)
-        playback.append(self.player_live_chat_panel)
+        live_chat_content.append(live_chat_input)
+        self.content_overlay.add_overlay(self.player_live_chat_panel)
         self.player_playback_row = playback
         player_content.append(playback)
         self.player_inline_controls_host = Gtk.Box(
@@ -1689,15 +1848,92 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_comments_button.connect("toggled", self._toggle_player_comments)
         player_actions.append(self.player_comments_button)
         details.append(player_actions)
+        self.player_actions = player_actions
         self.player_description = Gtk.Label(
-            xalign=0, yalign=0, wrap=True, selectable=True
+            xalign=0, yalign=0, wrap=True
         )
         self.player_description.add_css_class("dim-label")
         self.player_description.set_hexpand(True)
         details.append(self.player_description)
         player_content.append(details)
+        page.connect("notify::width", self._update_player_sidebar_layout)
         self._refresh_queue()
         return page
+
+    def _close_player_sidebar(self) -> None:
+        self.player_navigation_guard_until = time.monotonic() + 0.75
+        self.syncing_navigation = True
+        self.navigation.unselect_all()
+        self.syncing_navigation = False
+        if self.mpv_player:
+            self.mpv_player.grab_focus()
+        if self.player_comments_panel.get_visible():
+            self.player_comments_button.set_active(False)
+        elif self.player_live_chat_panel.get_visible():
+            self.player_live_chat_button.set_active(False)
+
+    def _player_sidebar_resize_handle(self) -> Gtk.Widget:
+        handle = Gtk.Box(width_request=10)
+        handle.add_css_class("player-sidebar-resize-handle")
+        handle.set_cursor_from_name("col-resize")
+        drag = Gtk.GestureDrag(button=1)
+        drag.connect("drag-begin", self._player_sidebar_drag_begin)
+        drag.connect("drag-update", self._player_sidebar_drag_update)
+        handle.add_controller(drag)
+        return handle
+
+    def _player_sidebar_drag_begin(
+        self, _gesture: Gtk.GestureDrag, _x: float, _y: float
+    ) -> None:
+        self.player_sidebar_drag_width = self.player_sidebar_width
+
+    def _player_sidebar_drag_update(
+        self, _gesture: Gtk.GestureDrag, offset_x: float, _offset_y: float
+    ) -> None:
+        page_width = max(360, self.player_page_overlay.get_width())
+        width = round(self.player_sidebar_drag_width - offset_x)
+        self.player_sidebar_width = max(280, min(width, page_width - 80))
+        for panel in (self.player_comments_panel, self.player_live_chat_panel):
+            panel.set_size_request(self.player_sidebar_width, -1)
+        self._comment_text_changed()
+        self._update_player_sidebar_layout()
+
+    def _update_player_sidebar_layout(self, *_args: object) -> None:
+        visible = self.player_page_active and (
+            self.player_comments_panel.get_visible()
+            or self.player_live_chat_panel.get_visible()
+        )
+        page_width = self.player_page_overlay.get_width()
+        if page_width > 0:
+            maximum = max(280, page_width - 80)
+            if self.player_sidebar_width > maximum:
+                self.player_sidebar_width = maximum
+                for panel in (
+                    self.player_comments_panel,
+                    self.player_live_chat_panel,
+                ):
+                    panel.set_size_request(self.player_sidebar_width, -1)
+        self.header_sidebar_background.set_size_request(
+            self.player_sidebar_width, -1
+        )
+        self.header_sidebar_background.set_visible(visible)
+        reserved = (
+            min(self.player_sidebar_width, max(0, page_width - 640))
+            if visible
+            else 0
+        )
+        if self.player_column.get_margin_end() != reserved:
+            self.player_column.set_margin_end(reserved)
+
+    def _normal_video_height_limit(self) -> int | None:
+        if self._player_is_fullscreen():
+            return None
+        viewport_height = self.player_scroller.get_height()
+        if viewport_height <= 0:
+            return None
+        # Keep the transport row plus the title and primary actions visible
+        # without scrolling in a normally sized window.
+        return max(180, viewport_height - 176)
 
     def _build_details_page(self) -> Gtk.Widget:
         scroller = Gtk.ScrolledWindow(vexpand=True)
@@ -4311,6 +4547,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         if hasattr(self, "youtube_settings_status"):
             self.youtube_settings_status.set_subtitle(self._youtube_connection_status())
+        if hasattr(self, "comment_composer"):
+            self._refresh_comment_composer()
         self.toast_overlay.add_toast(Adw.Toast(title=f"Signed in as {account.display_name}"))
         return GLib.SOURCE_REMOVE
 
@@ -4342,6 +4580,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.channel_cache.clear()
         self._refresh_accounts()
         self._sync_online_subscriptions()
+        if hasattr(self, "comment_composer"):
+            self._refresh_comment_composer()
 
     def _oauth_sign_out(self, account: OAuthAccount) -> None:
         run_async(
@@ -4360,6 +4600,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._refresh_accounts()
         if hasattr(self, "youtube_settings_status"):
             self.youtube_settings_status.set_subtitle(self._youtube_connection_status())
+        if hasattr(self, "comment_composer"):
+            self._refresh_comment_composer()
         return GLib.SOURCE_REMOVE
 
     def _load_account_feed(self, feed: str) -> None:
@@ -4381,7 +4623,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if MANAGE_SCOPE not in self.active_oauth_account.scopes:
                 self.account_grid.set_status(
                     "dialog-information-symbolic",
-                    "Read-only account",
+                    "Standard account",
                     "Sign in with playlist access to create, edit, and delete account playlists.",
                 )
                 return
@@ -4964,6 +5206,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.channel_cache.pop(self.channel_url, None)
         self.channel_loading = True
         if page == 1:
+            self.channel_share.set_sensitive(False)
             self.channel_grid.set_loading("Loading channel…")
         else:
             self.channel_more_spinner.set_visible(True)
@@ -4986,6 +5229,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.channel_more_spinner.stop()
         self.channel_more_spinner.set_visible(False)
         self.current_channel = channel
+        self.channel_share.set_sensitive(bool(channel.url))
         if page == 1 and self.channel_url and cache_result:
             self.channel_cache[self.channel_url] = (time.monotonic(), channel)
         self.channel_page = page
@@ -5092,6 +5336,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         state = "on" if button.get_active() else "off"
         self.toast_overlay.add_toast(Adw.Toast(title=f"Channel notifications {state}"))
 
+    def _share_channel(self) -> None:
+        channel = self.current_channel
+        display = Gdk.Display.get_default()
+        if not channel or not channel.url or not display:
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="This channel does not have a shareable link")
+            )
+            return
+        display.get_clipboard().set(channel.url)
+        self.toast_overlay.add_toast(Adw.Toast(title="Channel link copied"))
+
     def _toggle_current_subscription(self) -> None:
         if not self.current_item:
             return
@@ -5174,11 +5429,137 @@ class TubeFinWindow(Adw.ApplicationWindow):
         visible = button.get_active() and bool(
             self.current_item and self.current_item.source == "youtube"
         )
+        for toggle in (
+            self.player_comments_button,
+            self.fullscreen_comments_button,
+        ):
+            if toggle is not button and toggle.get_active() != visible:
+                toggle.set_active(visible)
         if visible and self.player_live_chat_button.get_active():
             self.player_live_chat_button.set_active(False)
         self.player_comments_panel.set_visible(visible)
+        self._update_player_sidebar_layout()
+        self._refresh_comment_composer()
         if visible and not self.comments_box.get_first_child():
             self._load_comments()
+
+    def _refresh_comment_composer(self) -> None:
+        available = self._commenting_available()
+        self.comment_composer.set_visible(True)
+        self.comment_entry.set_editable(available)
+        self.comment_entry.set_cursor_visible(available)
+        if available:
+            placeholder = "Add a comment…"
+        elif self.youtube_browser_checking:
+            placeholder = "Checking your YouTube sign-in…"
+        else:
+            placeholder = "Sign in to YouTube or connect an API account to post comments"
+        self.comment_placeholder.set_label(placeholder)
+        self._comment_text_changed()
+
+    def _commenting_available(self) -> bool:
+        return bool(
+            not self.comment_posting
+            and (
+                self.youtube_browser_session
+                or (
+                    self.active_oauth_account
+                    and COMMENT_SCOPE in self.active_oauth_account.scopes
+                )
+            )
+        )
+
+    def _comment_text(self) -> str:
+        buffer = self.comment_entry.get_buffer()
+        start, end = buffer.get_bounds()
+        return buffer.get_text(start, end, True)
+
+    def _comment_entry_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if (
+            keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+            and state & Gdk.ModifierType.CONTROL_MASK
+        ):
+            self._post_comment()
+            return True
+        return False
+
+    def _comment_text_changed(self) -> None:
+        text = self._comment_text()
+        columns = max(18, (self.player_sidebar_width - 72) // 8)
+        visual_lines = sum(
+            max(1, (len(line) + columns - 1) // columns)
+            for line in text.split("\n")
+        )
+        self.comment_editor.set_min_content_height(
+            max(44, min(128, 24 + visual_lines * 20))
+        )
+        available = self._commenting_available()
+        self.comment_placeholder.set_visible(not text)
+        self.comment_send.set_sensitive(available and bool(text.strip()))
+
+    def _post_comment(self) -> None:
+        text = self._comment_text().strip()
+        item = self.current_item
+        account = self.active_oauth_account
+        browser_session = self.youtube_browser_session
+        if not text or not item or item.source != "youtube":
+            return
+        if not browser_session and (
+            not account or COMMENT_SCOPE not in account.scopes
+        ):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Sign in to YouTube before posting a comment")
+            )
+            return
+        self.comment_posting = True
+        self.comment_entry.set_editable(False)
+        self.comment_send.set_sensitive(False)
+        if browser_session:
+            operation = lambda: self.youtube.browser_create_comment(
+                item,
+                text,
+                browser_session.display_name,
+            )
+        else:
+            operation = lambda: self.youtube.api_create_comment(
+                self.oauth.access_token(account),
+                item.id,
+                str(item.payload.get("channel_id") or ""),
+                text,
+            )
+        run_async(
+            operation,
+            lambda comment: self._comment_posted(item.id, comment),
+            self._comment_post_error,
+        )
+
+    def _comment_posted(self, item_id: str, comment: Comment) -> bool:
+        self.comment_posting = False
+        self._refresh_comment_composer()
+        if not self.current_item or self.current_item.id != item_id:
+            return GLib.SOURCE_REMOVE
+        self.comment_entry.get_buffer().set_text("")
+        child = self.comments_box.get_first_child()
+        while child:
+            following = child.get_next_sibling()
+            if child.has_css_class("comments-empty"):
+                self.comments_box.remove(child)
+            child = following
+        self.comments_box.prepend(self._comment_card(comment))
+        self.toast_overlay.add_toast(Adw.Toast(title="Comment posted"))
+        return GLib.SOURCE_REMOVE
+
+    def _comment_post_error(self, error: Exception) -> bool:
+        self.comment_posting = False
+        self._refresh_comment_composer()
+        self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
+        return GLib.SOURCE_REMOVE
 
     def _toggle_player_live_chat(self, button: Gtk.ToggleButton) -> None:
         visible = button.get_active() and self._synctube_active()
@@ -5191,6 +5572,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if visible and self.player_comments_button.get_active():
             self.player_comments_button.set_active(False)
         self.player_live_chat_panel.set_visible(visible)
+        self._update_player_sidebar_layout()
         self._refresh_live_chat_controls()
         if visible:
             GLib.idle_add(self._scroll_live_chat_to_bottom)
@@ -5250,7 +5632,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 f'<span foreground="{color}">{GLib.markup_escape_text(author_text)}</span>'
             )
         card.append(author)
-        text = Gtk.Label(label=message_text, xalign=0, wrap=True, selectable=True)
+        text = Gtk.Label(label=message_text, xalign=0, wrap=True)
         text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         card.append(text)
         self.live_chat_box.append(card)
@@ -5290,10 +5672,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         replies: Gtk.Box,
         indicator: Gtk.Label,
         disclosure: Gtk.Image,
-        reply_count: int,
+        comment: Comment,
     ) -> None:
         visible = not replies.get_visible()
         replies.set_visible(visible)
+        reply_count = len(comment.replies)
         indicator.set_label(
             "Hide replies"
             if visible
@@ -5312,68 +5695,518 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.comments_spinner.stop()
         self.comments_loading_row.set_visible(False)
         for comment in page.comments:
-            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            card.add_css_class("comment-card")
-            summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            author = Gtk.Label(label=f"{comment.author} · {comment.like_count:,} likes", xalign=0)
-            author.add_css_class("heading")
-            summary.append(author)
-            text = Gtk.Label(label=comment.text, xalign=0, wrap=True)
-            summary.append(text)
-            replies = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            for reply in comment.replies:
-                reply_text = Gtk.Label(
-                    label=f"↳ {reply.author}: {reply.text}", xalign=0, wrap=True, selectable=True
-                )
-                reply_text.add_css_class("dim-label")
-                reply_text.set_margin_start(18)
-                replies.append(reply_text)
-            if not comment.replies:
-                no_replies = Gtk.Label(label="No replies to this comment yet.", xalign=0)
-                no_replies.add_css_class("dim-label")
-                no_replies.set_margin_start(18)
-                replies.append(no_replies)
-            replies.set_visible(False)
-            footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-            reply_count = len(comment.replies)
-            indicator = Gtk.Label(
-                label=(
-                    f"View {reply_count} {'reply' if reply_count == 1 else 'replies'}"
-                    if reply_count
-                    else "View replies"
-                ),
-                xalign=0,
-                hexpand=True,
-            )
-            indicator.add_css_class("caption")
-            indicator.add_css_class("accent")
-            footer.append(indicator)
-            disclosure = Gtk.Image.new_from_icon_name("go-next-symbolic")
-            disclosure.add_css_class("accent")
-            footer.append(disclosure)
-            summary.append(footer)
-            open_comment = Gtk.Button(child=summary)
-            open_comment.add_css_class("flat")
-            open_comment.set_halign(Gtk.Align.FILL)
-            open_comment.connect(
-                "clicked",
-                self._toggle_comment_replies,
-                replies,
-                indicator,
-                disclosure,
-                reply_count,
-            )
-            card.append(open_comment)
-            card.append(replies)
-            self.comments_box.append(card)
+            self._mark_own_comment(comment)
+            self.comments_box.append(self._comment_card(comment))
         if not page.comments and not self.comments_box.get_first_child():
             empty = Gtk.Label(label="No comments yet.", wrap=True)
             empty.add_css_class("dim-label")
+            empty.add_css_class("comments-empty")
             self.comments_box.append(empty)
         self.comment_cursor = page.next_cursor
         self.comments_more.set_sensitive(page.next_cursor is not None)
         self.comments_more.set_label("Load more" if page.next_cursor else "All comments loaded")
         self.comments_more.set_visible(page.next_cursor is not None)
+        return GLib.SOURCE_REMOVE
+
+    def _mark_own_comment(self, comment: Comment) -> None:
+        browser = self.youtube_browser_session
+        account = self.active_oauth_account
+        comment.is_own = bool(
+            comment.is_own
+            or (
+                browser
+                and (
+                    comment.author_id == browser.channel_id
+                    or comment.author == browser.display_name
+                )
+            )
+            or (account and comment.author == account.display_name)
+        )
+        for reply in comment.replies:
+            self._mark_own_comment(reply)
+
+    @staticmethod
+    def _empty_replies_label() -> Gtk.Label:
+        empty = Gtk.Label(
+            label="No replies to this comment yet.", xalign=0
+        )
+        empty.add_css_class("dim-label")
+        empty.add_css_class("comments-empty")
+        return empty
+
+    def _comment_card(self, comment: Comment) -> Gtk.Widget:
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("comment-card")
+        card.set_overflow(Gtk.Overflow.HIDDEN)
+        summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        summary.add_css_class("comment-summary")
+        author = Gtk.Label(label=comment.author, xalign=0)
+        author.add_css_class("heading")
+        summary.append(author)
+        text = Gtk.Label(
+            label=comment.text,
+            xalign=0,
+            wrap=True,
+        )
+        summary.append(text)
+        card.append(summary)
+
+        reply_count = len(comment.replies)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        actions.add_css_class("comment-actions")
+        like = Gtk.Button(
+            label=f"{comment.like_count:,}",
+            icon_name="emblem-favorite-symbolic",
+            tooltip_text="Like this comment",
+        )
+        like.add_css_class("flat")
+        like.connect("clicked", self._like_comment, comment)
+        actions.append(like)
+        reply = Gtk.Button(
+            icon_name="mail-reply-sender-symbolic",
+            tooltip_text="Reply to this comment",
+        )
+        reply.add_css_class("flat")
+        actions.append(reply)
+        if comment.is_own:
+            delete = Gtk.Button(
+                icon_name="edit-delete-symbolic",
+                tooltip_text="Delete your comment",
+            )
+            delete.add_css_class("flat")
+            delete.add_css_class("destructive-action")
+            delete.connect(
+                "clicked",
+                self._delete_comment,
+                comment,
+                self.comments_box,
+                card,
+                None,
+                None,
+                None,
+            )
+            actions.append(delete)
+        actions.append(Gtk.Box(hexpand=True))
+        replies_toggle_content = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=5
+        )
+        indicator = Gtk.Label(
+            label=(
+                f"View {reply_count} {'reply' if reply_count == 1 else 'replies'}"
+                if reply_count
+                else "View replies"
+            ),
+            xalign=0,
+        )
+        indicator.add_css_class("caption")
+        indicator.add_css_class("comment-replies-control")
+        replies_toggle_content.append(indicator)
+        disclosure = Gtk.Image.new_from_icon_name("go-next-symbolic")
+        disclosure.add_css_class("comment-replies-control")
+        replies_toggle_content.append(disclosure)
+        replies_toggle = Gtk.Button(child=replies_toggle_content)
+        replies_toggle.add_css_class("flat")
+        replies = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        replies_toggle.connect(
+            "clicked",
+            self._toggle_comment_replies,
+            replies,
+            indicator,
+            disclosure,
+            comment,
+        )
+        actions.append(replies_toggle)
+        card.append(actions)
+        for reply in comment.replies:
+            replies.append(
+                self._comment_reply_row(
+                    reply,
+                    comment,
+                    replies,
+                    indicator,
+                    disclosure,
+                )
+            )
+        if not comment.replies:
+            replies.append(self._empty_replies_label())
+        replies.set_visible(False)
+        replies.set_margin_start(16)
+        replies.set_margin_end(16)
+        replies.set_margin_bottom(10)
+        card.append(replies)
+
+        reply_composer = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+        )
+        reply_composer.add_css_class("comment-reply-composer")
+        reply_entry = Gtk.Entry(
+            placeholder_text=f"Reply to {comment.author}…",
+            hexpand=True,
+        )
+        reply_composer.append(reply_entry)
+        post_reply = Gtk.Button(
+            label="Post reply",
+            icon_name="paper-plane-symbolic",
+        )
+        reply_composer.append(post_reply)
+        reply.connect(
+            "clicked",
+            self._toggle_reply_composer,
+            reply_composer,
+            reply_entry,
+        )
+        post_reply.connect(
+            "clicked",
+            self._post_reply,
+            comment,
+            reply_entry,
+            post_reply,
+            replies,
+            indicator,
+            disclosure,
+        )
+        reply_keys = Gtk.EventControllerKey()
+        reply_keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        reply_keys.connect(
+            "key-pressed",
+            self._reply_entry_key_pressed,
+            comment,
+            reply_entry,
+            post_reply,
+            replies,
+            indicator,
+            disclosure,
+        )
+        reply_entry.add_controller(reply_keys)
+        reply_entry.connect(
+            "activate",
+            self._post_reply,
+            comment,
+            reply_entry,
+            post_reply,
+            replies,
+            indicator,
+            disclosure,
+        )
+        reply_composer.set_visible(False)
+        card.append(reply_composer)
+        return card
+
+    def _comment_reply_row(
+        self,
+        reply: Comment,
+        parent: Comment,
+        replies: Gtk.Box,
+        indicator: Gtk.Label,
+        disclosure: Gtk.Image,
+    ) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.add_css_class("comment-reply")
+        reply_text = Gtk.Label(
+            label=f"↳ {reply.author}: {reply.text}",
+            xalign=0,
+            wrap=True,
+            hexpand=True,
+        )
+        reply_text.add_css_class("dim-label")
+        row.append(reply_text)
+        like = Gtk.Button(
+            label=f"{reply.like_count:,}",
+            icon_name="emblem-favorite-symbolic",
+            tooltip_text="Like this reply",
+        )
+        like.add_css_class("flat")
+        like.connect("clicked", self._like_comment, reply)
+        row.append(like)
+        if reply.is_own:
+            delete = Gtk.Button(
+                icon_name="edit-delete-symbolic",
+                tooltip_text="Delete your reply",
+            )
+            delete.add_css_class("flat")
+            delete.add_css_class("destructive-action")
+            delete.connect(
+                "clicked",
+                self._delete_comment,
+                reply,
+                replies,
+                row,
+                parent,
+                indicator,
+                disclosure,
+            )
+            row.append(delete)
+        return row
+
+    @staticmethod
+    def _toggle_reply_composer(
+        _button: Gtk.Button,
+        composer: Gtk.Box,
+        entry: Gtk.Entry,
+    ) -> None:
+        visible = not composer.get_visible()
+        composer.set_visible(visible)
+        if visible:
+            entry.grab_focus()
+
+    def _reply_entry_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+        parent: Comment,
+        entry: Gtk.Entry,
+        post_button: Gtk.Button,
+        replies: Gtk.Box,
+        indicator: Gtk.Label,
+        disclosure: Gtk.Image,
+    ) -> bool:
+        if (
+            keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+            and state & Gdk.ModifierType.CONTROL_MASK
+        ):
+            self._post_reply(
+                post_button,
+                parent,
+                entry,
+                post_button,
+                replies,
+                indicator,
+                disclosure,
+            )
+            return True
+        return False
+
+    def _post_reply(
+        self,
+        _button: Gtk.Widget,
+        parent: Comment,
+        entry: Gtk.Entry,
+        post_button: Gtk.Button,
+        replies: Gtk.Box,
+        indicator: Gtk.Label,
+        disclosure: Gtk.Image,
+    ) -> None:
+        text = entry.get_text().strip()
+        item = self.current_item
+        browser = self.youtube_browser_session
+        account = self.active_oauth_account
+        if not text or not item or item.source != "youtube":
+            return
+        if not browser and (
+            not account or COMMENT_SCOPE not in account.scopes
+        ):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Sign in to YouTube before replying")
+            )
+            return
+        entry.set_sensitive(False)
+        post_button.set_sensitive(False)
+        if browser:
+            operation = lambda: self.youtube.browser_reply_to_comment(
+                item,
+                parent.id,
+                text,
+                browser.display_name,
+            )
+        else:
+            operation = lambda: self.youtube.api_reply_to_comment(
+                self.oauth.access_token(account),
+                parent.id,
+                text,
+            )
+        run_async(
+            operation,
+            lambda reply: self._reply_posted(
+                item.id,
+                parent,
+                reply,
+                entry,
+                post_button,
+                replies,
+                indicator,
+                disclosure,
+            ),
+            lambda error: self._reply_post_error(
+                error, entry, post_button
+            ),
+        )
+
+    def _reply_posted(
+        self,
+        item_id: str,
+        parent: Comment,
+        reply: Comment,
+        entry: Gtk.Entry,
+        post_button: Gtk.Button,
+        replies: Gtk.Box,
+        indicator: Gtk.Label,
+        disclosure: Gtk.Image,
+    ) -> bool:
+        entry.set_sensitive(True)
+        post_button.set_sensitive(True)
+        if not self.current_item or self.current_item.id != item_id:
+            return GLib.SOURCE_REMOVE
+        entry.set_text("")
+        composer = entry.get_parent()
+        if composer:
+            composer.set_visible(False)
+        child = replies.get_first_child()
+        while child:
+            following = child.get_next_sibling()
+            if child.has_css_class("comments-empty"):
+                replies.remove(child)
+            child = following
+        self._mark_own_comment(reply)
+        parent.replies.append(reply)
+        replies.append(
+            self._comment_reply_row(
+                reply,
+                parent,
+                replies,
+                indicator,
+                disclosure,
+            )
+        )
+        replies.set_visible(True)
+        indicator.set_label("Hide replies")
+        disclosure.set_from_icon_name("pan-down-symbolic")
+        self.toast_overlay.add_toast(Adw.Toast(title="Reply posted"))
+        return GLib.SOURCE_REMOVE
+
+    def _reply_post_error(
+        self,
+        error: Exception,
+        entry: Gtk.Entry,
+        post_button: Gtk.Button,
+    ) -> bool:
+        entry.set_sensitive(True)
+        post_button.set_sensitive(True)
+        self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
+        return GLib.SOURCE_REMOVE
+
+    def _like_comment(self, button: Gtk.Button, comment: Comment) -> None:
+        item = self.current_item
+        if not self.youtube_browser_session:
+            self.toast_overlay.add_toast(
+                Adw.Toast(
+                    title="Connect your YouTube browser session to like comments"
+                )
+            )
+            return
+        if not item or item.source != "youtube" or not comment.id:
+            return
+        button.set_sensitive(False)
+        run_async(
+            lambda: self.youtube.browser_like_comment(
+                item,
+                comment.id,
+                comment.parent_id or "",
+            ),
+            lambda _result: self._comment_liked(comment, button),
+            lambda error: self._comment_action_error(error, button),
+        )
+
+    def _comment_liked(
+        self, comment: Comment, button: Gtk.Button
+    ) -> bool:
+        comment.like_count += 1
+        button.set_label(f"{comment.like_count:,}")
+        button.set_tooltip_text("You liked this comment")
+        button.add_css_class("suggested-action")
+        return GLib.SOURCE_REMOVE
+
+    def _delete_comment(
+        self,
+        button: Gtk.Button,
+        comment: Comment,
+        container: Gtk.Box,
+        row: Gtk.Widget,
+        parent: Comment | None,
+        indicator: Gtk.Label | None,
+        disclosure: Gtk.Image | None,
+    ) -> None:
+        item = self.current_item
+        browser = self.youtube_browser_session
+        account = self.active_oauth_account
+        if not item or item.source != "youtube" or not comment.id:
+            return
+        if not browser and (
+            not account or COMMENT_SCOPE not in account.scopes
+        ):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Sign in to YouTube before deleting comments")
+            )
+            return
+        button.set_sensitive(False)
+        if browser:
+            operation = lambda: self.youtube.browser_delete_comment(
+                item,
+                comment.id,
+                comment.delete_action,
+                comment.parent_id or "",
+            )
+        else:
+            operation = lambda: self.youtube.api_delete_comment(
+                self.oauth.access_token(account), comment.id
+            )
+        run_async(
+            operation,
+            lambda _result: self._comment_deleted(
+                comment,
+                container,
+                row,
+                parent,
+                indicator,
+                disclosure,
+            ),
+            lambda error: self._comment_action_error(error, button),
+        )
+
+    def _comment_deleted(
+        self,
+        comment: Comment,
+        container: Gtk.Box,
+        row: Gtk.Widget,
+        parent: Comment | None,
+        indicator: Gtk.Label | None,
+        disclosure: Gtk.Image | None,
+    ) -> bool:
+        if row.get_parent() is container:
+            container.remove(row)
+        if parent is not None:
+            parent.replies = [
+                reply for reply in parent.replies if reply.id != comment.id
+            ]
+            if not parent.replies:
+                container.append(self._empty_replies_label())
+            if indicator:
+                count = len(parent.replies)
+                indicator.set_label(
+                    "Hide replies"
+                    if container.get_visible()
+                    else (
+                        f"View {count} {'reply' if count == 1 else 'replies'}"
+                        if count
+                        else "View replies"
+                    )
+                )
+            if disclosure and not container.get_visible():
+                disclosure.set_from_icon_name("go-next-symbolic")
+        elif not container.get_first_child():
+            empty = Gtk.Label(label="No comments yet.", wrap=True)
+            empty.add_css_class("dim-label")
+            empty.add_css_class("comments-empty")
+            container.append(empty)
+        self.toast_overlay.add_toast(Adw.Toast(title="Comment deleted"))
+        return GLib.SOURCE_REMOVE
+
+    def _comment_action_error(
+        self, error: Exception, button: Gtk.Button
+    ) -> bool:
+        button.set_sensitive(True)
+        self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
         return GLib.SOURCE_REMOVE
 
     def _comments_error(self, error: Exception) -> bool:
@@ -5475,6 +6308,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.comments_loading_row.set_visible(False)
         self._clear_box(self.comments_box)
         self.player_comments_button.set_visible(item.source == "youtube")
+        self.fullscreen_comments_button.set_visible(
+            item.source == "youtube" and self._player_is_fullscreen()
+        )
+        self._refresh_comment_composer()
         live_chat_supported = item.source == "youtube" and self._synctube_active()
         live_chat_available = bool(
             live_chat_supported
@@ -5660,20 +6497,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _online_variants(
         self, item: MediaItem
-    ) -> tuple[list[StreamVariant], list[AudioTrack]]:
+    ) -> tuple[list[StreamVariant], list[AudioTrack], list[VideoChapter]]:
         online = self.youtube.resolve(item)
         variants = [StreamVariant("Online · Auto", online.url, online.headers)]
         variants.extend(
             StreamVariant(f"Online · {variant.label}", variant.url, variant.headers)
             for variant in online.variants
         )
-        return variants, online.audio_tracks
+        return variants, online.audio_tracks, list(online.chapters)
 
     def _online_variants_loaded(
         self,
         item_id: str,
         request_id: int,
-        options: tuple[list[StreamVariant], list[AudioTrack]],
+        options: tuple[list[StreamVariant], list[AudioTrack], list[VideoChapter]],
     ) -> bool:
         if (
             request_id == self.playback_request
@@ -5681,9 +6518,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
             and self.current_item.id == item_id
             and self.mpv_player
         ):
-            variants, audio_tracks = options
+            variants, audio_tracks, chapters = options
             self.mpv_player.set_variants(variants)
             self.mpv_player.set_audio_tracks(audio_tracks)
+            self.mpv_player.set_chapters(chapters)
         return GLib.SOURCE_REMOVE
 
     def _start_playback(
@@ -5695,12 +6533,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         variants = []
         subtitles = []
         audio_tracks = []
+        chapters = []
         if isinstance(stream, ResolvedStream):
             url = stream.url
             headers = stream.headers
             variants = stream.variants
             subtitles = stream.subtitles
             audio_tracks = stream.audio_tracks
+            chapters = stream.chapters
             default_label = stream.default_label
             self._set_player_description(
                 item, stream.description, stream.published_date
@@ -5719,6 +6559,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 variants,
                 subtitles,
                 audio_tracks,
+                chapters,
                 default_label,
             )
         if item.source == "youtube" and default_label == "Local download":
@@ -5735,7 +6576,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 lambda online: self._online_variants_loaded(
                     item.id,
                     request_id,
-                    ([StreamVariant("Online · Original", online.url, online.headers)], []),
+                    (
+                        [StreamVariant("Online · Original", online.url, online.headers)],
+                        [],
+                        list(online.chapters),
+                    ),
                 ),
                 lambda _error: None,
             )
@@ -6364,6 +7209,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.split_view.set_sidebar_width_fraction(fraction)
             self.sidebar_page.set_visible(True)
             self.sidebar_page.set_opacity(1)
+            self.header_overlay.set_visible(True)
             self.header.set_visible(True)
             self.header.set_opacity(1)
             self.player_details.set_visible(True)
@@ -6373,6 +7219,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.fullscreen_title.set_opacity(0)
             self.mpv_player.set_fullscreen_mode(False)
             self._set_player_controls_fullscreen(False)
+            self.fullscreen_comments_button.set_visible(False)
             self.fullscreen_live_chat_button.set_visible(False)
             self._update_transport_buttons()
             return
@@ -6383,6 +7230,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.fullscreen()
         self.sidebar_page.set_visible(False)
+        self.header_overlay.set_visible(False)
         self.split_view.set_min_sidebar_width(0)
         self.split_view.set_max_sidebar_width(0)
         self.split_view.set_sidebar_width_fraction(0)
@@ -6393,6 +7241,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._set_player_controls_fullscreen(True)
         self.fullscreen_title.set_visible(True)
         self.fullscreen_title.set_opacity(1)
+        self.fullscreen_comments_button.set_visible(
+            bool(self.current_item and self.current_item.source == "youtube")
+        )
         self.fullscreen_live_chat_button.set_visible(
             bool(
                 self._synctube_active()
@@ -6434,6 +7285,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if self.mpv_player and self.mpv_player.fullscreen_mode:
             self.fullscreen_title.set_visible(visible)
             self.fullscreen_title.set_opacity(1 if visible else 0)
+            for button in (
+                self.fullscreen_comments_button,
+                self.fullscreen_live_chat_button,
+            ):
+                button.set_opacity(1 if visible else 0)
+                button.set_can_target(visible)
 
     def _player_reveal_finished(
         self, revealer: Gtk.Revealer, _property: GObject.ParamSpec | None
@@ -6551,7 +7408,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.navigation_history.append(state)
         self.expected_page = name
         player = name == "player"
+        self.player_page_active = player
         self.player_expanded = player
+        if player:
+            self.header_background.add_css_class("player-header-background")
+        else:
+            self.header_background.remove_css_class("player-header-background")
         playlist = name == "playlist"
         context = name in {
             "browse-category",
@@ -6575,6 +7437,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if hasattr(self, "player_header_controls"):
             for control in self.player_header_controls:
                 control.set_visible(player)
+            if not player:
+                self.player_comments_button.set_active(False)
+                self.player_live_chat_button.set_active(False)
+                self.player_comments_panel.set_visible(False)
+                self.player_live_chat_panel.set_visible(False)
             self.player_live_chat_button.set_visible(
                 bool(
                     player
@@ -6592,9 +7459,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     and self.current_item.source == "youtube"
                 )
             )
+            self.fullscreen_comments_button.set_visible(
+                bool(
+                    player
+                    and self._player_is_fullscreen()
+                    and self.current_item
+                    and self.current_item.source == "youtube"
+                )
+            )
         if hasattr(self, "playlist_header_controls"):
             for control in self.playlist_header_controls:
                 control.set_visible(playlist and not self.remote_playlist_active)
+        if hasattr(self, "player_comments_panel"):
+            self._update_player_sidebar_layout()
         if player:
             self.header.set_title_widget(self.player_heading)
         elif (context and name not in {"browse-category", "playlist"}) or name == "requests":
@@ -8200,6 +9077,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.youtube_browser_session = None
             self.youtube_browser_error = ""
             self.youtube_browser_checking = True
+            if hasattr(self, "comment_composer"):
+                self._refresh_comment_composer()
             self.youtube_settings_status.set_subtitle(
                 f"Waiting for YouTube sign-in in {browser.title()}…"
             )
@@ -8233,6 +9112,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if hasattr(self, "youtube_sign_in_button"):
             self.youtube_sign_in_button.set_sensitive(True)
             self.youtube_sign_in_button.set_label("Open YouTube")
+        if hasattr(self, "comment_composer"):
+            self._refresh_comment_composer()
         self.toast_overlay.add_toast(
             Adw.Toast(title=f"Signed in to YouTube as {session.display_name}")
         )
@@ -8254,6 +9135,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if hasattr(self, "youtube_sign_in_button"):
             self.youtube_sign_in_button.set_sensitive(True)
             self.youtube_sign_in_button.set_label("Try again")
+        if hasattr(self, "comment_composer"):
+            self._refresh_comment_composer()
         if notify:
             self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
         self.home_signed_out.set_visible(
@@ -8426,6 +9309,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         state: Gdk.ModifierType,
     ) -> bool:
         page = self._visible_page_name()
+        if (
+            keyval == Gdk.KEY_Escape
+            and page == "player"
+            and (
+                self.player_comments_panel.get_visible()
+                or self.player_live_chat_panel.get_visible()
+            )
+        ):
+            self._close_player_sidebar()
+            return True
         focused = self.get_focus()
         while focused:
             if isinstance(focused, (Gtk.Editable, Gtk.TextView)):
@@ -8440,6 +9333,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             focused = focused.get_parent()
 
         control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         if control and keyval in (Gdk.KEY_f, Gdk.KEY_F, Gdk.KEY_l, Gdk.KEY_L):
             self._select_page("browse")
             self.global_search.grab_focus()
@@ -8468,14 +9362,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if keyval == Gdk.KEY_space:
                 self.mpv_player.toggle_pause()
                 return True
-            if keyval in (Gdk.KEY_Left, Gdk.KEY_h):
-                if control:
+            if keyval in (Gdk.KEY_Left, Gdk.KEY_h, Gdk.KEY_H):
+                if shift:
+                    self.mpv_player.seek_chapter(-1)
+                elif control:
                     self._play_previous_queued(reveal_player=True)
                 else:
                     self.mpv_player.seek_relative(-10)
                 return True
-            if keyval in (Gdk.KEY_Right, Gdk.KEY_l):
-                if control:
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_l, Gdk.KEY_L):
+                if shift:
+                    self.mpv_player.seek_chapter(1)
+                elif control:
                     self._play_next_queued(reveal_player=True)
                 else:
                     self.mpv_player.seek_relative(10)
@@ -8492,6 +9390,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Focus live chat", accelerator="c"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Seek backward", accelerator="h"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Seek forward", accelerator="l"))
+        group.add_shortcut(
+            Gtk.ShortcutsShortcut(title="Previous video section", accelerator="<Shift>h")
+        )
+        group.add_shortcut(
+            Gtk.ShortcutsShortcut(title="Next video section", accelerator="<Shift>l")
+        )
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Play or pause", accelerator="space"))
         group.add_shortcut(Gtk.ShortcutsShortcut(title="Quit", accelerator="<Control>Q"))
         section.add_group(group)

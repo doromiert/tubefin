@@ -23,9 +23,14 @@ gi.require_version("GdkWayland", "4.0")
 gi.require_version("GdkX11", "4.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gdk, GdkWayland, GdkX11, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkWayland, GdkX11, GLib, Gtk, Pango  # noqa: E402
 
-from tubefin.models import AudioTrack, StreamVariant, SubtitleTrack  # noqa: E402
+from tubefin.models import (  # noqa: E402
+    AudioTrack,
+    StreamVariant,
+    SubtitleTrack,
+    VideoChapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +177,203 @@ class MpvGLArea(Gtk.GLArea):
         return True
 
 
+class ChapterSeekBar(Gtk.DrawingArea):
+    """One continuous drag target rendered as chapter-sized track pieces."""
+
+    def __init__(self, on_seek: Callable[[float], None]) -> None:
+        super().__init__()
+        self.on_seek = on_seek
+        self.duration = 1.0
+        self.position = 0.0
+        self.chapters: list[VideoChapter] = []
+        self.drag_origin = 0.0
+        self.set_hexpand(True)
+        self.set_content_height(28)
+        self.set_draw_func(self._draw)
+        self.set_has_tooltip(True)
+        self.connect("query-tooltip", self._query_tooltip)
+
+        click = Gtk.GestureClick(button=1)
+        click.connect("pressed", self._pressed)
+        self.add_controller(click)
+        drag = Gtk.GestureDrag(button=1)
+        drag.connect("drag-begin", self._drag_begin)
+        drag.connect("drag-update", self._drag_update)
+        drag.group(click)
+        self.add_controller(drag)
+
+    def set_value(self, value: float) -> None:
+        value = max(0.0, min(float(value), self.duration))
+        if abs(value - self.position) >= 0.01:
+            self.position = value
+            self.queue_draw()
+
+    def get_value(self) -> float:
+        return self.position
+
+    def set_range(self, _minimum: float, maximum: float) -> None:
+        self.duration = max(1.0, float(maximum))
+        self.position = min(self.position, self.duration)
+        self.queue_draw()
+
+    def set_chapters(self, chapters: list[VideoChapter]) -> None:
+        self.chapters = sorted(chapters, key=lambda chapter: chapter.start)
+        self.queue_draw()
+
+    def chapter_target(self, direction: int) -> float | None:
+        starts = [chapter.start for chapter in self._sections()]
+        if len(starts) <= 1:
+            return None
+        if direction > 0:
+            return next(
+                (start for start in starts if start > self.position + 0.75),
+                None,
+            )
+        current = max(
+            (index for index, start in enumerate(starts) if start <= self.position),
+            default=0,
+        )
+        if self.position - starts[current] > 3:
+            return starts[current]
+        return starts[current - 1] if current else starts[0]
+
+    def chapter_at(self, value: float) -> VideoChapter | None:
+        if not self.chapters:
+            return None
+        sections = self._sections()
+        for index, section in enumerate(sections):
+            if section.start <= value < section.end:
+                return section
+            if index == len(sections) - 1 and value == section.end:
+                return section
+        return None
+
+    def _sections(self) -> list[VideoChapter]:
+        valid = [
+            chapter
+            for chapter in self.chapters
+            if 0 <= chapter.start < self.duration
+        ]
+        if not valid:
+            return [VideoChapter("Video", 0.0, self.duration)]
+        sections: list[VideoChapter] = []
+        if valid[0].start > 0:
+            sections.append(VideoChapter("Video", 0.0, valid[0].start))
+        for index, chapter in enumerate(valid):
+            end = (
+                valid[index + 1].start
+                if index + 1 < len(valid)
+                else self.duration
+            )
+            if end > chapter.start:
+                sections.append(VideoChapter(chapter.title, chapter.start, end))
+        return sections or [VideoChapter("Video", 0.0, self.duration)]
+
+    def _layout(self, width: float) -> list[tuple[VideoChapter, float, float]]:
+        sections = self._sections()
+        gap = 4.0 if len(sections) > 1 else 0.0
+        available = max(1.0, width - 16 - gap * (len(sections) - 1))
+        result: list[tuple[VideoChapter, float, float]] = []
+        cursor = 8.0
+        for section in sections:
+            section_width = available * (section.end - section.start) / self.duration
+            result.append((section, cursor, cursor + section_width))
+            cursor += section_width + gap
+        return result
+
+    def _time_at(self, x: float) -> float:
+        layout = self._layout(max(1, self.get_width()))
+        for index, (section, left, right) in enumerate(layout):
+            if x <= right:
+                fraction = max(0.0, min(1.0, (x - left) / max(1.0, right - left)))
+                return section.start + fraction * (section.end - section.start)
+            if index + 1 < len(layout) and x < layout[index + 1][1]:
+                return section.end
+        return self.duration
+
+    def _x_at(self, value: float, width: float) -> float:
+        for section, left, right in self._layout(width):
+            if value <= section.end:
+                fraction = (value - section.start) / max(0.001, section.end - section.start)
+                return left + max(0.0, min(1.0, fraction)) * (right - left)
+        return width
+
+    def _seek_at(self, x: float) -> None:
+        value = self._time_at(x)
+        self.set_value(value)
+        self.on_seek(value)
+
+    def _pressed(
+        self, _gesture: Gtk.GestureClick, _presses: int, x: float, _y: float
+    ) -> None:
+        self._seek_at(x)
+
+    def _drag_begin(self, _gesture: Gtk.GestureDrag, x: float, _y: float) -> None:
+        self.drag_origin = x
+
+    def _drag_update(
+        self, _gesture: Gtk.GestureDrag, offset_x: float, _offset_y: float
+    ) -> None:
+        self._seek_at(self.drag_origin + offset_x)
+
+    def _draw(
+        self,
+        _area: Gtk.DrawingArea,
+        context: object,
+        width: int,
+        height: int,
+    ) -> None:
+        center = height / 2
+        context.set_line_width(6)
+        context.set_line_cap(1)
+        for section, left, right in self._layout(width):
+            context.set_source_rgba(0.75, 0.75, 0.78, 0.3)
+            context.move_to(left + 3, center)
+            context.line_to(max(left + 3, right - 3), center)
+            context.stroke()
+            if self.position <= section.start:
+                continue
+            progress = min(self.position, section.end)
+            fraction = (progress - section.start) / max(0.001, section.end - section.start)
+            filled = left + fraction * (right - left)
+            context.set_source_rgba(0.57, 0.25, 0.7, 1)
+            context.move_to(left + 3, center)
+            context.line_to(max(left + 3, filled - 3), center)
+            context.stroke()
+        thumb = self._x_at(self.position, width)
+        context.set_source_rgba(0.92, 0.92, 0.94, 1)
+        context.arc(thumb, center, 8, 0, 6.283185307)
+        context.fill()
+
+    def _query_tooltip(
+        self,
+        _widget: Gtk.Widget,
+        x: int,
+        _y: int,
+        keyboard_mode: bool,
+        tooltip: Gtk.Tooltip,
+    ) -> bool:
+        value = self.position if keyboard_mode else self._time_at(x)
+        chapter = next(
+            (
+                section
+                for section in self._sections()
+                if section.start <= value <= section.end
+            ),
+            None,
+        )
+        total = max(0, int(value))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        timestamp = (
+            f"{hours}:{minutes:02d}:{seconds:02d}"
+            if hours
+            else f"{minutes}:{seconds:02d}"
+        )
+        tooltip.set_text(f"{chapter.title} · {timestamp}" if chapter else timestamp)
+        return True
+
+
 class MpvPlayer(Gtk.Box):
     def __init__(
         self,
@@ -214,6 +416,7 @@ class MpvPlayer(Gtk.Box):
         self.variants: list[StreamVariant] = []
         self.subtitles: list[SubtitleTrack] = []
         self.audio_tracks: list[AudioTrack] = []
+        self.chapters: list[VideoChapter] = []
         self.original_audio_id = ""
         self.external_audio_ids: dict[str, str] = {}
         self.default_url = ""
@@ -293,6 +496,14 @@ class MpvPlayer(Gtk.Box):
         self.playback_overlay.set_vexpand(True)
         self.playback_overlay.set_child(self.video_overlay)
         self.append(self.playback_overlay)
+        self.chapter_label = Gtk.Label(xalign=0)
+        self.chapter_label.add_css_class("chapter-label")
+        self.chapter_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.chapter_label.set_halign(Gtk.Align.FILL)
+        self.chapter_label.set_valign(Gtk.Align.END)
+        self.chapter_label.set_can_target(False)
+        self.chapter_label.set_visible(False)
+        self.playback_overlay.add_overlay(self.chapter_label)
         self.controls = self._build_controls()
         self.controls.set_halign(Gtk.Align.FILL)
         self.controls.set_valign(Gtk.Align.END)
@@ -324,10 +535,7 @@ class MpvPlayer(Gtk.Box):
         self.elapsed = Gtk.Label(label="00:00")
         self.elapsed.add_css_class("player-timestamp")
         controls.append(self.elapsed)
-        self.progress = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
-        self.progress.set_draw_value(False)
-        self.progress.set_hexpand(True)
-        self.progress.connect("change-value", self._seek)
+        self.progress = ChapterSeekBar(self.seek_absolute)
         controls.append(self.progress)
         self.duration = Gtk.Label(label="00:00")
         self.duration.add_css_class("player-timestamp")
@@ -472,6 +680,7 @@ class MpvPlayer(Gtk.Box):
         variants: list[StreamVariant] | None = None,
         subtitles: list[SubtitleTrack] | None = None,
         audio_tracks: list[AudioTrack] | None = None,
+        chapters: list[VideoChapter] | None = None,
         default_label: str = "Auto",
     ) -> None:
         self.should_play = True
@@ -481,6 +690,11 @@ class MpvPlayer(Gtk.Box):
         self.variants = variants or []
         self.subtitles = subtitles or []
         self.audio_tracks = audio_tracks or []
+        self.chapters = chapters or []
+        self.progress.set_range(0, 1)
+        self.progress.set_value(0)
+        self.progress.set_chapters(self.chapters)
+        self._sync_chapter_label()
         self.original_audio_id = ""
         self.external_audio_ids.clear()
         self._set_options()
@@ -502,6 +716,11 @@ class MpvPlayer(Gtk.Box):
         self.audio_tracks = combined
         self._set_audio_options()
         self._apply_audio_selection()
+
+    def set_chapters(self, chapters: list[VideoChapter]) -> None:
+        self.chapters = list(chapters)
+        self.progress.set_chapters(self.chapters)
+        self._sync_chapter_label()
 
     def set_default_audio_language(self, language: str) -> None:
         self.default_audio_language = language.strip()
@@ -543,8 +762,17 @@ class MpvPlayer(Gtk.Box):
 
     def seek_absolute(self, seconds: float) -> None:
         if not self.shutting_down:
+            self.progress.set_value(seconds)
+            self._sync_chapter_label()
             with suppress(mpv.ShutdownError):
                 self.player.command_async("seek", max(0, seconds), "absolute+exact")
+
+    def seek_chapter(self, direction: int) -> bool:
+        target = self.progress.chapter_target(direction)
+        if target is None:
+            return False
+        self.seek_absolute(target)
+        return True
 
     def resume_at(self, seconds: float) -> None:
         if float(self.player.duration or 0) > 0:
@@ -621,6 +849,7 @@ class MpvPlayer(Gtk.Box):
     def reveal_controls(self) -> None:
         self.controls.set_visible(True)
         self.fullscreen_transport.set_visible(self.fullscreen_mode)
+        self._sync_chapter_label()
         if self.on_controls_visibility:
             self.on_controls_visibility(True)
         if self.hide_controls_source:
@@ -632,6 +861,8 @@ class MpvPlayer(Gtk.Box):
     def set_fullscreen_mode(self, fullscreen: bool) -> None:
         self.fullscreen_mode = fullscreen
         self._move_transport_controls(fullscreen)
+        controls_height = self.controls.measure(Gtk.Orientation.VERTICAL, -1)[1]
+        self.chapter_label.set_margin_bottom(controls_height if fullscreen else 0)
         self.fullscreen_button.set_icon_name(
             "view-restore-symbolic" if fullscreen else "view-fullscreen-symbolic"
         )
@@ -871,6 +1102,7 @@ class MpvPlayer(Gtk.Box):
             return GLib.SOURCE_REMOVE
         self.controls.set_visible(False)
         self.fullscreen_transport.set_visible(False)
+        self._sync_chapter_label()
         if self.on_controls_visibility:
             self.on_controls_visibility(False)
         self.hide_controls_source = 0
@@ -883,10 +1115,6 @@ class MpvPlayer(Gtk.Box):
             GLib.source_remove(self.hide_controls_source)
             self.hide_controls_source = 0
         self._hide_controls()
-
-    def _seek(self, _scale: Gtk.Scale, _scroll: Gtk.ScrollType, value: float) -> bool:
-        self.player.command_async("seek", value, "absolute")
-        return True
 
     def _ready(self) -> bool:
         if not self.shutting_down:
@@ -1199,6 +1427,7 @@ class MpvPlayer(Gtk.Box):
         if self.shutting_down:
             return GLib.SOURCE_REMOVE
         self.progress.set_value(position)
+        self._sync_chapter_label()
         self.elapsed.set_label(self._time_label(position, self.time_has_hours))
         self._state_changed()
         return GLib.SOURCE_REMOVE
@@ -1212,7 +1441,16 @@ class MpvPlayer(Gtk.Box):
             self._time_label(self.progress.get_value(), self.time_has_hours)
         )
         self.duration.set_label(self._time_label(duration, self.time_has_hours))
+        self._sync_chapter_label()
         return GLib.SOURCE_REMOVE
+
+    def _sync_chapter_label(self) -> None:
+        chapter = self.progress.chapter_at(self.progress.get_value())
+        self.chapter_label.set_label(chapter.title if chapter else "")
+        self.chapter_label.set_visible(
+            chapter is not None
+            and (not self.fullscreen_mode or self.controls.get_visible())
+        )
 
     def _state_changed(self) -> None:
         if self.shutting_down or not self.on_state_changed:
