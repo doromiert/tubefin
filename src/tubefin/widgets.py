@@ -730,3 +730,20 @@ class SectionShelf(Gtk.Box):
                 target.remove(child)
                 return
             child = following
+
+    def cards(self) -> list[MediaCard]:
+        target = self.flow or self.row
+        if target is None:
+            return []
+        cards: list[MediaCard] = []
+        child = target.get_first_child()
+        while child:
+            card = (
+                child.get_child()
+                if isinstance(child, Gtk.FlowBoxChild)
+                else child
+            )
+            if isinstance(card, MediaCard):
+                cards.append(card)
+            child = child.get_next_sibling()
+        return cards

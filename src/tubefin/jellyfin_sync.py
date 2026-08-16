@@ -166,7 +166,12 @@ class JellyfinSyncPlayClient:
         elif kind in {"GroupLeft", "NotInGroup"}:
             self.group = None
             self.on_message({"type": "left"})
-        elif kind in {"UserJoined", "UserLeft"}:
+        elif kind == "UserJoined":
+            self.on_message(
+                {"type": "participant-joined", "participant": data}
+            )
+            self.on_message({"type": "members-changed"})
+        elif kind == "UserLeft":
             self.on_message({"type": "members-changed"})
         elif kind.endswith("Denied") or kind in {
             "GroupDoesNotExist",

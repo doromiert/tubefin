@@ -434,6 +434,7 @@ class MpvPlayer(Gtk.Box):
         self.time_has_hours = False
         self.bound_picker_popovers: set[int] = set()
         self.playback_speed = 1.0
+        self.subtitle_offset = 0.0
         self.sync_speed = 1.0
         self.last_audible_volume = 100.0
         self.last_motion: tuple[float, float] | None = None
@@ -585,6 +586,36 @@ class MpvPlayer(Gtk.Box):
         self.speed_control.append(speed_down)
         self.speed_control.append(self.speed_value)
         self.speed_control.append(speed_up)
+        self.subtitle_offset_control = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+        )
+        self.subtitle_offset_control.set_halign(Gtk.Align.FILL)
+        self.subtitle_offset_control.set_hexpand(True)
+        subtitle_earlier = Gtk.Button(
+            label="−", tooltip_text="Show subtitles 0.1 seconds earlier"
+        )
+        subtitle_earlier.add_css_class("speed-step-button")
+        subtitle_earlier.connect(
+            "clicked", lambda *_: self._step_subtitle_offset(-1)
+        )
+        self.subtitle_offset_value = Gtk.Button(
+            label="0.0s", tooltip_text="Reset subtitle offset"
+        )
+        self.subtitle_offset_value.add_css_class("speed-value-button")
+        self.subtitle_offset_value.set_hexpand(True)
+        self.subtitle_offset_value.connect(
+            "clicked", lambda *_: self.set_subtitle_offset(0.0)
+        )
+        subtitle_later = Gtk.Button(
+            label="+", tooltip_text="Show subtitles 0.1 seconds later"
+        )
+        subtitle_later.add_css_class("speed-step-button")
+        subtitle_later.connect(
+            "clicked", lambda *_: self._step_subtitle_offset(1)
+        )
+        self.subtitle_offset_control.append(subtitle_earlier)
+        self.subtitle_offset_control.append(self.subtitle_offset_value)
+        self.subtitle_offset_control.append(subtitle_later)
         self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 200, 1)
         self.volume.set_draw_value(False)
         self.volume.set_value(100)
@@ -609,16 +640,21 @@ class MpvPlayer(Gtk.Box):
         settings_box.set_margin_start(12)
         settings_box.set_margin_end(12)
         self.option_rows: dict[str, Gtk.Box] = {}
+        self.option_control_size_group = Gtk.SizeGroup(
+            mode=Gtk.SizeGroupMode.HORIZONTAL
+        )
         for label_text, control in (
             ("Quality", self.quality),
             ("Closed captions", self.captions),
             ("Audio track", self.audio),
             ("Network buffer", self.buffer),
             ("Playback speed", self.speed_control),
+            ("Subtitle offset", self.subtitle_offset_control),
             ("Volume", self.volume_control),
         ):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
             row.append(Gtk.Label(label=label_text, xalign=0, hexpand=True))
+            self.option_control_size_group.add_widget(control)
             row.append(control)
             settings_box.append(row)
             self.option_rows[label_text] = row
@@ -695,6 +731,7 @@ class MpvPlayer(Gtk.Box):
         self.progress.set_value(0)
         self.progress.set_chapters(self.chapters)
         self._sync_chapter_label()
+        self.set_subtitle_offset(0.0)
         self.original_audio_id = ""
         self.external_audio_ids.clear()
         self._set_options()
@@ -815,6 +852,21 @@ class MpvPlayer(Gtk.Box):
         )
         index = max(0, min(index + direction, len(self.speed_values) - 1))
         self.set_playback_speed(self.speed_values[index])
+
+    def set_subtitle_offset(self, seconds: float) -> None:
+        self.subtitle_offset = max(-10.0, min(10.0, round(seconds, 1)))
+        label = (
+            "0.0s"
+            if abs(self.subtitle_offset) < 0.05
+            else f"{self.subtitle_offset:+.1f}s"
+        )
+        self.subtitle_offset_value.set_label(label)
+        if not self.shutting_down:
+            with suppress(mpv.ShutdownError):
+                self.player.sub_delay = self.subtitle_offset
+
+    def _step_subtitle_offset(self, direction: int) -> None:
+        self.set_subtitle_offset(self.subtitle_offset + direction * 0.1)
 
     def set_volume(self, volume: float) -> None:
         self.volume.set_value(max(0, min(volume, 200)))
@@ -1075,6 +1127,7 @@ class MpvPlayer(Gtk.Box):
             self.audio,
             self.buffer,
             self.speed_control,
+            self.subtitle_offset_control,
             self.volume_control,
         )
         width = max(
@@ -1150,6 +1203,7 @@ class MpvPlayer(Gtk.Box):
         self.captions.set_model(Gtk.StringList.new(captions))
         self.captions.set_selected(self._preferred_caption_index())
         self.option_rows["Closed captions"].set_visible(bool(self.subtitles))
+        self.option_rows["Subtitle offset"].set_visible(bool(self.subtitles))
         self._set_audio_options()
         self.syncing_options = False
         GLib.idle_add(self._normalize_option_widths)

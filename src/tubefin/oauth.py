@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import webbrowser
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -110,6 +110,7 @@ class OAuthClient:
         *,
         manage_playlists: bool = False,
         open_browser: bool = True,
+        url_opener: Callable[[str], None] | None = None,
         timeout: int = 180,
     ) -> OAuthAccount:
         if not self.client_id:
@@ -163,7 +164,9 @@ class OAuthClient:
         )
         url = f"{self.AUTHORIZE_URL}?{authorize_query}"
         if open_browser:
-            webbrowser.open(url)
+            if url_opener is None:
+                raise ServiceError("No system browser launcher is available.")
+            url_opener(url)
         if not ready.wait(timeout):
             server.shutdown()
             raise ServiceError("Google sign-in timed out.")

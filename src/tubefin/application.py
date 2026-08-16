@@ -4,7 +4,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -59,7 +59,7 @@ from tubefin.services import (  # noqa: E402
     SponsorBlockService,
     YouTubeService,
 )
-from tubefin.streaming import PrebufferManager  # noqa: E402
+from tubefin.streaming import PrebufferedStream, PrebufferManager  # noqa: E402
 from tubefin.sync import RoomState, SyncTubeClient  # noqa: E402
 from tubefin.widgets import (  # noqa: E402
     MediaCard,
@@ -71,6 +71,7 @@ from tubefin.widgets import (  # noqa: E402
 )
 
 APP_ID = "io.github.doromiert.TubeFin"
+PLAYER_SIDEBAR_MIN_WIDTH = 280
 SPONSORBLOCK_CATEGORY_DETAILS = {
     "sponsor": ("Sponsors", "Paid promotions and advertisements"),
     "selfpromo": ("Self-promotion", "Merchandise, donations, and unpaid promotion"),
@@ -324,6 +325,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         }
         self.subscriptions = SubscriptionStore()
         self.prebuffer = PrebufferManager()
+        self.home_prefetch_mib = int(
+            self.player_settings["home_prefetch_mib"]
+        )
+        self.home_prebuffer = PrebufferManager(
+            concurrency=3,
+            capacity=28,
+            seconds=5,
+            memory_budget_bytes=self.home_prefetch_mib << 20,
+        )
+        self.home_prefetch_source = 0
         self.oauth = OAuthClient(str(oauth_settings["client_id"]))
         self.oauth_accounts: list[OAuthAccount] = list(oauth_settings["accounts"])  # type: ignore[arg-type]
         self.active_oauth_account = next(
@@ -336,6 +347,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.sync_client: SyncTubeClient | None = None
         self.sync_role = ""
+        self.synctube_known_members: set[str] = set()
+        self.synctube_roster_initialized = False
         self.sync_window: Adw.Window | None = None
         self.sync_room_entry: Gtk.Entry | None = None
         self.sync_status_label: Gtk.Label | None = None
@@ -407,6 +420,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.queue_loop = False
         self.comment_cursor: str | None = None
         self.comments_loading = False
+        self.prefetched_comments_item_id = ""
+        self.prefetched_comments_future: Future[Any] | None = None
         self.subscription_updates_loading = False
         self.channel_page = 1
         self.channel_loading = False
@@ -701,6 +716,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.home_scroller = scroller
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.get_vadjustment().connect("value-changed", self._home_scroll_changed)
+        scroller.connect("map", lambda *_: self._schedule_home_prefetch())
+        scroller.connect("notify::width", lambda *_: self._schedule_home_prefetch())
+        scroller.connect("notify::height", lambda *_: self._schedule_home_prefetch())
         clamp = Adw.Clamp(maximum_size=2400, tightening_threshold=1600)
         clamp.set_margin_top(18)
         clamp.set_margin_bottom(36)
@@ -1734,9 +1752,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         live_chat_heading.append(live_chat_close)
         live_chat_content.append(live_chat_heading)
         self.live_chat_status = Gtk.Label(xalign=0, wrap=True)
+        self.live_chat_status.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.live_chat_status.set_max_width_chars(1)
         self.live_chat_status.add_css_class("dim-label")
         live_chat_content.append(self.live_chat_status)
         self.live_chat_scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.live_chat_scroller.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
         self.live_chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.live_chat_rows: dict[str, Gtk.Widget] = {}
         self.live_chat_scroller.set_child(self.live_chat_box)
@@ -1745,6 +1768,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.live_chat_entry = Gtk.Entry(
             placeholder_text="Send a message…", hexpand=True, max_length=200
         )
+        # Gtk.Entry otherwise contributes a theme-dependent default width that
+        # can make this panel wider than the comments panel at its minimum.
+        self.live_chat_entry.set_width_chars(1)
+        self.live_chat_entry.set_max_width_chars(1)
         self.live_chat_entry.connect("activate", lambda *_: self._send_live_chat())
         live_chat_input.append(self.live_chat_entry)
         self.live_chat_send = Gtk.Button(
@@ -1771,6 +1798,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_title = Gtk.Label(xalign=0)
         self.player_title.add_css_class("title-2")
         self.player_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.player_title.set_hexpand(True)
+        self.player_title.set_max_width_chars(1)
         details.append(self.player_title)
         player_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         channel_cluster = Gtk.Box(
@@ -1852,6 +1881,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_description = Gtk.Label(
             xalign=0, yalign=0, wrap=True
         )
+        self.player_description.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.player_description.set_max_width_chars(1)
         self.player_description.add_css_class("dim-label")
         self.player_description.set_hexpand(True)
         details.append(self.player_description)
@@ -1892,7 +1923,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
     ) -> None:
         page_width = max(360, self.player_page_overlay.get_width())
         width = round(self.player_sidebar_drag_width - offset_x)
-        self.player_sidebar_width = max(280, min(width, page_width - 80))
+        self.player_sidebar_width = max(
+            PLAYER_SIDEBAR_MIN_WIDTH, min(width, page_width - 80)
+        )
         for panel in (self.player_comments_panel, self.player_live_chat_panel):
             panel.set_size_request(self.player_sidebar_width, -1)
         self._comment_text_changed()
@@ -1905,7 +1938,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         page_width = self.player_page_overlay.get_width()
         if page_width > 0:
-            maximum = max(280, page_width - 80)
+            maximum = max(PLAYER_SIDEBAR_MIN_WIDTH, page_width - 80)
             if self.player_sidebar_width > maximum:
                 self.player_sidebar_width = maximum
                 for panel in (
@@ -2936,6 +2969,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _set_home_section(self, key: str, shelf: SectionShelf) -> None:
         self.home_section_widgets[key] = shelf
         self._rebuild_home_sections()
+        self._schedule_home_prefetch()
 
     def _rebuild_home_sections(self) -> None:
         self._clear_box(self.home_sections)
@@ -2947,6 +2981,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.home_sections.append(shelf)
 
     def _load_home_sections(self, *, refresh_channel_feeds: bool = False) -> None:
+        self.home_prebuffer.clear()
         self._clear_box(self.home_sections)
         self.home_section_widgets = {}
         self.recommendation_generation += 1
@@ -3128,11 +3163,116 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return videos
 
     def _home_scroll_changed(self, adjustment: Gtk.Adjustment) -> None:
+        self._schedule_home_prefetch()
         if (
             adjustment.get_value() + adjustment.get_page_size()
             >= adjustment.get_upper() - 1400
         ):
             self._load_more_recommendations()
+
+    def _schedule_home_prefetch(self) -> None:
+        if self.home_prefetch_source:
+            GLib.source_remove(self.home_prefetch_source)
+        self.home_prefetch_source = GLib.timeout_add(
+            180, self._refresh_home_prefetch
+        )
+
+    @staticmethod
+    def _widget_position_within(
+        widget: Gtk.Widget, ancestor: Gtk.Widget
+    ) -> tuple[int, int] | None:
+        x = 0
+        y = 0
+        current: Gtk.Widget | None = widget
+        while current is not None and current is not ancestor:
+            allocation = current.get_allocation()
+            x += allocation.x
+            y += allocation.y
+            current = current.get_parent()
+        return (x, y) if current is ancestor else None
+
+    def _refresh_home_prefetch(self) -> bool:
+        self.home_prefetch_source = 0
+        if (
+            self.home_prefetch_mib <= 0
+            or self._visible_page_name() != "home"
+        ):
+            return GLib.SOURCE_REMOVE
+        root = self.home_scroller.get_child()
+        if not root:
+            return GLib.SOURCE_REMOVE
+        adjustment = self.home_scroller.get_vadjustment()
+        viewport_top = adjustment.get_value()
+        viewport_bottom = viewport_top + adjustment.get_page_size()
+        positioned: list[tuple[float, int, float, MediaItem]] = []
+        keys = list(self.home_section_order)
+        keys.extend(
+            key for key in self.home_section_widgets if key not in keys
+        )
+        for key in keys:
+            shelf = self.home_section_widgets.get(key)
+            if not shelf:
+                continue
+            for card in shelf.cards():
+                item = card.item
+                if (
+                    not card.get_mapped()
+                    or not item.playable
+                    or item.source != "youtube"
+                ):
+                    continue
+                position = self._widget_position_within(card, root)
+                if position is None:
+                    continue
+                x, y = position
+                height = max(1, card.get_height())
+                positioned.append((float(y), x, float(y + height), item))
+        positioned.sort(key=lambda value: (value[0], value[1]))
+        visible = [
+            value
+            for value in positioned
+            if value[2] >= viewport_top and value[0] <= viewport_bottom
+        ]
+        below = [value for value in positioned if value[0] > viewport_bottom]
+        above = [value for value in positioned if value[2] < viewport_top]
+        above.reverse()
+        selected: list[MediaItem] = []
+        selected_keys: set[str] = set()
+
+        def add(values: list[tuple[float, int, float, MediaItem]], limit: int) -> None:
+            for _top, _x, _bottom, item in values:
+                key = self.home_prebuffer.key(item)
+                if key in selected_keys:
+                    continue
+                selected_keys.add(key)
+                selected.append(item)
+                if len(selected) >= limit:
+                    return
+
+        add(visible, 20)
+        if len(selected) < 20:
+            add(below, 20)
+        if len(selected) < 20:
+            add(above, 20)
+        add(below, 28)
+        if len(selected) < 28:
+            add(above, 28)
+        self.home_prebuffer.reconcile(
+            selected,
+            self._resolve_home_prefetch_item,
+            self._resolve_home_prefetch_comments,
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _resolve_home_prefetch_item(self, item: MediaItem) -> ResolvedStream:
+        if item.source != "youtube":
+            raise ValueError("Home prefetch only supports YouTube videos")
+        return self.youtube.resolve(item)
+
+    def _resolve_home_prefetch_comments(self, item: MediaItem) -> CommentPage:
+        if item.source != "youtube":
+            raise ValueError("Home prefetch only supports YouTube videos")
+        return self.youtube.comments(item)
 
     def _load_more_recommendations(self) -> None:
         if (
@@ -3199,6 +3339,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 on_share=self._share_item,
             )
             self._set_home_section("recommendations", self.recommendation_shelf)
+        self._schedule_home_prefetch()
         return GLib.SOURCE_REMOVE
 
     def _recommendations_error(self, generation: int, error: Exception) -> bool:
@@ -4523,7 +4664,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _oauth_sign_in(self, manage: bool) -> None:
         self._save_oauth_client(notify=False)
         run_async(
-            lambda: self.oauth.authorize(manage_playlists=manage),
+            lambda: self.oauth.authorize(
+                manage_playlists=manage,
+                url_opener=self._launch_default_uri,
+            ),
             self._oauth_connected,
             lambda error: self.toast_overlay.add_toast(Adw.Toast(title=str(error))),
         )
@@ -5414,8 +5558,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.comments_loading_row.set_visible(True)
         self.comments_spinner.start()
+        prefetched = None
+        if (
+            self.comment_cursor is None
+            and self.prefetched_comments_item_id == item.id
+        ):
+            prefetched = self.prefetched_comments_future
+            self.prefetched_comments_item_id = ""
+            self.prefetched_comments_future = None
         run_async(
-            lambda: self.youtube.comments(item, cursor=self.comment_cursor),
+            (
+                lambda: prefetched.result()
+                if prefetched is not None
+                else self.youtube.comments(item, cursor=self.comment_cursor)
+            ),
             lambda page: self._comments_loaded_for(item.id, page),
             self._comments_error,
         )
@@ -5624,6 +5780,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         card.add_css_class("live-chat-message")
         author = Gtk.Label(label=author_text, xalign=0)
+        author.set_ellipsize(Pango.EllipsizeMode.END)
+        author.set_max_width_chars(1)
+        author.set_hexpand(True)
         author.add_css_class("heading")
         color = str(value.get("color") or "")
         rgba = Gdk.RGBA()
@@ -5634,6 +5793,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         card.append(author)
         text = Gtk.Label(label=message_text, xalign=0, wrap=True)
         text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        text.set_max_width_chars(1)
         card.append(text)
         self.live_chat_box.append(card)
         message_id = str(value.get("id") or "")
@@ -6269,6 +6429,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_request += 1
         request_id = self.playback_request
         self._detach_playback()
+        if self.prefetched_comments_future is not None:
+            self.home_prebuffer.release_sidecar(
+                self.prefetched_comments_future
+            )
+        self.prefetched_comments_item_id = ""
+        self.prefetched_comments_future = None
+        if item.source == "youtube":
+            comments_future = self.home_prebuffer.take_sidecar(item)
+            if comments_future is not None:
+                self.prefetched_comments_item_id = item.id
+                self.prefetched_comments_future = comments_future
         # Update this before resolving. Navigation must never consult the item
         # from the stream we just retired while a new selection is loading.
         self.current_item = item
@@ -6363,15 +6534,58 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if local_stream:
             self._start_playback(item, local_stream, request_id)
             return
-        warmed = self.prebuffer.take(item)
-        if warmed:
-            self._start_playback(item, warmed, request_id)
+        prefetch_manager = self.home_prebuffer
+        prefetched = prefetch_manager.claim(item)
+        if prefetched is None:
+            prefetch_manager = self.prebuffer
+            prefetched = prefetch_manager.claim(item)
+        if prefetched is not None:
+            run_async(
+                prefetched.result,
+                lambda buffered: self._prefetched_stream_ready(
+                    prefetch_manager,
+                    item,
+                    buffered,
+                    request_id,
+                ),
+                lambda error: self._prefetched_stream_failed(
+                    item, error, request_id
+                ),
+            )
             return
         run_async(
             lambda: self._resolve_item(item),
             lambda url: self._start_playback(item, url, request_id),
             lambda error: self._playback_error(error, request_id),
         )
+
+    def _prefetched_stream_ready(
+        self,
+        manager: PrebufferManager,
+        item: MediaItem,
+        buffered: PrebufferedStream,
+        request_id: int,
+    ) -> bool:
+        if request_id != self.playback_request:
+            buffered.close()
+            return GLib.SOURCE_REMOVE
+        try:
+            stream = manager.activate(buffered)
+        except Exception as error:
+            return self._prefetched_stream_failed(item, error, request_id)
+        return self._start_playback(item, stream, request_id)
+
+    def _prefetched_stream_failed(
+        self, item: MediaItem, _error: Exception, request_id: int
+    ) -> bool:
+        if request_id != self.playback_request:
+            return GLib.SOURCE_REMOVE
+        run_async(
+            lambda: self._resolve_item(item),
+            lambda stream: self._start_playback(item, stream, request_id),
+            lambda error: self._playback_error(error, request_id),
+        )
+        return GLib.SOURCE_REMOVE
 
     @staticmethod
     def _release_date_label(value: object) -> str:
@@ -7362,7 +7576,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _close_player(self, *_args: object) -> bool:
         self.mpris.close()
+        if self.home_prefetch_source:
+            GLib.source_remove(self.home_prefetch_source)
+            self.home_prefetch_source = 0
         self.prebuffer.close()
+        self.home_prebuffer.close()
         sync_client = self.sync_client
         self.sync_client = None
         jellyfin_sync_client = self.jellyfin_sync_client
@@ -7408,6 +7626,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.navigation_history.append(state)
         self.expected_page = name
         player = name == "player"
+        if name == "home":
+            self._schedule_home_prefetch()
+        elif current == "home":
+            if player:
+                GLib.idle_add(self._clear_home_prefetch)
+            else:
+                self.home_prebuffer.clear()
         self.player_page_active = player
         self.player_expanded = player
         if player:
@@ -7487,6 +7712,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.mini_player.set_visible(
             name != "player" and bool(self.current_item or self.queue)
         )
+
+    def _clear_home_prefetch(self) -> bool:
+        self.home_prebuffer.clear()
+        return GLib.SOURCE_REMOVE
 
     def _visible_page_name(self) -> str | None:
         if hasattr(self, "player_revealer") and self.player_revealer.get_reveal_child():
@@ -8059,6 +8288,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._apply_jellyfin_sync_queue(message.get("queue"))
         elif kind == "command":
             self._apply_jellyfin_sync_command(message.get("command"))
+        elif kind == "participant-joined":
+            participant = self._jellyfin_participant_name(
+                message.get("participant")
+            )
+            own_name = (
+                self.jellyfin.session.username
+                if self.jellyfin.session
+                else ""
+            )
+            if not own_name or participant.casefold() != own_name.casefold():
+                self._show_party_join_toast(participant, "Jellyfin")
         elif kind == "members-changed":
             self._refresh_jellyfin_sync_groups()
         elif kind in {"left", "disconnected"}:
@@ -8083,6 +8323,23 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.jellyfin_sync_status.set_label(text)
             self.toast_overlay.add_toast(Adw.Toast(title=text))
         return GLib.SOURCE_REMOVE
+
+    @classmethod
+    def _jellyfin_participant_name(cls, value: object) -> str:
+        if isinstance(value, str):
+            return value.strip() or "Someone"
+        if isinstance(value, dict):
+            for key in ("UserName", "Username", "DisplayName", "Name"):
+                name = str(value.get(key) or "").strip()
+                if name:
+                    return name
+            for key in ("User", "Session"):
+                nested = value.get(key)
+                if nested is not value:
+                    name = cls._jellyfin_participant_name(nested)
+                    if name != "Someone":
+                        return name
+        return "Someone"
 
     def _disconnect_jellyfin_syncplay(self) -> None:
         client = self.jellyfin_sync_client
@@ -8272,6 +8529,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self._render_sync_members(
                     self.sync_members_list, message.get("members")
                 )
+            self._update_synctube_member_roster(
+                message.get("members"), initial=True
+            )
             if self.sync_disconnect_button:
                 self.sync_disconnect_button.set_visible(True)
             self.syncplay_button.set_tooltip_text(
@@ -8280,6 +8540,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._replace_live_chat(message.get("chat"))
             self._set_synctube_mode(True)
         elif kind == "members":
+            self._update_synctube_member_roster(message.get("members"))
             if self.sync_members_list:
                 self._render_sync_members(
                     self.sync_members_list, message.get("members")
@@ -8315,14 +8576,57 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 )
             self.syncplay_button.set_tooltip_text("Start or join a watch party")
             if kind in {"disconnected", "room_closed"}:
+                self.synctube_known_members.clear()
+                self.synctube_roster_initialized = False
                 self._set_synctube_mode(False)
         elif kind == "participant_joined":
+            client_id = str(message.get("client_id") or "")
+            if (
+                client_id
+                and self.sync_client
+                and client_id != self.sync_client.client_id
+                and client_id not in self.synctube_known_members
+            ):
+                self.synctube_known_members.add(client_id)
+                self._show_party_join_toast("Someone", "SyncTube")
             if self.sync_status_label:
                 self.sync_status_label.set_label(
-                    f"Participant joined: {message.get('client_id')} · "
+                    f"Participant joined: {client_id} · "
                     "host may grant control."
                 )
         return GLib.SOURCE_REMOVE
+
+    def _update_synctube_member_roster(
+        self, values: object, *, initial: bool = False
+    ) -> None:
+        members = values if isinstance(values, list) else []
+        current: dict[str, str] = {}
+        for value in members:
+            if not isinstance(value, dict):
+                continue
+            client_id = str(value.get("id") or "")
+            if client_id:
+                current[client_id] = str(value.get("name") or "Anonymous")
+        if (
+            not initial
+            and self.synctube_roster_initialized
+            and self.sync_client
+        ):
+            for client_id in current.keys() - self.synctube_known_members:
+                if client_id != self.sync_client.client_id:
+                    self._show_party_join_toast(
+                        current[client_id], "SyncTube"
+                    )
+        self.synctube_known_members = set(current)
+        self.synctube_roster_initialized = True
+
+    def _show_party_join_toast(self, name: str, service: str) -> None:
+        display_name = name.strip() or "Someone"
+        self.toast_overlay.add_toast(
+            Adw.Toast(
+                title=f"{display_name} joined the {service} watch party"
+            )
+        )
 
     def _sync_connection_status(self, room: str, role: str) -> str:
         message = (
@@ -8341,6 +8645,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.sync_client.close()
             self.sync_client = None
         self.sync_role = ""
+        self.synctube_known_members.clear()
+        self.synctube_roster_initialized = False
         self.syncplay_button.set_tooltip_text("Start or join a watch party")
         self._set_synctube_mode(False)
         if self.sync_status_label:
@@ -8767,6 +9073,38 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         playback.add(audio_language)
 
+        prefetch_row = Adw.ActionRow(
+            title="Home prefetch memory",
+            subtitle=(
+                "RAM cap for comments, metadata, and the first five seconds of "
+                "up to 28 visible or nearby YouTube videos. Set to 0 to disable."
+            ),
+        )
+        prefetch_adjustment = Gtk.Adjustment(
+            value=self.home_prefetch_mib,
+            lower=0,
+            upper=1024,
+            step_increment=32,
+            page_increment=128,
+        )
+        prefetch_value = Gtk.SpinButton(
+            adjustment=prefetch_adjustment,
+            numeric=True,
+            valign=Gtk.Align.CENTER,
+        )
+        prefetch_value.set_width_chars(4)
+        prefetch_value.set_tooltip_text("Home prefetch RAM limit in MiB")
+        prefetch_suffix = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+        )
+        prefetch_suffix.append(prefetch_value)
+        prefetch_suffix.append(Gtk.Label(label="MiB"))
+        prefetch_row.add_suffix(prefetch_suffix)
+        prefetch_value.connect(
+            "value-changed", self._home_prefetch_memory_changed
+        )
+        playback.add(prefetch_row)
+
         sponsorblock = Adw.SwitchRow(
             title="SponsorBlock",
             subtitle="Choose how each crowd-sourced segment category is handled.",
@@ -8958,6 +9296,27 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.preferred_audio_language
             )
 
+    def _home_prefetch_memory_changed(
+        self, spin: Gtk.SpinButton
+    ) -> None:
+        requested = round(spin.get_value())
+        normalized = (
+            0
+            if requested <= 0
+            else max(32, min(1024, round(requested / 32) * 32))
+        )
+        if requested != normalized:
+            spin.set_value(normalized)
+            return
+        self.home_prefetch_mib = normalized
+        self.config.save_player_settings(
+            home_prefetch_mib=self.home_prefetch_mib
+        )
+        self.home_prebuffer.set_memory_budget(
+            self.home_prefetch_mib << 20
+        )
+        self._schedule_home_prefetch()
+
     def _sponsorblock_changed(
         self, row: Adw.SwitchRow, _property: GObject.ParamSpec
     ) -> None:
@@ -9088,7 +9447,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.youtube_settings_status.set_subtitle(
                 "Browser opened; no supported local browser profile was found"
             )
-        self._launch_youtube_browser(browser)
+        self._launch_youtube_browser()
         if browser:
             self._verify_youtube_browser_session(wait=True)
 
@@ -9171,27 +9530,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return next((name for name, path in candidates if path.exists()), "")
 
     @staticmethod
-    def _launch_youtube_browser(browser: str) -> None:
-        uri = "https://www.youtube.com/"
-        commands = {
-            "firefox": "firefox",
-            "chromium": "chromium",
-            "chrome": "google-chrome",
-            "brave": "brave-browser",
-        }
-        if browser:
-            try:
-                app = Gio.AppInfo.create_from_commandline(
-                    commands.get(browser, browser),
-                    None,
-                    Gio.AppInfoCreateFlags.SUPPORTS_URIS,
-                )
-                app.launch_uris([uri], None)
-                return
-            except GLib.Error:
-                pass
+    def _launch_youtube_browser() -> None:
+        # The browser whose cookies yt-dlp can read is not necessarily the
+        # user's preferred browser. Let GIO/xdg-desktop-portal resolve the
+        # registered HTTPS handler instead of launching the cookie source.
         with suppress(GLib.Error):
-            Gio.AppInfo.launch_default_for_uri(uri, None)
+            TubeFinWindow._launch_default_uri("https://www.youtube.com/")
+
+    @staticmethod
+    def _launch_default_uri(uri: str) -> None:
+        Gio.AppInfo.launch_default_for_uri(uri, None)
 
     def _disconnect_from_settings(self) -> None:
         self.disconnect_jellyfin()

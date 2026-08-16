@@ -393,9 +393,16 @@
   color: @view_fg_color;
 }
 
+.comments-sidebar {
+  min-width: 280px;
+}
+
+.live-chat-sidebar {
+  min-width: 0;
+}
+
 .comments-sidebar,
 .live-chat-sidebar {
-  min-width: 280px;
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: @view_bg_color;
 }
