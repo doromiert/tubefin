@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.3.1" date="2026-08-16">
+      <description>
+        <p>Halves uncached YouTube startup time by reusing authenticated session cookies, adds reliable resolver fallback and detailed playback diagnostics, and caches details plus the opening video segment after playback.</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-08-16">
       <description>
         <p>Adds authenticated YouTube comment posting, replies, likes, and deletion; chapter-aware seeking and shortcuts; resizable full-height comments and live-chat panels with fullscreen access; channel sharing; and touch-friendly scrolling.</p>
