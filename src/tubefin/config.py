@@ -25,6 +25,15 @@ SPONSORBLOCK_DEFAULTS = {
     category: "auto" if category == "sponsor" else "ignore"
     for category in SPONSORBLOCK_CATEGORIES
 }
+HOME_SECTION_ORDER = (
+    "local_history",
+    "offline",
+    "jellyfin_continue",
+    "jellyfin_recent",
+    "youtube_activity",
+    "recommendations",
+    "watched_channels",
+)
 
 
 class ConfigStore:
@@ -46,6 +55,30 @@ class ConfigStore:
     def save_session(self, session: JellyfinSession) -> None:
         payload = self._load()
         payload["jellyfin"] = asdict(session)
+        self._save(payload)
+
+    def load_home_section_order(self) -> list[str]:
+        home = self._load().get("home") or {}
+        saved = home.get("section_order") if isinstance(home, dict) else None
+        order: list[str] = []
+        if isinstance(saved, list):
+            order.extend(
+                key for key in saved if key in HOME_SECTION_ORDER and key not in order
+            )
+        order.extend(key for key in HOME_SECTION_ORDER if key not in order)
+        return order
+
+    def save_home_section_order(self, order: list[str]) -> None:
+        payload = self._load()
+        home = payload.setdefault("home", {})
+        if not isinstance(home, dict):
+            home = {}
+            payload["home"] = home
+        normalized = [
+            key for key in order if key in HOME_SECTION_ORDER
+        ]
+        normalized.extend(key for key in HOME_SECTION_ORDER if key not in normalized)
+        home["section_order"] = normalized
         self._save(payload)
 
     def load_player_settings(self) -> dict[str, object]:
@@ -121,6 +154,23 @@ class ConfigStore:
             color = "#8f5bd7"
         payload = self._load()
         payload["synctube"] = {"username": username, "color": color.lower()}
+        self._save(payload)
+
+    def load_seerr_settings(self) -> dict[str, str]:
+        value = self._load().get("seerr") or {}
+        if not isinstance(value, dict):
+            value = {}
+        return {
+            "url": str(value.get("url") or "").strip(),
+            "api_key": str(value.get("api_key") or "").strip(),
+        }
+
+    def save_seerr_settings(self, url: str, api_key: str) -> None:
+        payload = self._load()
+        payload["seerr"] = {
+            "url": url.strip().rstrip("/"),
+            "api_key": api_key.strip(),
+        }
         self._save(payload)
 
     @staticmethod

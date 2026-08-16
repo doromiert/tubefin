@@ -16,7 +16,7 @@ flatpak-builder \
   "$repository_root/io.github.doromiert.TubeFin.yaml"
 flatpak build-bundle \
   "$repository_directory" \
-  "$output_directory/TubeFin-1.0.0.flatpak" \
+  "$output_directory/TubeFin-1.1.0.flatpak" \
   io.github.doromiert.TubeFin \
   stable \
   --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo

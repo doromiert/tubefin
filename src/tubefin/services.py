@@ -1389,7 +1389,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="1.0.0"'
+        'DeviceId="tubefin-desktop", Version="1.1.0"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:
@@ -1879,3 +1879,124 @@ class JellyfinService:
         if not self.session:
             raise ServiceError("Connect to a Jellyfin server first.")
         return self.session
+
+
+class SeerrService:
+    """Small Seerr API client with API-key and Jellyfin Quick Connect auth."""
+
+    def __init__(self, base_url: str = "", api_key: str = "") -> None:
+        self.base_url = self._normalize(base_url)
+        self.api_key = api_key.strip()
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookies)
+        )
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        return value.strip().rstrip("/").removesuffix("/api/v1")
+
+    def configure(self, base_url: str, api_key: str) -> None:
+        self.base_url = self._normalize(base_url)
+        self.api_key = api_key.strip()
+
+    def discover(self, jellyfin_url: str, configured_url: str = "") -> str:
+        candidates: list[str] = []
+        if configured_url:
+            candidates.append(self._normalize(configured_url))
+        try:
+            parsed = urllib.parse.urlparse(jellyfin_url)
+            if parsed.hostname:
+                host = parsed.hostname
+                if ":" in host:
+                    host = f"[{host}]"
+                candidates.append(f"{parsed.scheme or 'http'}://{host}:5055")
+        except ValueError:
+            pass
+        for candidate in dict.fromkeys(candidates):
+            try:
+                self.base_url = candidate
+                self.status()
+                return candidate
+            except ServiceError:
+                continue
+        self.base_url = self._normalize(configured_url)
+        return ""
+
+    def status(self) -> dict[str, Any]:
+        return self._request("/status", authenticated=False)
+
+    def search(self, query: str, page: int = 1) -> list[dict[str, Any]]:
+        result = self._request(
+            "/search", query={"query": query, "page": page}
+        )
+        return list(result.get("results") or []) if isinstance(result, dict) else []
+
+    def request_media(self, media_type: str, media_id: int) -> dict[str, Any]:
+        body: dict[str, Any] = {"mediaType": media_type, "mediaId": media_id}
+        if media_type == "tv":
+            body["seasons"] = "all"
+        result = self._request("/request", method="POST", body=body)
+        return result if isinstance(result, dict) else {}
+
+    def quick_connect_initiate(self) -> dict[str, Any]:
+        result = self._request(
+            "/auth/jellyfin/quickconnect/initiate",
+            method="POST",
+            authenticated=False,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def quick_connect_check(self, secret: str) -> bool:
+        result = self._request(
+            "/auth/jellyfin/quickconnect/check",
+            query={"secret": secret},
+            authenticated=False,
+        )
+        return bool(result.get("authenticated")) if isinstance(result, dict) else False
+
+    def quick_connect_authenticate(self, secret: str) -> dict[str, Any]:
+        result = self._request(
+            "/auth/jellyfin/quickconnect/authenticate",
+            method="POST",
+            body={"secret": secret},
+            authenticated=False,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def _request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        query: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        if not self.base_url:
+            raise ServiceError("Seerr is not configured.")
+        url = f"{self.base_url}/api/v1{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        headers = {"Accept": "application/json", "User-Agent": "TubeFin/1.1"}
+        if authenticated and self.api_key:
+            headers["X-Api-Key"] = self.api_key
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, payload, headers, method=method)
+        try:
+            with self.opener.open(request, timeout=12) as response:
+                data = response.read()
+            return json.loads(data) if data else {}
+        except urllib.error.HTTPError as error:
+            if error.code in {401, 403}:
+                message = "Sign in to Seerr or add its API key in Settings."
+            else:
+                message = f"Seerr returned HTTP {error.code}."
+            raise ServiceError(message) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ServiceError(f"Could not reach Seerr at {self.base_url}.") from error
+        except json.JSONDecodeError as error:
+            raise ServiceError("Seerr returned an unexpected response.") from error

@@ -1,0 +1,91 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    name: Nix and AppImage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Validate the flake
+        run: nix flake check --no-build
+      - name: Build AppImage
+        run: packaging/appimage/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tubefin-appimage
+          path: dist/TubeFin-*-x86_64.AppImage
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes appstream flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+      - name: Build Flatpak bundle
+        run: packaging/flatpak/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tubefin-flatpak
+          path: dist/TubeFin-*.flatpak
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install archive tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zstd
+      - name: Build Arch package
+        run: packaging/arch/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tubefin-arch
+          path: dist/tubefin-*-any.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [appimage, flatpak, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum TubeFin-* tubefin-* > SHA256SUMS
+      - name: Publish artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "TubeFin ${GITHUB_REF_NAME#v}" \
+              --generate-notes
+          fi

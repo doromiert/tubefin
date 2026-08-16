@@ -336,9 +336,10 @@ class MpvPlayer(Gtk.Box):
         self.buffer.set_halign(Gtk.Align.END)
         self.speed_values = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
         self.speed_control = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=0
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
         )
-        self.speed_control.set_halign(Gtk.Align.END)
+        self.speed_control.set_halign(Gtk.Align.FILL)
+        self.speed_control.set_hexpand(True)
         speed_down = Gtk.Button(label="−", tooltip_text="Decrease playback speed")
         speed_down.add_css_class("speed-step-button")
         speed_down.connect("clicked", lambda *_: self._step_playback_speed(-1))
@@ -346,6 +347,7 @@ class MpvPlayer(Gtk.Box):
             label="1×", tooltip_text="Reset playback speed to 1×"
         )
         self.speed_value.add_css_class("speed-value-button")
+        self.speed_value.set_hexpand(True)
         self.speed_value.connect("clicked", lambda *_: self.set_playback_speed(1.0))
         speed_up = Gtk.Button(label="+", tooltip_text="Increase playback speed")
         speed_up.add_css_class("speed-step-button")
@@ -392,7 +394,7 @@ class MpvPlayer(Gtk.Box):
             self.option_rows[label_text] = row
         self.settings_popover = Gtk.Popover(child=settings_box)
         self.settings_popover.set_autohide(True)
-        self.settings_popover.set_cascade_popdown(True)
+        self.settings_popover.set_cascade_popdown(False)
         self.settings_popover.connect(
             "notify::visible", self._settings_visibility_changed
         )
@@ -401,6 +403,7 @@ class MpvPlayer(Gtk.Box):
             tooltip_text="Playback settings",
             popover=self.settings_popover,
         )
+        self.settings_button = settings
         controls.append(settings)
         self.fullscreen_button = Gtk.Button(
             icon_name="view-fullscreen-symbolic", tooltip_text="Fullscreen"
@@ -652,6 +655,10 @@ class MpvPlayer(Gtk.Box):
         x: float,
         _y: float,
     ) -> None:
+        if self.settings_popover.get_visible():
+            self.settings_popover.popdown()
+            self.reveal_controls()
+            return
         device = gesture.get_current_event_device()
         touch = bool(device and device.get_source() == Gdk.InputSource.TOUCHSCREEN)
         if presses == 2:

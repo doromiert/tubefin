@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -261,6 +263,29 @@ class OfflineLibrary:
             }
             for key, value in defaults.items():
                 metadata.setdefault(key, value)
+            local_thumbnail = str(metadata.get("local_thumbnail_url") or "")
+            local_thumbnail_path: Path | None = None
+            if local_thumbnail.startswith("file:"):
+                local_thumbnail_path = Path(
+                    urllib.request.url2pathname(urllib.parse.urlparse(local_thumbnail).path)
+                )
+            elif local_thumbnail:
+                local_thumbnail_path = Path(local_thumbnail)
+            if not local_thumbnail_path or not local_thumbnail_path.is_file():
+                directory = Path(record.directory)
+                thumbnails = [
+                    path
+                    for suffix in ("*.jpg", "*.jpeg", "*.webp", "*.png")
+                    for path in directory.glob(suffix)
+                    if path.is_file()
+                ]
+                if thumbnails:
+                    local_thumbnail = max(
+                        thumbnails, key=lambda path: path.stat().st_size
+                    ).resolve().as_uri()
+                    metadata["local_thumbnail_url"] = local_thumbnail
+                    record.item.thumbnail_url = local_thumbnail
+                    changed = True
             if metadata != existing_metadata:
                 record.item.payload["download_metadata"] = metadata
                 changed = True

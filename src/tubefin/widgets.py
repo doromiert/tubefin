@@ -221,6 +221,7 @@ class MediaCard(Gtk.Box):
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True)
         labels.set_margin_start(2)
         labels.set_margin_end(2)
+        labels.set_valign(Gtk.Align.CENTER)
 
         title = Gtk.Label(label=item.title, xalign=0)
         title.add_css_class("media-title")
@@ -616,10 +617,26 @@ class SectionShelf(Gtk.Box):
         self.on_share = on_share
         self.flow: Gtk.FlowBox | None = None
         self.row: Gtk.Box | None = None
+        self.content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.revealer = Gtk.Revealer()
+        self.revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.revealer.set_transition_duration(180)
+        self.revealer.set_reveal_child(True)
+        self.revealer.set_child(self.content_box)
         if section.title:
-            title = Gtk.Label(label=section.title, xalign=0)
+            heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            title = Gtk.Label(label=section.title, xalign=0, hexpand=True)
             title.add_css_class("title-2")
-            self.append(title)
+            heading.append(title)
+            self.collapse_icon = Gtk.Image.new_from_icon_name("pan-down-symbolic")
+            heading.append(self.collapse_icon)
+            toggle = Gtk.Button(child=heading)
+            toggle.add_css_class("flat")
+            toggle.add_css_class("section-heading")
+            toggle.set_tooltip_text("Collapse section")
+            toggle.connect("clicked", self._toggle_collapsed)
+            self.append(toggle)
+        self.append(self.revealer)
 
         if horizontal:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
@@ -649,7 +666,7 @@ class SectionShelf(Gtk.Box):
             scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
             scroller.set_propagate_natural_height(True)
             scroller.set_child(row)
-            self.append(scroller)
+            self.content_box.append(scroller)
             return
 
         flow = Gtk.FlowBox()
@@ -664,7 +681,15 @@ class SectionShelf(Gtk.Box):
         flow.set_column_spacing(10)
         flow.set_row_spacing(14)
         self.append_items(section.items)
-        self.append(flow)
+        self.content_box.append(flow)
+
+    def _toggle_collapsed(self, button: Gtk.Button) -> None:
+        expanded = not self.revealer.get_reveal_child()
+        self.revealer.set_reveal_child(expanded)
+        self.collapse_icon.set_from_icon_name(
+            "pan-down-symbolic" if expanded else "pan-end-symbolic"
+        )
+        button.set_tooltip_text("Collapse section" if expanded else "Expand section")
 
     def _card(self, item: MediaItem) -> MediaCard:
         return MediaCard(

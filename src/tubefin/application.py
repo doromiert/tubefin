@@ -20,10 +20,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from tubefin import __version__  # noqa: E402
-from tubefin.config import (  # noqa: E402
-    SPONSORBLOCK_CATEGORIES,
-    ConfigStore,
-)
+from tubefin.config import SPONSORBLOCK_CATEGORIES, ConfigStore  # noqa: E402
 from tubefin.downloads import DownloadManager  # noqa: E402
 from tubefin.jellyfin_sync import JellyfinSyncPlayClient  # noqa: E402
 from tubefin.library import (  # noqa: E402
@@ -56,6 +53,7 @@ from tubefin.mpv_player import MpvPlayer  # noqa: E402
 from tubefin.oauth import MANAGE_SCOPE, OAuthClient  # noqa: E402
 from tubefin.services import (  # noqa: E402
     JellyfinService,
+    SeerrService,
     SponsorBlockService,
     YouTubeService,
 )
@@ -84,6 +82,15 @@ SPONSORBLOCK_CATEGORY_DETAILS = {
 }
 SPONSORBLOCK_BEHAVIOR_LABELS = ("Auto-skip", "Show skip button", "Ignore")
 SPONSORBLOCK_BEHAVIOR_VALUES = ("auto", "button", "ignore")
+HOME_SECTION_TITLES = {
+    "local_history": "Continue Watching · Local history",
+    "offline": "Available Offline · This device",
+    "jellyfin_continue": "Continue watching · Jellyfin",
+    "jellyfin_recent": "Recently added · Jellyfin",
+    "youtube_activity": "Subscription Activity · Provided by YouTube",
+    "recommendations": "Recommended · YouTube",
+    "watched_channels": "From Channels You Watched · Ranked locally",
+}
 
 
 def run_async(
@@ -236,6 +243,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.set_size_request(100, 180)
 
         self.config = ConfigStore()
+        self.home_section_order = self.config.load_home_section_order()
+        self.home_section_widgets: dict[str, SectionShelf] = {}
+        self.home_pull_distance = 0.0
+        self.home_pull_refreshing = False
         self.player_settings = self.config.load_player_settings()
         self.sync_settings = self.config.load_sync_settings()
         oauth_settings = self.config.load_oauth_settings()
@@ -255,6 +266,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.youtube_browser_checking = bool(self.youtube.browser)
         self.youtube_browser_error = ""
         self.jellyfin = JellyfinService(self.config.load_session())
+        self.seerr_settings = self.config.load_seerr_settings()
+        self.seerr = SeerrService(
+            self.seerr_settings["url"], self.seerr_settings["api_key"]
+        )
+        self.seerr_available = False
+        self.seerr_search_generation = 0
         self.offline = OfflineLibrary()
         self.downloads = DownloadManager(self.offline, browser=self.youtube.browser)
         self.playlists = PlaylistStore()
@@ -401,6 +418,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.navigation.select_row(self.navigation.get_row_at_index(0))
         if self.jellyfin.session:
             self._set_account(self.jellyfin.session)
+            self._discover_seerr()
         self._load_home_sections()
         self._sync_online_subscriptions()
         self._sync_online_history()
@@ -447,6 +465,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
             row.set_name(key)
             row.add_prefix(Gtk.Image.new_from_icon_name(icon))
             self.navigation.append(row)
+
+        self.requests_navigation_row = Adw.ActionRow(title="Requests")
+        self.requests_navigation_row.set_name("requests")
+        self.requests_navigation_row.add_prefix(
+            Gtk.Image.new_from_icon_name("emblem-downloads-symbolic")
+        )
+        self.requests_navigation_row.set_visible(False)
+        self.navigation.append(self.requests_navigation_row)
 
         spacer = Gtk.Box(vexpand=True)
         sidebar.append(spacer)
@@ -570,6 +596,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.pages.add_named(self._build_browse_page(), "browse")
         self.pages.add_named(self._build_browse_category_page(), "browse-category")
         self.pages.add_named(self._build_library_page(), "library")
+        self.pages.add_named(self._build_requests_page(), "requests")
         self.pages.add_named(self._build_offline_page(), "downloads")
         self.pages.add_named(self._build_history_page(), "history")
         self.pages.add_named(self._build_playlist_page(), "playlist")
@@ -617,6 +644,30 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         clamp.set_child(content)
+
+        self.home_pull_revealer = Gtk.Revealer()
+        self.home_pull_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        pull_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        pull_row.set_halign(Gtk.Align.CENTER)
+        self.home_pull_spinner = Gtk.Spinner()
+        pull_row.append(self.home_pull_spinner)
+        self.home_pull_label = Gtk.Label(label="Pull to refresh")
+        self.home_pull_label.add_css_class("dim-label")
+        pull_row.append(self.home_pull_label)
+        self.home_pull_revealer.set_child(pull_row)
+        content.append(self.home_pull_revealer)
+
+        scroll_controller = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        scroll_controller.connect("scroll", self._home_overscroll)
+        scroller.add_controller(scroll_controller)
+        pull_gesture = Gtk.GestureDrag()
+        pull_gesture.set_touch_only(True)
+        pull_gesture.connect("drag-begin", self._home_pull_begin)
+        pull_gesture.connect("drag-update", self._home_pull_update)
+        pull_gesture.connect("drag-end", self._home_pull_end)
+        scroller.add_controller(pull_gesture)
 
         signed_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.home_signed_out = signed_out
@@ -713,6 +764,41 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.browse_buttons[key] = button
         page.append(categories)
         return responsive
+
+    def _build_requests_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        page.set_margin_top(24)
+        page.set_margin_bottom(24)
+        page.set_margin_start(24)
+        page.set_margin_end(24)
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.seerr_search = Gtk.SearchEntry(
+            placeholder_text="Search movies and shows", hexpand=True
+        )
+        self.seerr_search.connect("activate", self._seerr_search_requested)
+        search_row.append(self.seerr_search)
+        self.seerr_connect = Gtk.Button(label="Sign in", icon_name="network-server-symbolic")
+        self.seerr_connect.connect("clicked", lambda *_: self._seerr_quick_connect())
+        search_row.append(self.seerr_connect)
+        page.append(search_row)
+        self.seerr_status = Adw.StatusPage(
+            icon_name="edit-find-symbolic",
+            title="Find something to watch",
+            description="Search Seerr, then request a movie or every season of a show.",
+        )
+        page.append(self.seerr_status)
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.seerr_results = Gtk.FlowBox()
+        self.seerr_results.add_css_class("media-grid")
+        self.seerr_results.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.seerr_results.set_homogeneous(True)
+        self.seerr_results.set_min_children_per_line(1)
+        self.seerr_results.set_max_children_per_line(5)
+        self.seerr_results.set_column_spacing(16)
+        self.seerr_results.set_row_spacing(18)
+        scroller.set_child(self.seerr_results)
+        page.append(scroller)
+        return page
 
     def _build_browse_category_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1487,9 +1573,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         artwork = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True)
         self.details_picture = Gtk.Picture()
         self.details_picture.set_content_fit(Gtk.ContentFit.COVER)
-        self.details_picture.set_size_request(560, 315)
+        self.details_picture.set_can_shrink(True)
+        self.details_picture.set_hexpand(True)
+        picture_frame = Gtk.AspectFrame(ratio=16 / 9, obey_child=False)
+        picture_frame.set_hexpand(True)
+        picture_frame.set_child(self.details_picture)
         self.details_picture.add_css_class("details-picture")
-        artwork.append(self.details_picture)
+        artwork.append(picture_frame)
         self.details_title = Gtk.Label(xalign=0, wrap=True)
         self.details_title.add_css_class("title-1")
         artwork.append(self.details_title)
@@ -1538,7 +1628,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.details_playlist.connect("clicked", lambda *_: self._save_detail_to_playlist())
         actions.append(self.details_playlist)
         hero.append(actions)
-        content.append(hero)
+        responsive = Adw.BreakpointBin()
+        responsive.set_child(hero)
+        narrow = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("max-width: 720px")
+        )
+        narrow.add_setter(hero, "orientation", Gtk.Orientation.VERTICAL)
+        responsive.add_breakpoint(narrow)
+        content.append(responsive)
         return scroller
 
     def _build_mini_player(self) -> Gtk.Widget:
@@ -1613,6 +1710,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 ),
             ),
             "library": ("Library", "History, subscriptions, and playlists"),
+            "requests": ("Requests", "Search and request from Seerr"),
             "downloads": ("Downloads", "Offline videos and active transfers"),
         }
         if name not in titles:
@@ -2361,15 +2459,89 @@ class TubeFinWindow(Adw.ApplicationWindow):
             box.remove(child)
             child = following
 
-    def _refresh_home(self) -> None:
+    def _refresh_home(self, *, pulled: bool = False) -> None:
         self.home_scroller.get_vadjustment().set_value(0)
         self._load_home_sections(refresh_channel_feeds=True)
         self._sync_online_subscriptions()
         self._sync_online_history()
-        self.toast_overlay.add_toast(Adw.Toast(title="Refreshing Home"))
+        if not pulled:
+            self.toast_overlay.add_toast(Adw.Toast(title="Refreshing Home"))
+
+    def _home_overscroll(
+        self, _controller: Gtk.EventControllerScroll, _dx: float, dy: float
+    ) -> bool:
+        if self.home_scroller.get_vadjustment().get_value() > 0.5 or dy >= 0:
+            self.home_pull_distance = 0.0
+            return False
+        self.home_pull_distance += min(28.0, abs(dy) * 18.0)
+        self._show_home_pull_progress()
+        if self.home_pull_distance >= 72.0:
+            self._trigger_home_pull_refresh()
+        return False
+
+    def _home_pull_begin(
+        self, _gesture: Gtk.GestureDrag, _start_x: float, _start_y: float
+    ) -> None:
+        self.home_pull_distance = (
+            0.0 if self.home_scroller.get_vadjustment().get_value() <= 0.5 else -1.0
+        )
+
+    def _home_pull_update(
+        self, _gesture: Gtk.GestureDrag, _offset_x: float, offset_y: float
+    ) -> None:
+        if self.home_pull_distance < 0 or offset_y <= 0:
+            return
+        self.home_pull_distance = min(96.0, offset_y * 0.55)
+        self._show_home_pull_progress()
+
+    def _home_pull_end(
+        self, _gesture: Gtk.GestureDrag, _offset_x: float, _offset_y: float
+    ) -> None:
+        if self.home_pull_distance >= 72.0:
+            self._trigger_home_pull_refresh()
+        elif not self.home_pull_refreshing:
+            self.home_pull_revealer.set_reveal_child(False)
+        self.home_pull_distance = 0.0
+
+    def _show_home_pull_progress(self) -> None:
+        self.home_pull_label.set_label(
+            "Release to refresh" if self.home_pull_distance >= 72.0 else "Pull to refresh"
+        )
+        self.home_pull_revealer.set_reveal_child(True)
+
+    def _trigger_home_pull_refresh(self) -> None:
+        if self.home_pull_refreshing:
+            return
+        self.home_pull_refreshing = True
+        self.home_pull_distance = 0.0
+        self.home_pull_label.set_label("Refreshing…")
+        self.home_pull_spinner.start()
+        self.home_pull_revealer.set_reveal_child(True)
+        self._refresh_home(pulled=True)
+        GLib.timeout_add(900, self._finish_home_pull_refresh)
+
+    def _finish_home_pull_refresh(self) -> bool:
+        self.home_pull_spinner.stop()
+        self.home_pull_refreshing = False
+        self.home_pull_revealer.set_reveal_child(False)
+        return GLib.SOURCE_REMOVE
+
+    def _set_home_section(self, key: str, shelf: SectionShelf) -> None:
+        self.home_section_widgets[key] = shelf
+        self._rebuild_home_sections()
+
+    def _rebuild_home_sections(self) -> None:
+        self._clear_box(self.home_sections)
+        keys = list(self.home_section_order)
+        keys.extend(key for key in self.home_section_widgets if key not in keys)
+        for key in keys:
+            shelf = self.home_section_widgets.get(key)
+            if shelf:
+                self.home_sections.append(shelf)
 
     def _load_home_sections(self, *, refresh_channel_feeds: bool = False) -> None:
         self._clear_box(self.home_sections)
+        self.home_section_widgets = {}
         self.recommendation_generation += 1
         self.recommendation_shelf = None
         self.recommendation_items = []
@@ -2392,7 +2564,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if not self._jellyfin_syncplay_active() or item.source != "youtube"
         ]
         if history:
-            self.home_sections.append(
+            self._set_home_section(
+                "local_history",
                 SectionShelf(
                     MediaSection("Continue Watching · Local history", history),
                     self.thumbnails,
@@ -2415,7 +2588,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if item.playable and not self._is_marked_watched(item)
         ][:12]
         if downloaded and not self._jellyfin_syncplay_active():
-            self.home_sections.append(
+            self._set_home_section(
+                "offline",
                 SectionShelf(
                     MediaSection("Available Offline · This device", downloaded),
                     self.thumbnails,
@@ -2441,7 +2615,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             run_async(
                 lambda: self._account_feed_items("history"),
                 lambda items: self._append_home_section(
-                    "Subscription Activity · Provided by YouTube", items
+                    "Subscription Activity · Provided by YouTube", items,
+                    "youtube_activity",
                 ),
                 lambda _error: None,
             )
@@ -2455,7 +2630,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
                         channels, refresh=refresh_channel_feeds
                     ),
                     lambda items: self._append_home_section(
-                        "From Channels You Watched · Ranked locally", items
+                        "From Channels You Watched · Ranked locally", items,
+                        "watched_channels",
                     ),
                     lambda _error: None,
                 )
@@ -2615,7 +2791,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 on_mark_watched=self._mark_watched,
                 on_share=self._share_item,
             )
-            self.home_sections.append(self.recommendation_shelf)
+            self._set_home_section("recommendations", self.recommendation_shelf)
         return GLib.SOURCE_REMOVE
 
     def _recommendations_error(self, generation: int, error: Exception) -> bool:
@@ -2643,13 +2819,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
             ),
         )
 
-    def _append_home_section(self, title: str, items: list[MediaItem]) -> bool:
+    def _append_home_section(
+        self, title: str, items: list[MediaItem], key: str = ""
+    ) -> bool:
         if self._jellyfin_syncplay_active():
             return GLib.SOURCE_REMOVE
         items = [item for item in items if not self._is_marked_watched(item)]
         if items:
-            self.home_sections.append(
-                SectionShelf(
+            shelf = SectionShelf(
                     MediaSection(title, items[:12]),
                     self.thumbnails,
                     self._activate_item,
@@ -2663,7 +2840,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     on_mark_watched=self._mark_watched,
                     on_share=self._share_item,
                 )
-            )
+            self._set_home_section(key or title.casefold().replace(" ", "_"), shelf)
         return GLib.SOURCE_REMOVE
 
     def _local_subscription_updates(
@@ -2759,8 +2936,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 item for item in section.items if not self._is_marked_watched(item)
             ]
             if items:
-                self.home_sections.append(
-                    SectionShelf(
+                shelf = SectionShelf(
                         MediaSection(f"{section.title} · Jellyfin", items),
                         self.thumbnails,
                         self._activate_item,
@@ -2772,7 +2948,187 @@ class TubeFinWindow(Adw.ApplicationWindow):
                         on_mark_watched=self._mark_watched,
                         on_share=self._share_item,
                     )
+                title = section.title.casefold()
+                key = "jellyfin_continue" if "continue" in title else "jellyfin_recent"
+                self._set_home_section(key, shelf)
+        return GLib.SOURCE_REMOVE
+
+    def _discover_seerr(self) -> None:
+        session = self.jellyfin.session
+        if not session:
+            self._seerr_discovered("")
+            return
+        run_async(
+            lambda: self.seerr.discover(
+                session.server_url, self.seerr_settings["url"]
+            ),
+            self._seerr_discovered,
+            lambda _error: self._seerr_discovered(""),
+        )
+
+    def _seerr_discovered(self, url: str) -> bool:
+        self.seerr_available = bool(url)
+        if hasattr(self, "requests_navigation_row"):
+            self.requests_navigation_row.set_visible(self.seerr_available)
+        if hasattr(self, "seerr_status"):
+            self.seerr_status.set_title(
+                "Find something to watch" if url else "Seerr was not found"
+            )
+            self.seerr_status.set_description(
+                "Search Seerr, then request a movie or every season of a show."
+                if url
+                else (
+                    "Set the Seerr address in Settings if it is not on Jellyfin's "
+                    "host at port 5055."
                 )
+            )
+        if not url and self._visible_page_name() == "requests":
+            self._select_page("library")
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_search_requested(self, entry: Gtk.SearchEntry) -> None:
+        query = entry.get_text().strip()
+        if not query or not self.seerr_available:
+            return
+        self.seerr_search_generation += 1
+        generation = self.seerr_search_generation
+        self._clear_box(self.seerr_results)
+        self.seerr_status.set_title("Searching Seerr…")
+        self.seerr_status.set_description("")
+        self.seerr_status.set_visible(True)
+        run_async(
+            lambda: self.seerr.search(query),
+            lambda results: self._seerr_results_loaded(generation, results),
+            lambda error: self._seerr_error(generation, error),
+        )
+
+    def _seerr_results_loaded(
+        self, generation: int, results: list[dict[str, Any]]
+    ) -> bool:
+        if generation != self.seerr_search_generation:
+            return GLib.SOURCE_REMOVE
+        supported = [
+            item for item in results if item.get("mediaType") in {"movie", "tv"}
+        ]
+        self.seerr_status.set_visible(not supported)
+        if not supported:
+            self.seerr_status.set_title("No movies or shows found")
+            self.seerr_status.set_description("Try another title.")
+            return GLib.SOURCE_REMOVE
+        for result in supported:
+            self.seerr_results.append(self._seerr_result_card(result))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_result_card(self, result: dict[str, Any]) -> Gtk.Widget:
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.add_css_class("seerr-card")
+        poster = Gtk.Picture()
+        poster.set_content_fit(Gtk.ContentFit.COVER)
+        poster.set_can_shrink(True)
+        frame = Gtk.AspectFrame(ratio=2 / 3, obey_child=False)
+        frame.set_size_request(180, 270)
+        frame.set_child(poster)
+        card.append(frame)
+        title = str(result.get("title") or result.get("name") or "Untitled")
+        title_label = Gtk.Label(label=title, xalign=0, wrap=True, lines=2)
+        title_label.add_css_class("heading")
+        title_label.set_ellipsize(Pango.EllipsizeMode.END)
+        card.append(title_label)
+        media_type = str(result.get("mediaType") or "movie")
+        date = str(result.get("releaseDate") or result.get("firstAirDate") or "")
+        meta = Gtk.Label(
+            label=f"{'Show' if media_type == 'tv' else 'Movie'}{f' · {date[:4]}' if date else ''}",
+            xalign=0,
+        )
+        meta.add_css_class("caption")
+        meta.add_css_class("dim-label")
+        card.append(meta)
+        media_info = result.get("mediaInfo") or {}
+        status = int(media_info.get("status") or 0) if isinstance(media_info, dict) else 0
+        requested = status > 1
+        button = Gtk.Button(
+            label="Available" if status == 5 else "Requested" if requested else "Request",
+            icon_name="object-select-symbolic" if requested else "list-add-symbolic",
+        )
+        button.set_sensitive(not requested and status != 5)
+        button.add_css_class("suggested-action")
+        media_id = int(result.get("id") or 0)
+        button.connect(
+            "clicked",
+            lambda clicked, kind=media_type, identifier=media_id: self._seerr_request(
+                clicked, kind, identifier
+            ),
+        )
+        card.append(button)
+        poster_path = str(result.get("posterPath") or "")
+        if poster_path:
+            self.thumbnails.load(
+                f"https://image.tmdb.org/t/p/w500{poster_path}",
+                lambda path, picture=poster: self._set_details_result_picture(picture, path),
+            )
+        return card
+
+    @staticmethod
+    def _set_details_result_picture(picture: Gtk.Picture, path: object) -> bool:
+        if path:
+            picture.set_filename(str(path))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_request(self, button: Gtk.Button, media_type: str, media_id: int) -> None:
+        button.set_sensitive(False)
+        button.set_label("Requesting…")
+        run_async(
+            lambda: self.seerr.request_media(media_type, media_id),
+            lambda _result: self._seerr_request_done(button),
+            lambda error: self._seerr_request_error(button, error),
+        )
+
+    def _seerr_request_done(self, button: Gtk.Button) -> bool:
+        button.set_label("Requested")
+        self.toast_overlay.add_toast(Adw.Toast(title="Request sent to Seerr"))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_request_error(self, button: Gtk.Button, error: Exception) -> bool:
+        button.set_label("Request")
+        button.set_sensitive(True)
+        self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_quick_connect(self) -> None:
+        self.seerr_connect.set_sensitive(False)
+        run_async(
+            self._complete_seerr_quick_connect,
+            self._seerr_quick_connected,
+            self._seerr_quick_error,
+        )
+
+    def _complete_seerr_quick_connect(self) -> str:
+        initiated = self.seerr.quick_connect_initiate()
+        code = str(initiated.get("code") or "")
+        secret = str(initiated.get("secret") or "")
+        if not code or not secret:
+            raise RuntimeError("Seerr did not return a Quick Connect code.")
+        GLib.idle_add(
+            lambda: self.toast_overlay.add_toast(
+                Adw.Toast(title=f"Enter Seerr Quick Connect code: {code}", timeout=12)
+            )
+        )
+        for _attempt in range(60):
+            if self.seerr.quick_connect_check(secret):
+                self.seerr.quick_connect_authenticate(secret)
+                return code
+            time.sleep(2)
+        raise RuntimeError("Seerr Quick Connect timed out.")
+
+    def _seerr_quick_connected(self, _code: str) -> bool:
+        self.seerr_connect.set_sensitive(True)
+        self.seerr_connect.set_label("Connected")
+        self.toast_overlay.add_toast(Adw.Toast(title="Connected to Seerr"))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_quick_error(self, error: Exception) -> bool:
+        self.seerr_connect.set_sensitive(True)
+        self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
         return GLib.SOURCE_REMOVE
 
     def _load_offline(self) -> None:
@@ -2896,9 +3252,30 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _offline_item(record: DownloadRecord) -> MediaItem:
+        metadata = record.item.payload.get("download_metadata") or {}
+        thumbnail_url = str(metadata.get("local_thumbnail_url") or "")
+        if thumbnail_url.startswith("file:"):
+            parsed = GLib.filename_from_uri(thumbnail_url)
+            if not parsed or not Path(parsed[0]).is_file():
+                thumbnail_url = ""
+        elif thumbnail_url and not Path(thumbnail_url).is_file():
+            thumbnail_url = ""
+        if not thumbnail_url:
+            directory = Path(record.directory)
+            local_thumbnails = [
+                path
+                for suffix in ("*.jpg", "*.jpeg", "*.webp", "*.png")
+                for path in directory.glob(suffix)
+                if path.is_file()
+            ]
+            if local_thumbnails:
+                thumbnail_url = max(
+                    local_thumbnails, key=lambda path: path.stat().st_size
+                ).resolve().as_uri()
         return replace(
             record.item,
             source="offline",
+            thumbnail_url=thumbnail_url or record.item.thumbnail_url,
             playable=record.status == DownloadStatus.COMPLETE,
             payload={
                 **record.item.payload,
@@ -5383,7 +5760,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "history",
             "playlist",
         }
-        if name not in {"home", "browse", "library"}:
+        if name not in {"home", "browse", "library", "requests"}:
             self.active_navigation = name
             self.syncing_navigation = True
             self.navigation.unselect_all()
@@ -5402,7 +5779,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 control.set_visible(playlist and not self.remote_playlist_active)
         if player:
             self.header.set_title_widget(self.player_heading)
-        elif context and name not in {"browse-category", "playlist"}:
+        elif (context and name not in {"browse-category", "playlist"}) or name == "requests":
             self.header.set_title_widget(self.window_title)
         else:
             self.header.set_title_widget(self.global_search_clamp)
@@ -6563,6 +6940,33 @@ class TubeFinWindow(Adw.ApplicationWindow):
             accounts.add(jellyfin_status)
         content.append(accounts)
 
+        requests = Adw.PreferencesGroup(
+            title="Seerr requests",
+            description=(
+                "TubeFin checks the Jellyfin host on port 5055 automatically. "
+                "Set an address for reverse proxies or a separate Seerr host."
+            ),
+        )
+        seerr_url = Adw.EntryRow(title="Seerr address")
+        seerr_url.set_text(self.seerr_settings["url"])
+        seerr_url.set_input_purpose(Gtk.InputPurpose.URL)
+        requests.add(seerr_url)
+        seerr_key = Adw.PasswordEntryRow(title="API key (optional)")
+        seerr_key.set_text(self.seerr_settings["api_key"])
+        requests.add(seerr_key)
+        seerr_save_row = Adw.ActionRow(
+            title="Requests tab",
+            subtitle="The sidebar tab appears only after TubeFin can reach Seerr.",
+        )
+        seerr_save = Gtk.Button(label="Save and check", valign=Gtk.Align.CENTER)
+        seerr_save.connect(
+            "clicked",
+            lambda *_: self._save_seerr_settings(seerr_url, seerr_key, seerr_save),
+        )
+        seerr_save_row.add_suffix(seerr_save)
+        requests.add(seerr_save_row)
+        content.append(requests)
+
         playback = Adw.PreferencesGroup(title="Playback")
         sync_row = Adw.ActionRow(
             title="SyncTube watch room",
@@ -6654,6 +7058,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.sponsorblock_rows[category] = category_row
         content.append(playback)
 
+        self.home_order_group = Adw.PreferencesGroup(
+            title="Home sections",
+            description=(
+                "Use the arrows to choose the shelf order. Shelves can be collapsed "
+                "temporarily from Home."
+            ),
+        )
+        self.home_order_rows: list[Adw.ActionRow] = []
+        content.append(self.home_order_group)
+        self._rebuild_home_order_settings()
+
         advanced = Gtk.Expander(label="Optional YouTube API access")
         account_page = self._build_account_page()
         account_page.set_size_request(-1, 520)
@@ -6687,6 +7102,50 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._refresh_accounts()
         window.present()
 
+    def _rebuild_home_order_settings(self) -> None:
+        group = getattr(self, "home_order_group", None)
+        if not group:
+            return
+        for row in getattr(self, "home_order_rows", []):
+            group.remove(row)
+        self.home_order_rows = []
+        for index, key in enumerate(self.home_section_order):
+            row = Adw.ActionRow(title=HOME_SECTION_TITLES.get(key, key))
+            controls = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER
+            )
+            up = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Move up")
+            up.add_css_class("square-button")
+            up.set_sensitive(index > 0)
+            up.connect("clicked", lambda *_args, value=key: self._move_home_section(value, -1))
+            controls.append(up)
+            down = Gtk.Button(icon_name="go-down-symbolic", tooltip_text="Move down")
+            down.add_css_class("square-button")
+            down.set_sensitive(index < len(self.home_section_order) - 1)
+            down.connect(
+                "clicked", lambda *_args, value=key: self._move_home_section(value, 1)
+            )
+            controls.append(down)
+            row.add_suffix(controls)
+            group.add(row)
+            self.home_order_rows.append(row)
+
+    def _move_home_section(self, key: str, offset: int) -> None:
+        try:
+            current = self.home_section_order.index(key)
+        except ValueError:
+            return
+        target = current + offset
+        if target < 0 or target >= len(self.home_section_order):
+            return
+        self.home_section_order[current], self.home_section_order[target] = (
+            self.home_section_order[target],
+            self.home_section_order[current],
+        )
+        self.config.save_home_section_order(self.home_section_order)
+        self._rebuild_home_sections()
+        self._rebuild_home_order_settings()
+
     def _sync_identity_changed(
         self, username: Adw.EntryRow, color_button: Gtk.ColorButton
     ) -> None:
@@ -6702,6 +7161,33 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.config.save_sync_settings(
             self.sync_settings["username"], self.sync_settings["color"]
         )
+
+    def _save_seerr_settings(
+        self,
+        url: Adw.EntryRow,
+        api_key: Adw.PasswordEntryRow,
+        button: Gtk.Button,
+    ) -> None:
+        self.seerr_settings = {
+            "url": url.get_text().strip(),
+            "api_key": api_key.get_text().strip(),
+        }
+        self.config.save_seerr_settings(
+            self.seerr_settings["url"], self.seerr_settings["api_key"]
+        )
+        self.seerr.configure(
+            self.seerr_settings["url"], self.seerr_settings["api_key"]
+        )
+        button.set_label("Checking…")
+        button.set_sensitive(False)
+        self._discover_seerr()
+        GLib.timeout_add(1200, self._reset_seerr_save_button, button)
+
+    @staticmethod
+    def _reset_seerr_save_button(button: Gtk.Button) -> bool:
+        button.set_label("Save and check")
+        button.set_sensitive(True)
+        return GLib.SOURCE_REMOVE
 
     def _default_caption_language_changed(self, entry: Gtk.Entry) -> None:
         self.default_caption_language = entry.get_text().strip()
@@ -7012,6 +7498,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.config.save_session(session)
         self.jellyfin_loaded = False
         self._set_account(session)
+        self._discover_seerr()
         if self.connection_window:
             self.connection_window.close()
         self.toast_overlay.add_toast(Adw.Toast(title=f"Connected as {session.username}"))
@@ -7031,6 +7518,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._disconnect_jellyfin_syncplay()
         self.config.clear_session()
         self.jellyfin.session = None
+        self._seerr_discovered("")
         self.jellyfin_loaded = False
         self.browse_cache = {
             key: value

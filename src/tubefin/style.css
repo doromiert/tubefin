@@ -156,6 +156,20 @@
   font-variant-numeric: tabular-nums;
 }
 
+.section-heading {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.section-heading:hover {
+  background: transparent;
+}
+
+.seerr-card {
+  min-width: 180px;
+  max-width: 220px;
+}
+
 .media-title {
   font-weight: 650;
 }

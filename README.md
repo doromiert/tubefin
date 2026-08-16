@@ -9,13 +9,14 @@ It currently supports:
 - YouTube search without a Google API key
 - Jellyfin username/password sign-in and persistent sessions
 - Jellyfin home, library, folder, series, and season browsing
+- Conditional Seerr movie and show search/request support with Quick Connect
 - Search within Jellyfin
 - Thumbnail caching and native libmpv video/audio playback
 - Video details, channels, paginated comments/replies, captions, dubbed audio, and quality selection
 - A mixed YouTube/Jellyfin queue with reordering, looping, prebuffering, and auto-advance
 - Multi-audio YouTube downloads, an offline library, and local playlists
 - Google desktop OAuth with subscriptions, liked videos, activity, and playlist management
-- Local-history and signed-in homepage sections with explicit recommendation provenance
+- Reorderable, runtime-collapsible homepage sections with pull-to-refresh
 - Watch-together rooms through SyncTube for YouTube and SyncPlay for Jellyfin
 - Adaptive libadwaita navigation, a mini player, dark mode, and keyboard shortcuts
 - Fully reproducible Nix packaging and development environment
