@@ -16,7 +16,7 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   - --own-name=org.mpris.MediaPlayer2.tubefin
   - --own-name=org.mpris.MediaPlayer2.tubefin.*
-  - --env=GSK_RENDERER=ngl
+  - --env=GSK_RENDERER=gl
   - --env=YT_DLP_JS_RUNTIME=deno
 
 cleanup:

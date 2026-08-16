@@ -271,6 +271,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.seerr_settings["url"], self.seerr_settings["api_key"]
         )
         self.seerr_available = False
+        self.seerr_authenticated = bool(self.seerr_settings["api_key"])
         self.seerr_search_generation = 0
         self.offline = OfflineLibrary()
         self.downloads = DownloadManager(
@@ -3008,26 +3009,41 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _seerr_discovered(self, url: str) -> bool:
         self.seerr_available = bool(url)
+        has_access = self.seerr_available and self.seerr_authenticated
         if hasattr(self, "requests_navigation_row"):
             self.requests_navigation_row.set_visible(self.jellyfin.session is not None)
         if hasattr(self, "seerr_search"):
-            self.seerr_search.set_sensitive(self.seerr_available)
+            self.seerr_search.set_sensitive(has_access)
         if hasattr(self, "seerr_connect"):
             self.seerr_connect.set_label(
-                "Sign in to Seerr" if url else "Configure Seerr"
+                "Seerr connected"
+                if has_access
+                else "Sign in to Seerr"
+                if url
+                else "Configure Seerr"
             )
             self.seerr_connect.set_tooltip_text(
-                "Sign in to Seerr with your Jellyfin account"
+                "Requests use the saved Seerr API key"
+                if has_access and self.seerr_settings["api_key"]
+                else "Signed in to Seerr"
+                if has_access
+                else "Sign in to Seerr with your Jellyfin account"
                 if url
                 else "Set the Seerr address in Settings"
             )
-            self.seerr_connect.set_sensitive(True)
+            self.seerr_connect.set_sensitive(not has_access)
         if hasattr(self, "seerr_status"):
             self.seerr_status.set_title(
-                "Find something to watch" if url else "Seerr was not found"
+                "Find something to watch"
+                if has_access
+                else "Sign in to search Seerr"
+                if url
+                else "Seerr was not found"
             )
             self.seerr_status.set_description(
                 "Search Seerr, then request a movie or every season of a show."
+                if has_access
+                else "Use your Jellyfin account, or configure a Seerr API key in Settings."
                 if url
                 else (
                     "Automatic discovery could not reach Seerr. Set its address "
@@ -3044,7 +3060,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _seerr_search_requested(self, entry: Gtk.SearchEntry) -> None:
         query = entry.get_text().strip()
-        if not query or not self.seerr_available:
+        if not query or not self.seerr_available or not self.seerr_authenticated:
             return
         self.seerr_search_generation += 1
         generation = self.seerr_search_generation
@@ -3073,6 +3089,24 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         for result in supported:
             self.seerr_results.append(self._seerr_result_card(result))
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_error(self, generation: int, error: Exception) -> bool:
+        if generation != self.seerr_search_generation:
+            return GLib.SOURCE_REMOVE
+        self._clear_box(self.seerr_results)
+        message = str(error)
+        needs_sign_in = "sign in" in message.casefold()
+        if needs_sign_in:
+            self.seerr_authenticated = False
+            self.seerr_search.set_sensitive(False)
+            self.seerr_connect.set_label("Sign in to Seerr")
+            self.seerr_connect.set_sensitive(True)
+        self.seerr_status.set_visible(True)
+        self.seerr_status.set_title(
+            "Sign in to search Seerr" if needs_sign_in else "Seerr search failed"
+        )
+        self.seerr_status.set_description(message)
         return GLib.SOURCE_REMOVE
 
     def _seerr_result_card(self, result: dict[str, Any]) -> Gtk.Widget:
@@ -3238,7 +3272,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
 
     def _seerr_credentials_connected(self, window: Adw.Window) -> bool:
+        self.seerr_authenticated = True
+        self.seerr_search.set_sensitive(True)
         self.seerr_connect.set_label("Connected to Seerr")
+        self.seerr_connect.set_sensitive(False)
+        self.seerr_status.set_title("Find something to watch")
+        self.seerr_status.set_description(
+            "Search Seerr, then request a movie or every season of a show."
+        )
         window.close()
         self.toast_overlay.add_toast(Adw.Toast(title="Connected to Seerr"))
         return GLib.SOURCE_REMOVE
@@ -7463,6 +7504,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "url": url.get_text().strip(),
             "api_key": api_key.get_text().strip(),
         }
+        self.seerr_authenticated = bool(self.seerr_settings["api_key"])
         self.config.save_seerr_settings(
             self.seerr_settings["url"], self.seerr_settings["api_key"]
         )
@@ -7810,6 +7852,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._disconnect_jellyfin_syncplay()
         self.config.clear_session()
         self.jellyfin.session = None
+        self.seerr_authenticated = bool(self.seerr_settings["api_key"])
         self._seerr_discovered("")
         if self._visible_page_name() == "requests":
             self._select_page("library")

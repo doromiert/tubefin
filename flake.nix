@@ -91,7 +91,7 @@
               gappsWrapperArgs+=(
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp pkgs.ffmpeg pkgs.libsecret ]}
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.mpv pkgs.libglvnd ]}
-                --set-default GSK_RENDERER ngl
+                --set-default GSK_RENDERER gl
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${
                   pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
                     pkgs.gst_all_1.gst-plugins-base
@@ -185,7 +185,7 @@
             shellHook = ''
               export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"
               export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.mpv pkgs.libglvnd ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-              export GSK_RENDERER=ngl
+              export GSK_RENDERER=gl
               export GST_PLUGIN_SYSTEM_PATH_1_0=${
                 pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
                   pkgs.gst_all_1.gst-plugins-base
