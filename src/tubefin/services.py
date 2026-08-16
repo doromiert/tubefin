@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tubefin.models import (
+    AudioTrack,
     Availability,
     ChannelDetails,
     Comment,
@@ -506,7 +507,9 @@ class YouTubeService:
         data = self._run(*arguments)
         return [self._item(entry) for entry in data.get("entries") or [] if entry]
 
-    def download_options(self, item: MediaItem) -> tuple[list[str], bool]:
+    def download_options(
+        self, item: MediaItem
+    ) -> tuple[list[str], bool, list[AudioTrack]]:
         video_url = item.payload.get("webpage_url") or f"https://www.youtube.com/watch?v={item.id}"
         data = self._run(
             "--dump-single-json",
@@ -522,7 +525,7 @@ class YouTubeService:
             and int(candidate.get("height") or 0) > 0
         }
         qualities = [f"{height}p" for height in sorted(heights, reverse=True)]
-        return qualities, bool(data.get("subtitles"))
+        return qualities, bool(data.get("subtitles")), self._audio_tracks(data)
 
     def mark_watched(self, item: MediaItem) -> None:
         video_url = item.payload.get("webpage_url") or f"https://www.youtube.com/watch?v={item.id}"
@@ -779,7 +782,90 @@ class YouTubeService:
             subtitles.append(SubtitleTrack(label, str(language), str(track["url"])))
         subtitles.sort(key=lambda track: ("auto" in track.label, track.label.casefold()))
 
-        return ResolvedStream(str(stream_url), headers, variants, subtitles)
+        audio_tracks = [
+            track for track in self._audio_tracks(data) if not track.original
+        ]
+        return ResolvedStream(
+            str(stream_url), headers, variants, subtitles, audio_tracks
+        )
+
+    @staticmethod
+    def _audio_tracks(data: dict[str, Any]) -> list[AudioTrack]:
+        names = {
+            "ar": "Arabic",
+            "cs": "Czech",
+            "da": "Danish",
+            "de": "German",
+            "en": "English",
+            "es": "Spanish",
+            "fi": "Finnish",
+            "fr": "French",
+            "hi": "Hindi",
+            "id": "Indonesian",
+            "it": "Italian",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "nl": "Dutch",
+            "no": "Norwegian",
+            "pl": "Polish",
+            "pt": "Portuguese",
+            "ru": "Russian",
+            "sk": "Slovak",
+            "sv": "Swedish",
+            "tr": "Turkish",
+            "uk": "Ukrainian",
+            "zh": "Chinese",
+        }
+        original_language = str(data.get("language") or "").casefold()
+        best: dict[str, dict[str, Any]] = {}
+        for candidate in data.get("formats") or []:
+            if (
+                candidate.get("vcodec") != "none"
+                or candidate.get("acodec") in {None, "none"}
+                or not candidate.get("url")
+            ):
+                continue
+            language = str(candidate.get("language") or "und").casefold()
+            note = str(candidate.get("format_note") or "")
+            rank = (
+                "drc" not in note.casefold(),
+                float(candidate.get("language_preference") or 0),
+                float(candidate.get("abr") or candidate.get("tbr") or 0),
+            )
+            current = best.get(language)
+            if current is None or rank > current["rank"]:
+                best[language] = {"format": candidate, "rank": rank}
+        tracks: list[AudioTrack] = []
+        for language, value in best.items():
+            candidate = value["format"]
+            note = str(candidate.get("format_note") or "")
+            base_language = language.split("-", 1)[0]
+            display = names.get(base_language, language.upper() if language != "und" else "Audio")
+            original = "original" in note.casefold() or (
+                bool(original_language)
+                and (
+                    language == original_language
+                    or language.startswith(f"{original_language}-")
+                )
+            )
+            label = f"{display} · {'Original' if original else 'Dub'}"
+            headers = {
+                str(name): str(header)
+                for name, header in (candidate.get("http_headers") or {}).items()
+                if header is not None
+            }
+            tracks.append(
+                AudioTrack(
+                    label=label,
+                    language=language,
+                    url=str(candidate["url"]),
+                    headers=headers,
+                    format_id=str(candidate.get("format_id") or ""),
+                    original=original,
+                )
+            )
+        tracks.sort(key=lambda track: (not track.original, track.label.casefold()))
+        return tracks
 
     def details(self, item: MediaItem) -> VideoDetails:
         video_url = item.payload.get("webpage_url") or f"https://www.youtube.com/watch?v={item.id}"
@@ -1243,7 +1329,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="0.1.0"'
+        'DeviceId="tubefin-desktop", Version="1.0.0"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:
@@ -1337,7 +1423,13 @@ class JellyfinService:
         )
         latest = self._request_current(
             "/Users/{user_id}/Items/Latest",
-            query={"Limit": 12, "GroupItems": "true", "EnableImages": "true"},
+            query={
+                "Limit": 12,
+                "GroupItems": "true",
+                "EnableImages": "true",
+                "IncludeItemTypes": "Movie,Episode,Video,MusicVideo",
+                "MediaTypes": "Video",
+            },
         )
         return [
             MediaSection("Continue watching", self._items(resume.get("Items", []))),
@@ -1596,7 +1688,23 @@ class JellyfinService:
         entries: Iterable[dict[str, Any]],
         playable: bool | None = None,
     ) -> list[MediaItem]:
-        return [self._item(entry, playable) for entry in entries]
+        return [
+            self._item(entry, playable)
+            for entry in entries
+            if not self._is_music(entry)
+        ]
+
+    @staticmethod
+    def _is_music(entry: dict[str, Any]) -> bool:
+        """Exclude audio-only Jellyfin entities throughout the video client."""
+        return str(entry.get("Type") or "").casefold() in {
+            "audio",
+            "audiobook",
+            "musicalbum",
+            "musicartist",
+        } or str(entry.get("MediaType") or "").casefold() == "audio" or str(
+            entry.get("CollectionType") or ""
+        ).casefold() in {"music", "audiobooks"}
 
     def _item(self, entry: dict[str, Any], playable: bool | None = None) -> MediaItem:
         session = self._require_session()

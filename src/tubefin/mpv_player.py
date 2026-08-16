@@ -25,7 +25,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gdk, GdkWayland, GdkX11, GLib, Gtk  # noqa: E402
 
-from tubefin.models import StreamVariant, SubtitleTrack  # noqa: E402
+from tubefin.models import AudioTrack, StreamVariant, SubtitleTrack  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,7 @@ class MpvPlayer(Gtk.Box):
         on_buffer_changed: Callable[[int], None] | None = None,
         on_state_changed: Callable[[float, float, bool], None] | None = None,
         default_caption_language: str = "",
+        default_audio_language: str = "",
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.on_ready = on_ready
@@ -184,12 +185,18 @@ class MpvPlayer(Gtk.Box):
         self.on_buffer_changed = on_buffer_changed
         self.on_state_changed = on_state_changed
         self.default_caption_language = default_caption_language.strip()
+        self.default_audio_language = default_audio_language.strip()
         self.buffer_seconds = buffer_seconds
         self.seeking = False
         self.should_play = False
         self.shutting_down = False
         self.variants: list[StreamVariant] = []
         self.subtitles: list[SubtitleTrack] = []
+        self.audio_tracks: list[AudioTrack] = []
+        self.original_audio_id = ""
+        self.default_url = ""
+        self.default_headers: dict[str, str] = {}
+        self.default_quality_label = "Auto"
         self.pending_seek: float | None = None
         self.syncing_options = False
         self.hide_controls_source = 0
@@ -310,6 +317,10 @@ class MpvPlayer(Gtk.Box):
         self.captions.set_halign(Gtk.Align.END)
         self.captions.set_tooltip_text("Closed captions")
         self.captions.connect("notify::selected", self._captions_changed)
+        self.audio = Gtk.DropDown()
+        self.audio.set_halign(Gtk.Align.END)
+        self.audio.set_tooltip_text("Audio track")
+        self.audio.connect("notify::selected", self._audio_changed)
         self.buffer = Gtk.DropDown.new_from_strings(
             ["10s buffer", "20s buffer", "30s buffer", "60s buffer", "120s buffer"]
         )
@@ -357,6 +368,7 @@ class MpvPlayer(Gtk.Box):
         for label_text, control in (
             ("Quality", self.quality),
             ("Closed captions", self.captions),
+            ("Audio track", self.audio),
             ("Network buffer", self.buffer),
             ("Playback speed", self.speed),
             ("Volume", self.volume_control),
@@ -420,12 +432,41 @@ class MpvPlayer(Gtk.Box):
         headers: dict[str, str] | None = None,
         variants: list[StreamVariant] | None = None,
         subtitles: list[SubtitleTrack] | None = None,
+        audio_tracks: list[AudioTrack] | None = None,
+        default_label: str = "Auto",
     ) -> None:
         self.should_play = True
+        self.default_url = url
+        self.default_headers = headers or {}
+        self.default_quality_label = default_label
         self.variants = variants or []
         self.subtitles = subtitles or []
+        self.audio_tracks = audio_tracks or []
+        self.original_audio_id = ""
         self._set_options()
-        self._load_url(url, headers or {})
+        self._load_url(url, self.default_headers)
+
+    def set_variants(self, variants: list[StreamVariant]) -> None:
+        """Publish qualities resolved after playback has already started."""
+        self.variants = variants
+        self._set_quality_options()
+
+    def set_audio_tracks(self, tracks: list[AudioTrack]) -> None:
+        """Publish alternate audio while preserving embedded local tracks."""
+        combined = list(self.audio_tracks)
+        languages = {track.language.casefold() for track in combined}
+        for track in tracks:
+            if track.language.casefold() not in languages:
+                combined.append(track)
+                languages.add(track.language.casefold())
+        self.audio_tracks = combined
+        self._set_audio_options()
+        self._apply_audio_selection()
+
+    def set_default_audio_language(self, language: str) -> None:
+        self.default_audio_language = language.strip()
+        self._set_audio_options()
+        self._apply_audio_selection()
 
     def stop(self) -> None:
         if self.shutting_down:
@@ -808,6 +849,8 @@ class MpvPlayer(Gtk.Box):
             with suppress(mpv.ShutdownError):
                 self.player.command_async("seek", self.pending_seek, "absolute+exact")
             self.pending_seek = None
+        self._discover_embedded_audio_tracks()
+        self._apply_audio_selection()
         self._apply_caption_selection()
         return self._ready()
 
@@ -817,24 +860,116 @@ class MpvPlayer(Gtk.Box):
         self.player.pause = False
 
     def _set_options(self) -> None:
+        self._set_quality_options()
         self.syncing_options = True
-        qualities = ["Auto", *(variant.label for variant in self.variants)]
-        self.quality.set_model(Gtk.StringList.new(qualities))
-        self.quality.set_selected(0)
-        self.option_rows["Quality"].set_visible(bool(self.variants))
         captions = ["Captions off", *(track.label for track in self.subtitles)]
         self.captions.set_model(Gtk.StringList.new(captions))
         self.captions.set_selected(self._preferred_caption_index())
         self.option_rows["Closed captions"].set_visible(bool(self.subtitles))
+        self._set_audio_options()
+        self.syncing_options = False
+        GLib.idle_add(self._normalize_option_widths)
+
+    def _set_audio_options(self) -> None:
+        was_syncing = self.syncing_options
+        self.syncing_options = True
+        labels = ["Original", *(track.label for track in self.audio_tracks)]
+        self.audio.set_model(Gtk.StringList.new(labels))
+        self.audio.set_selected(self._preferred_audio_index())
+        self.option_rows["Audio track"].set_visible(bool(self.audio_tracks))
+        self.syncing_options = was_syncing
+
+    def _discover_embedded_audio_tracks(self) -> None:
+        with suppress(mpv.ShutdownError):
+            tracks = [
+                track
+                for track in (self.player.track_list or [])
+                if track.get("type") == "audio"
+            ]
+            if not tracks:
+                return
+            original = next(
+                (
+                    track
+                    for track in tracks
+                    if track.get("default") or track.get("selected")
+                ),
+                tracks[0],
+            )
+            self.original_audio_id = str(original.get("id") or "")
+            if self.audio_tracks:
+                return
+            embedded: list[AudioTrack] = []
+            for track in tracks:
+                track_id = str(track.get("id") or "")
+                if not track_id or track_id == self.original_audio_id:
+                    continue
+                language = str(track.get("lang") or "und")
+                label = str(track.get("title") or language.upper() or "Audio")
+                embedded.append(
+                    AudioTrack(label, language, f"mpv://aid/{track_id}")
+                )
+            if embedded:
+                self.audio_tracks = embedded
+                self._set_audio_options()
+
+    def _preferred_audio_index(self) -> int:
+        preference = self.default_audio_language.strip()
+        if not preference or not self.audio_tracks:
+            return 0
+        scores = [
+            self.language_match_score(preference, track.label, track.language)
+            for track in self.audio_tracks
+        ]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        return best + 1 if scores[best] >= 0.55 else 0
+
+    def _audio_changed(self, _dropdown: Gtk.DropDown, _property: object) -> None:
+        if not self.syncing_options:
+            self._apply_audio_selection()
+
+    def _apply_audio_selection(self) -> None:
+        selected = self.audio.get_selected()
+        if selected == 0:
+            self.player.command_async(
+                "set", "aid", self.original_audio_id or "auto"
+            )
+            return
+        if selected > len(self.audio_tracks):
+            return
+        track = self.audio_tracks[selected - 1]
+        if track.url.startswith("mpv://aid/"):
+            self.player.command_async("set", "aid", track.url.rpartition("/")[2])
+            return
+        if track.headers:
+            self.player.http_header_fields = [
+                f"{name}: {value}" for name, value in track.headers.items()
+            ]
+        self.player.command_async(
+            "audio-add", track.url, "cached", track.label, track.language
+        )
+
+    def _set_quality_options(self) -> None:
+        self.syncing_options = True
+        qualities = [
+            self.default_quality_label,
+            *(variant.label for variant in self.variants),
+        ]
+        self.quality.set_model(Gtk.StringList.new(qualities))
+        self.quality.set_selected(0)
+        self.option_rows["Quality"].set_visible(bool(self.variants))
         self.syncing_options = False
         GLib.idle_add(self._normalize_option_widths)
 
     def _quality_changed(self, dropdown: Gtk.DropDown, _property: object) -> None:
         selected = dropdown.get_selected()
-        if self.syncing_options or selected == 0 or selected > len(self.variants):
+        if self.syncing_options or selected > len(self.variants):
+            return
+        self.pending_seek = float(self.player.time_pos or 0)
+        if selected == 0:
+            self._load_url(self.default_url, self.default_headers)
             return
         variant = self.variants[selected - 1]
-        self.pending_seek = float(self.player.time_pos or 0)
         self._load_url(variant.url, variant.headers)
 
     def _captions_changed(self, dropdown: Gtk.DropDown, _property: object) -> None:
@@ -866,12 +1001,18 @@ class MpvPlayer(Gtk.Box):
 
     @staticmethod
     def _caption_match_score(preference: str, track: SubtitleTrack) -> float:
+        return MpvPlayer.language_match_score(preference, track.label, track.language)
+
+    @staticmethod
+    def language_match_score(
+        preference: str, label_value: str, language_value: str
+    ) -> float:
         preferred = " ".join(re.findall(r"[\w]+", preference.casefold()))
         preferred_code = _LANGUAGE_CODES.get(preferred)
         if not preferred_code and len(preferred) in {2, 3}:
             preferred_code = preferred
-        language = track.language.casefold().replace("_", "-")
-        label = " ".join(re.findall(r"[\w]+", track.label.casefold()))
+        language = language_value.casefold().replace("_", "-")
+        label = " ".join(re.findall(r"[\w]+", label_value.casefold()))
         label_words = set(label.split()) - {
             "auto",
             "automatic",
@@ -894,7 +1035,7 @@ class MpvPlayer(Gtk.Box):
                 difflib.SequenceMatcher(None, preferred, candidate).ratio()
                 for candidate in candidates
             )
-        if "auto" in track.label.casefold():
+        if "auto" in label_value.casefold():
             score -= 0.01
         return score
 

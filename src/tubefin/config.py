@@ -66,6 +66,9 @@ class ConfigStore:
             "default_caption_language": str(
                 player.get("default_caption_language") or ""
             ).strip(),
+            "preferred_audio_language": str(
+                player.get("preferred_audio_language") or ""
+            ).strip(),
             "sponsorblock_enabled": bool(player.get("sponsorblock_enabled", True)),
             "sponsorblock_categories": category_behaviors,
         }
@@ -75,6 +78,7 @@ class ConfigStore:
         *,
         buffer_seconds: int | None = None,
         default_caption_language: str | None = None,
+        preferred_audio_language: str | None = None,
         sponsorblock_enabled: bool | None = None,
         sponsorblock_categories: dict[str, str] | None = None,
     ) -> None:
@@ -87,6 +91,8 @@ class ConfigStore:
             player["buffer_seconds"] = max(5, min(300, buffer_seconds))
         if default_caption_language is not None:
             player["default_caption_language"] = default_caption_language.strip()
+        if preferred_audio_language is not None:
+            player["preferred_audio_language"] = preferred_audio_language.strip()
         if sponsorblock_enabled is not None:
             player["sponsorblock_enabled"] = sponsorblock_enabled
         if sponsorblock_categories is not None:

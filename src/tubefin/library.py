@@ -140,6 +140,23 @@ class OfflineLibrary:
     def get(self, record_id: str) -> DownloadRecord | None:
         return next((record for record in self.list() if record.id == record_id), None)
 
+    def find_complete_for_item(self, item: MediaItem) -> DownloadRecord | None:
+        """Return a usable local copy of the same source item, when available."""
+        source = str(item.payload.get("original_source") or item.source)
+        for record in self.list():
+            record_source = str(
+                record.item.payload.get("original_source") or record.item.source
+            )
+            if (
+                record.status == DownloadStatus.COMPLETE
+                and record_source == source
+                and record.item.id == item.id
+                and record.media_path
+                and Path(record.media_path).is_file()
+            ):
+                return record
+        return None
+
     def upsert(self, record: DownloadRecord) -> None:
         records = self.list()
         record.updated_at = time.time()

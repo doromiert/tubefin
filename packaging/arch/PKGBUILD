@@ -1,0 +1,41 @@
+pkgname=tubefin
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Native GTK YouTube and Jellyfin client'
+arch=('any')
+url='https://github.com/doromiert/tubefin'
+license=('GPL-3.0-or-later')
+depends=(
+  'ffmpeg'
+  'gst-libav'
+  'gst-plugins-bad'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gst-plugins-ugly'
+  'gtk4'
+  'libadwaita'
+  'libsecret'
+  'mpv'
+  'python'
+  'python-gobject'
+  'python-mpv'
+  'python-websocket-client'
+  'yt-dlp'
+)
+makedepends=('git')
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+package() {
+  cd "$pkgname"
+  install -d "$pkgdir/usr/lib/tubefin"
+  cp -a src/tubefin "$pkgdir/usr/lib/tubefin/"
+  find "$pkgdir/usr/lib/tubefin" -type d -name __pycache__ -prune -exec rm -rf {} +
+  install -Dm755 packaging/arch/tubefin "$pkgdir/usr/bin/tubefin"
+  install -Dm644 data/io.github.doromiert.TubeFin.desktop \
+    "$pkgdir/usr/share/applications/io.github.doromiert.TubeFin.desktop"
+  install -Dm644 data/io.github.doromiert.TubeFin.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml"
+  install -Dm644 data/io.github.doromiert.TubeFin.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg"
+}

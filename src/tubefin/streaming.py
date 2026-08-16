@@ -277,6 +277,8 @@ class PrebufferedStream:
             self.proxy.start(),
             variants=self.stream.variants,
             subtitles=self.stream.subtitles,
+            audio_tracks=self.stream.audio_tracks,
+            default_label=self.stream.default_label,
         )
 
     def close(self) -> None:

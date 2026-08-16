@@ -1,0 +1,104 @@
+app-id: io.github.doromiert.TubeFin
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: tubefin
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=all
+  - --filesystem=xdg-run/pipewire-0:ro
+  - --talk-name=org.freedesktop.secrets
+  - --own-name=org.mpris.MediaPlayer2.tubefin
+  - --own-name=org.mpris.MediaPlayer2.tubefin.*
+  - --env=GSK_RENDERER=ngl
+  - --env=YT_DLP_JS_RUNTIME=deno
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/man
+  - '*.a'
+  - '*.la'
+
+modules:
+  - packaging/flatpak/libmpv.yaml
+
+  - name: python-mpv
+    buildsystem: simple
+    build-commands:
+      - sed -i "s/ctypes.util.find_library('mpv')/'libmpv.so.2'/" mpv.py
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/77/bc/6aa34c8805ff62e2fefc7d171563c60598aac215d5241186031a2c839935/python_mpv-1.0.8.tar.gz
+        sha256: 017fa359da059c831a94c419083491903e6d2f7c81b9841c33c196cabf4b3fe3
+
+  - name: websocket-client
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz
+        sha256: 9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98
+
+  - name: yt-dlp
+    no-autogen: true
+    no-make-install: true
+    make-args:
+      - yt-dlp
+      - PYTHON=/usr/bin/python3
+    post-install:
+      - install -Dm755 yt-dlp /app/bin/yt-dlp
+    sources:
+      - type: git
+        url: https://github.com/yt-dlp/yt-dlp.git
+        tag: 2026.07.04
+        commit: fdec00e0bf530dc6c3cc7b1dd780e95d9ae460e9
+    modules:
+      - name: deno
+        buildsystem: simple
+        build-commands:
+          - install -Dm755 deno /app/bin/deno
+        sources:
+          - type: archive
+            url: https://github.com/denoland/deno/releases/download/v2.9.5/deno-x86_64-unknown-linux-gnu.zip
+            sha256: 8b010a3b1a4a0188a67cdb8a7a27348b2a501af78aec7fc74f2ace167368d530
+            only-arches: [x86_64]
+          - type: archive
+            url: https://github.com/denoland/deno/releases/download/v2.9.5/deno-aarch64-unknown-linux-gnu.zip
+            sha256: 6b7cae3a8fc4385a59dea3146fcb8bad7fea4230e0ad36a8c692afacbc254be0
+            only-arches: [aarch64]
+
+      - name: yt-dlp-ejs
+        buildsystem: simple
+        build-commands:
+          - pip3 install --no-deps --prefix=/app yt_dlp_ejs*.whl
+        sources:
+          - type: file
+            url: https://files.pythonhosted.org/packages/e3/bd/520769863744b669440a924271a6159ddd82ad5ae26b4ac4d4b69e9f8d44/yt_dlp_ejs-0.8.0-py3-none-any.whl
+            sha256: 79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4
+
+  - name: tubefin
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+      - install -Dm644 data/io.github.doromiert.TubeFin.desktop /app/share/applications/io.github.doromiert.TubeFin.desktop
+      - install -Dm644 data/io.github.doromiert.TubeFin.metainfo.xml /app/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml
+      - install -Dm644 data/io.github.doromiert.TubeFin.svg /app/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .git
+          - .flatpak-builder*
+          - .flatpak-repo*
+          - dist
+          - result
+          - result-*

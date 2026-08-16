@@ -41,6 +41,7 @@ class DownloadManager:
         *,
         quality: str = "best",
         audio_only: bool = False,
+        audio_tracks: list[str] | None = None,
         captions: bool = True,
         callback: ProgressCallback | None = None,
     ) -> DownloadRecord:
@@ -52,17 +53,25 @@ class DownloadManager:
             raise ServiceError("yt-dlp is not installed.")
         record_id = uuid.uuid4().hex
         directory = self.library.download_directory / record_id
+        source_url = str(
+            item.payload.get("webpage_url")
+            or item.payload.get("source_url")
+            or f"https://www.youtube.com/watch?v={item.id}"
+        )
         stored_item = replace(
             item,
             payload={
                 **item.payload,
+                "webpage_url": source_url,
+                "source_url": source_url,
                 "download_metadata": {
                     "source": item.source,
-                    "source_url": str(item.payload.get("webpage_url") or ""),
+                    "source_url": source_url,
                     "channel": item.subtitle,
                     "channel_id": str(item.payload.get("channel_id") or ""),
                     "channel_url": str(item.payload.get("channel_url") or ""),
                     "original_thumbnail_url": item.thumbnail_url or "",
+                    "audio_tracks": list(audio_tracks or []),
                 },
             },
         )
@@ -72,6 +81,7 @@ class DownloadManager:
             directory=str(directory),
             quality=quality,
             audio_only=audio_only,
+            audio_tracks=list(audio_tracks or []),
             created_at=time.time(),
             updated_at=time.time(),
         )
@@ -149,7 +159,29 @@ class DownloadManager:
             ]
             if self.browser:
                 arguments[1:1] = ["--cookies-from-browser", self.browser]
-            if record.audio_only:
+            selected_audio = [track for track in record.audio_tracks if track]
+            if selected_audio:
+                if record.audio_only:
+                    selector = "+".join(selected_audio)
+                elif record.quality in {"min", "minimum", "worst"}:
+                    selector = "+".join(["worstvideo", *selected_audio])
+                elif record.quality not in {"", "best", "auto"}:
+                    height = "".join(
+                        character for character in record.quality if character.isdigit()
+                    )
+                    selector = "+".join(
+                        [f"bestvideo[height<={height}]", *selected_audio]
+                    )
+                else:
+                    selector = "+".join(["bestvideo", *selected_audio])
+                arguments += [
+                    "--audio-multistreams",
+                    "--format",
+                    selector,
+                    "--merge-output-format",
+                    "mkv",
+                ]
+            elif record.audio_only:
                 arguments += ["--extract-audio", "--audio-format", "m4a"]
             elif record.quality in {"min", "minimum", "worst"}:
                 arguments += [
@@ -300,7 +332,12 @@ def exported_metadata(record: DownloadRecord) -> dict[str, object]:
         "schema": 1,
         "id": record.item.id,
         "source": record.item.source,
-        "source_url": str(record.item.payload.get("webpage_url") or ""),
+        "source_url": str(
+            record.item.payload.get("webpage_url")
+            or record.item.payload.get("source_url")
+            or (record.item.payload.get("download_metadata") or {}).get("source_url")
+            or ""
+        ),
         "title": record.item.title,
         "channel": record.item.subtitle,
         "channel_id": str(record.item.payload.get("channel_id") or ""),

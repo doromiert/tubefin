@@ -39,7 +39,7 @@
         {
           default = python.pkgs.buildPythonApplication {
             pname = "tubefin";
-            version = "0.1.0";
+            version = "1.0.0";
             pyproject = true;
 
             src = ./.;
@@ -57,6 +57,10 @@
               pythonMpv
               python.pkgs.websocket-client
             ];
+
+            # Release/package builds must not launch the test harness. Tests remain
+            # available explicitly from the development shell.
+            doCheck = false;
 
             checkPhase = ''
               runHook preCheck

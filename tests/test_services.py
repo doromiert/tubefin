@@ -171,18 +171,41 @@ class YouTubeServiceTests(unittest.TestCase):
                     {"height": 1080, "vcodec": "avc1"},
                     {"height": 720, "vcodec": "avc1"},
                     {"height": 720, "vcodec": "vp9"},
+                    {
+                        "format_id": "140",
+                        "vcodec": "none",
+                        "acodec": "mp4a.40.2",
+                        "language": "en",
+                        "format_note": "English original (default), medium",
+                        "abr": 129,
+                        "url": "https://example/original.m4a",
+                    },
+                    {
+                        "format_id": "140-1",
+                        "vcodec": "none",
+                        "acodec": "mp4a.40.2",
+                        "language": "ru",
+                        "format_note": "Russian, medium",
+                        "abr": 129,
+                        "url": "https://example/russian.m4a",
+                    },
                 ],
+                "language": "en",
                 "subtitles": {},
                 "automatic_captions": {"en": [{"url": "https://example/auto.vtt"}]},
             }
         )
 
-        qualities, subtitles = service.download_options(
+        qualities, subtitles, audio_tracks = service.download_options(
             MediaItem("video", "Video", source="youtube")
         )
 
         self.assertEqual(qualities, ["1080p", "720p"])
         self.assertFalse(subtitles)
+        self.assertEqual(
+            [(track.language, track.original) for track in audio_tracks],
+            [("en", True), ("ru", False)],
+        )
 
     def test_channel_latest_maps_first_video_without_loading_channel_artwork(self) -> None:
         service = YouTubeService("firefox")
@@ -611,6 +634,7 @@ class ConfigStoreTests(unittest.TestCase):
                 {
                     "buffer_seconds": 60,
                     "default_caption_language": "",
+                    "preferred_audio_language": "",
                     "sponsorblock_enabled": True,
                     "sponsorblock_categories": SPONSORBLOCK_DEFAULTS,
                 },
@@ -631,6 +655,7 @@ class ConfigStoreTests(unittest.TestCase):
                 {
                     "buffer_seconds": 45,
                     "default_caption_language": "",
+                    "preferred_audio_language": "",
                     "sponsorblock_enabled": False,
                     "sponsorblock_categories": SPONSORBLOCK_DEFAULTS,
                 },
@@ -647,6 +672,19 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(
                 store.load_player_settings()["default_caption_language"],
                 "English",
+            )
+
+    def test_player_settings_preserve_preferred_audio_language(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": directory}),
+        ):
+            store = ConfigStore()
+            store.save_player_settings(preferred_audio_language=" Russian ")
+
+            self.assertEqual(
+                store.load_player_settings()["preferred_audio_language"],
+                "Russian",
             )
 
     def test_player_settings_preserve_sponsorblock_category_behaviors(self) -> None:

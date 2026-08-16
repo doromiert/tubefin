@@ -34,6 +34,7 @@ from tubefin.library import (  # noqa: E402
     SubscriptionStore,
 )
 from tubefin.models import (  # noqa: E402
+    AudioTrack,
     Availability,
     ChannelDetails,
     ChannelSubscription,
@@ -46,6 +47,7 @@ from tubefin.models import (  # noqa: E402
     OAuthAccount,
     ResolvedStream,
     SponsorSegment,
+    StreamVariant,
     VideoDetails,
     YouTubeBrowserSession,
 )
@@ -245,6 +247,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.default_caption_language = str(
             self.player_settings["default_caption_language"]
+        )
+        self.preferred_audio_language = str(
+            self.player_settings["preferred_audio_language"]
         )
         self.youtube_browser_session: YouTubeBrowserSession | None = None
         self.youtube_browser_checking = bool(self.youtube.browser)
@@ -1303,6 +1308,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             ),
             on_state_changed=self._player_state_changed,
             default_caption_language=self.default_caption_language,
+            default_audio_language=self.preferred_audio_language,
         )
         stage.set_child(self.mpv_player)
         self.fullscreen_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
@@ -2381,6 +2387,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         history = [
             self._refresh_stored_artwork(item)
             for item in self.history.continue_watching()
+            if not self._is_jellyfin_music_item(item)
             if not self._synctube_active() or item.source != "jellyfin"
             if not self._jellyfin_syncplay_active() or item.source != "youtube"
         ]
@@ -2921,7 +2928,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._start_download(item, quality, audio_only, captions)
             return
         dialog = Adw.Window(transient_for=self, modal=True, title="Download video")
-        dialog.set_default_size(430, 300)
+        dialog.set_default_size(430, 520)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(Adw.HeaderBar())
         dialog.set_content(toolbar)
@@ -2948,11 +2955,27 @@ class TubeFinWindow(Adw.ApplicationWindow):
         captions = Gtk.CheckButton(label="Include subtitles when available")
         captions.set_active(True)
         content.append(captions)
+        audio_title = Gtk.Label(label="Audio tracks", xalign=0)
+        audio_title.add_css_class("heading")
+        content.append(audio_title)
+        audio_scroller = Gtk.ScrolledWindow()
+        audio_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        audio_scroller.set_max_content_height(150)
+        audio_scroller.set_propagate_natural_height(True)
+        audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        audio_placeholder = Gtk.Label(label="Loading available audio…", xalign=0)
+        audio_placeholder.add_css_class("dim-label")
+        audio_box.append(audio_placeholder)
+        audio_scroller.set_child(audio_box)
+        content.append(audio_scroller)
+        audio_buttons: list[tuple[AudioTrack, Gtk.CheckButton]] = []
         loading_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         loading_row.set_halign(Gtk.Align.START)
         spinner = Gtk.Spinner(spinning=True)
         loading_row.append(spinner)
-        loading_label = Gtk.Label(label="Loading exact quality choices…", xalign=0)
+        loading_label = Gtk.Label(
+            label="Loading exact qualities and audio tracks…", xalign=0
+        )
         loading_label.add_css_class("dim-label")
         loading_row.append(loading_label)
         content.append(loading_row)
@@ -2982,6 +3005,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 selected_quality,
                 audio_only,
                 captions.get_active(),
+                [
+                    track.format_id
+                    for track, button in audio_buttons
+                    if button.get_active() and track.format_id
+                ],
             )
             dialog.close()
 
@@ -2999,6 +3027,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 spinner,
                 loading_label,
                 quality_choices,
+                audio_box,
+                audio_buttons,
                 options,
             ),
             lambda error: self._download_options_error(
@@ -3015,11 +3045,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         spinner: Gtk.Spinner,
         loading_label: Gtk.Label,
         quality_choices: list[str],
-        options: tuple[list[str], bool],
+        audio_box: Gtk.Box,
+        audio_buttons: list[tuple[AudioTrack, Gtk.CheckButton]],
+        options: tuple[list[str], bool, list[AudioTrack]],
     ) -> bool:
         if not dialog.get_visible():
             return GLib.SOURCE_REMOVE
-        qualities, has_subtitles = options
+        qualities, has_subtitles, audio_tracks = options
         selected = quality.get_selected()
         selected_label = quality_choices[selected] if selected < len(quality_choices) else ""
         exact = [value for value in qualities if value not in quality_choices]
@@ -3035,6 +3067,27 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if not has_subtitles:
             captions.set_active(False)
         captions.set_sensitive(has_subtitles)
+        self._clear_box(audio_box)
+        preferred_index = -1
+        if self.preferred_audio_language and audio_tracks:
+            scores = [
+                MpvPlayer.language_match_score(
+                    self.preferred_audio_language, track.label, track.language
+                )
+                for track in audio_tracks
+            ]
+            best = max(range(len(scores)), key=scores.__getitem__)
+            if scores[best] >= 0.55:
+                preferred_index = best
+        for index, track in enumerate(audio_tracks):
+            button = Gtk.CheckButton(label=track.label)
+            button.set_active(track.original or index == preferred_index)
+            audio_box.append(button)
+            audio_buttons.append((track, button))
+        if audio_tracks and not any(button.get_active() for _, button in audio_buttons):
+            audio_buttons[0][1].set_active(True)
+        if not audio_tracks:
+            audio_box.append(Gtk.Label(label="Original audio", xalign=0))
         spinner.stop()
         loading_row.set_visible(False)
         return GLib.SOURCE_REMOVE
@@ -3059,12 +3112,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         quality: str,
         audio_only: bool,
         captions: bool,
+        audio_tracks: list[str] | None = None,
     ) -> None:
         try:
             record = self.downloads.enqueue(
                 item,
                 quality=quality,
                 audio_only=audio_only,
+                audio_tracks=audio_tracks,
                 captions=captions,
                 callback=self._download_changed,
             )
@@ -4328,6 +4383,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _play_selected(self, item: MediaItem) -> None:
+        if self._is_jellyfin_music_item(item):
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="TubeFin does not support music playback")
+            )
+            return
         if item.source == "jellyfin" and self._synctube_active():
             self.toast_overlay.add_toast(
                 Adw.Toast(title="Disconnect from SyncTube to use Jellyfin")
@@ -4357,6 +4417,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.queue_index = position
         self._refresh_queue()
         self._begin_playback(item)
+
+    @staticmethod
+    def _is_jellyfin_music_item(item: MediaItem) -> bool:
+        return item.source == "jellyfin" and (
+            item.kind.casefold()
+            in {"audio", "audiobook", "musicalbum", "musicartist"}
+            or str(item.payload.get("MediaType") or "").casefold() == "audio"
+            or str(item.payload.get("CollectionType") or "").casefold()
+            in {"music", "audiobooks"}
+        )
 
     def _begin_playback(self, item: MediaItem) -> None:
         self.playback_request += 1
@@ -4429,6 +4499,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_status_box.set_visible(True)
         self.player_spinner.start()
 
+        local_stream = self._local_download_stream(item)
+        if local_stream:
+            self._start_playback(item, local_stream, request_id)
+            return
         warmed = self.prebuffer.take(item)
         if warmed:
             self._start_playback(item, warmed, request_id)
@@ -4473,6 +4547,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _resolve_item(self, item: MediaItem) -> ResolvedStream:
+        local_stream = self._local_download_stream(item)
+        if local_stream:
+            return local_stream
         key = f"{item.source}:{item.id}"
         while True:
             with self.resolved_stream_lock:
@@ -4502,7 +4579,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 path = Path(str(item.payload.get("media_path") or ""))
                 if not path.is_file():
                     raise FileNotFoundError("The offline media file is missing.")
-                stream = ResolvedStream(path.resolve().as_uri())
+                stream = ResolvedStream(
+                    path.resolve().as_uri(), default_label="Local download"
+                )
             else:
                 raise ValueError(f"Unsupported media source: {item.source}")
             with self.resolved_stream_lock:
@@ -4513,6 +4592,45 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.resolved_stream_inflight.pop(key, None)
                 event.set()
 
+    def _local_download_stream(self, item: MediaItem) -> ResolvedStream | None:
+        if item.source != "youtube":
+            return None
+        record = self.offline.find_complete_for_item(item)
+        if not record:
+            return None
+        return ResolvedStream(
+            Path(record.media_path).resolve().as_uri(),
+            default_label="Local download",
+        )
+
+    def _online_variants(
+        self, item: MediaItem
+    ) -> tuple[list[StreamVariant], list[AudioTrack]]:
+        online = self.youtube.resolve(item)
+        variants = [StreamVariant("Online · Auto", online.url, online.headers)]
+        variants.extend(
+            StreamVariant(f"Online · {variant.label}", variant.url, variant.headers)
+            for variant in online.variants
+        )
+        return variants, online.audio_tracks
+
+    def _online_variants_loaded(
+        self,
+        item_id: str,
+        request_id: int,
+        options: tuple[list[StreamVariant], list[AudioTrack]],
+    ) -> bool:
+        if (
+            request_id == self.playback_request
+            and self.current_item
+            and self.current_item.id == item_id
+            and self.mpv_player
+        ):
+            variants, audio_tracks = options
+            self.mpv_player.set_variants(variants)
+            self.mpv_player.set_audio_tracks(audio_tracks)
+        return GLib.SOURCE_REMOVE
+
     def _start_playback(
         self, item: MediaItem, stream: str | ResolvedStream, request_id: int
     ) -> bool:
@@ -4521,18 +4639,37 @@ class TubeFinWindow(Adw.ApplicationWindow):
         headers: dict[str, str] = {}
         variants = []
         subtitles = []
+        audio_tracks = []
         if isinstance(stream, ResolvedStream):
             url = stream.url
             headers = stream.headers
             variants = stream.variants
             subtitles = stream.subtitles
+            audio_tracks = stream.audio_tracks
+            default_label = stream.default_label
         else:
             url = stream
+            default_label = "Auto"
         self.player_heading.set_label(item.title)
         self.mini_title.set_label(item.title)
         self.mini_subtitle.set_label(item.subtitle or item.source.capitalize())
         if self.mpv_player:
-            self.mpv_player.load(url, headers, variants, subtitles)
+            self.mpv_player.load(
+                url,
+                headers,
+                variants,
+                subtitles,
+                audio_tracks,
+                default_label,
+            )
+        if item.source == "youtube" and default_label == "Local download":
+            run_async(
+                lambda: self._online_variants(item),
+                lambda choices: self._online_variants_loaded(
+                    item.id, request_id, choices
+                ),
+                lambda _error: None,
+            )
         if item.source == "jellyfin":
             self._report_jellyfin_playback(item, "start", 0.0, False)
             self.last_reported_pause = False
@@ -5016,8 +5153,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
             )
         )
         if self.mpv_player:
-            self.mpv_player.previous_button.set_visible(has_previous)
-            self.mpv_player.next_button.set_visible(has_next)
+            fullscreen = self.mpv_player.fullscreen_mode
+            self.mpv_player.previous_button.set_visible(fullscreen or has_previous)
+            self.mpv_player.previous_button.set_sensitive(has_previous)
+            self.mpv_player.next_button.set_visible(fullscreen or has_next)
+            self.mpv_player.next_button.set_sensitive(has_next)
         if hasattr(self, "mini_previous"):
             self.mini_previous.set_visible(has_previous)
             self.mini_next.set_visible(has_next)
@@ -5069,6 +5209,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.fullscreen_title.set_visible(False)
             self.fullscreen_title.set_opacity(0)
             self.mpv_player.set_fullscreen_mode(False)
+            self._update_transport_buttons()
             return
         self.pre_fullscreen_sidebar_widths = (
             self.split_view.get_min_sidebar_width(),
@@ -5086,6 +5227,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.fullscreen_title.set_visible(True)
         self.fullscreen_title.set_opacity(1)
         self.mpv_player.set_fullscreen_mode(True)
+        self._update_transport_buttons()
 
     def _set_fullscreen_swipe_progress(self, progress: float) -> None:
         if not self.mpv_player or not self.mpv_player.fullscreen_mode:
@@ -6469,6 +6611,25 @@ class TubeFinWindow(Adw.ApplicationWindow):
         captions_row.add_suffix(captions_language)
         playback.add(captions_row)
 
+        audio_row = Adw.ActionRow(
+            title="Preferred dubbed audio",
+            subtitle=(
+                "Enter a language name or code. TubeFin uses the closest available "
+                "YouTube dub; leave blank for the original audio."
+            ),
+        )
+        audio_language = Gtk.Entry(
+            text=self.preferred_audio_language,
+            placeholder_text="Original",
+            valign=Gtk.Align.CENTER,
+        )
+        audio_language.set_width_chars(18)
+        audio_language.connect(
+            "changed", lambda entry: self._preferred_audio_language_changed(entry)
+        )
+        audio_row.add_suffix(audio_language)
+        playback.add(audio_row)
+
         sponsorblock = Adw.SwitchRow(
             title="SponsorBlock",
             subtitle="Choose how each crowd-sourced segment category is handled.",
@@ -6547,6 +6708,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         if self.mpv_player:
             self.mpv_player.default_caption_language = self.default_caption_language
+
+    def _preferred_audio_language_changed(self, entry: Gtk.Entry) -> None:
+        self.preferred_audio_language = entry.get_text().strip()
+        self.config.save_player_settings(
+            preferred_audio_language=self.preferred_audio_language
+        )
+        if self.mpv_player:
+            self.mpv_player.set_default_audio_language(
+                self.preferred_audio_language
+            )
 
     def _sponsorblock_changed(
         self, row: Adw.SwitchRow, _property: GObject.ParamSpec

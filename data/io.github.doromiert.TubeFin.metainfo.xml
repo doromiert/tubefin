@@ -12,7 +12,7 @@
     </p>
     <p>
       Search YouTube without an API key, connect to a Jellyfin server, browse
-      libraries, and play compatible media with GStreamer.
+      libraries, and play compatible media with libmpv.
     </p>
   </description>
   <launchable type="desktop-id">io.github.doromiert.TubeFin.desktop</launchable>
@@ -22,9 +22,9 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
-    <release version="0.1.0" date="2026-08-14">
+    <release version="1.0.0" date="2026-08-16">
       <description>
-        <p>Initial preview with YouTube search, Jellyfin browsing, and native playback.</p>
+        <p>First stable release with YouTube and Jellyfin playback, offline downloads, account sync, watch rooms, SponsorBlock, and MPRIS controls.</p>
       </description>
     </release>
   </releases>

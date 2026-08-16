@@ -40,6 +40,8 @@ class ResolvedStream:
     headers: dict[str, str] = field(default_factory=dict)
     variants: list[StreamVariant] = field(default_factory=list)
     subtitles: list[SubtitleTrack] = field(default_factory=list)
+    audio_tracks: list[AudioTrack] = field(default_factory=list)
+    default_label: str = "Auto"
 
 
 @dataclass(slots=True)
@@ -54,6 +56,16 @@ class SubtitleTrack:
     label: str
     language: str
     url: str
+
+
+@dataclass(slots=True)
+class AudioTrack:
+    label: str
+    language: str
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    format_id: str = ""
+    original: bool = False
 
 
 class Availability(StrEnum):
@@ -129,6 +141,7 @@ class DownloadRecord:
     media_path: str = ""
     quality: str = "best"
     audio_only: bool = False
+    audio_tracks: list[str] = field(default_factory=list)
     status: DownloadStatus = DownloadStatus.QUEUED
     progress: float = 0.0
     error: str = ""
