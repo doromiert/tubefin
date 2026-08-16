@@ -33,6 +33,7 @@ size = $size
 arch = any
 license = GPL-3.0-or-later
 depend = ffmpeg
+depend = deno
 depend = gst-libav
 depend = gst-plugins-bad
 depend = gst-plugins-base

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +61,15 @@ class YouTubeService:
         self.executable = shutil.which("yt-dlp")
         self.browser = browser
         self.avatar_cache: dict[str, str | None] = {}
+        self.cookie_snapshot_directory = tempfile.TemporaryDirectory(
+            prefix="tubefin-youtube-cookies-"
+        )
+        self.cookie_snapshot_path = (
+            Path(self.cookie_snapshot_directory.name) / "cookies.txt"
+        )
+        self.cookie_snapshot_lock = threading.Lock()
+        self.cookie_snapshot_ready = False
+        self.cookie_snapshot_browser = ""
 
     @property
     def available(self) -> bool:
@@ -134,10 +144,47 @@ class YouTubeService:
     def _run(self, *arguments: str) -> dict[str, Any]:
         if not self.executable:
             raise ServiceError("yt-dlp is not installed. Run TubeFin through Nix to include it.")
+        snapshot_owner = False
+        browser_arguments: list[str] = []
+        if self.browser:
+            self.cookie_snapshot_lock.acquire()
+            if self.cookie_snapshot_browser != self.browser:
+                self.cookie_snapshot_ready = False
+                self.cookie_snapshot_browser = self.browser
+                with suppress(OSError):
+                    self.cookie_snapshot_path.unlink()
+            if self.cookie_snapshot_ready:
+                browser_arguments = ["--cookies", str(self.cookie_snapshot_path)]
+                self.cookie_snapshot_lock.release()
+            else:
+                snapshot_owner = True
+                try:
+                    self.cookie_snapshot_path.write_text(
+                        "# Netscape HTTP Cookie File\n",
+                        encoding="utf-8",
+                    )
+                    self.cookie_snapshot_path.chmod(0o600)
+                except OSError:
+                    snapshot_owner = False
+                    self.cookie_snapshot_lock.release()
+                    browser_arguments = ["--cookies-from-browser", self.browser]
+                else:
+                    browser_arguments = [
+                        "--cookies-from-browser",
+                        self.browser,
+                        "--cookies",
+                        str(self.cookie_snapshot_path),
+                    ]
         try:
-            browser_arguments = ["--cookies-from-browser", self.browser] if self.browser else []
             result = subprocess.run(
-                [self.executable, *browser_arguments, *arguments],
+                [
+                    self.executable,
+                    "--ignore-config",
+                    "--js-runtimes",
+                    "deno",
+                    *browser_arguments,
+                    *arguments,
+                ],
                 capture_output=True,
                 check=False,
                 text=True,
@@ -145,6 +192,14 @@ class YouTubeService:
             )
         except subprocess.TimeoutExpired as error:
             raise ServiceError("YouTube took too long to respond.") from error
+        finally:
+            if snapshot_owner:
+                with suppress(OSError):
+                    self.cookie_snapshot_ready = (
+                        self.cookie_snapshot_path.stat().st_size > 32
+                    )
+                    self.cookie_snapshot_path.chmod(0o600)
+                self.cookie_snapshot_lock.release()
         if result.returncode != 0:
             detail = result.stderr.strip().splitlines()
             message = detail[-1] if detail else "yt-dlp could not complete the request."
@@ -1239,16 +1294,33 @@ class YouTubeService:
         self.avatar_cache[channel_url] = avatar
         return avatar
 
+    def resolve_fast(self, item: MediaItem) -> ResolvedStream:
+        """Resolve one progressive stream while avoiding nonessential manifests."""
+        return self._resolve_youtube_stream(item, fast=True)
+
     def resolve(self, item: MediaItem) -> ResolvedStream:
+        return self._resolve_youtube_stream(item, fast=False)
+
+    def _resolve_youtube_stream(
+        self, item: MediaItem, *, fast: bool
+    ) -> ResolvedStream:
         video_url = item.payload.get("webpage_url") or f"https://www.youtube.com/watch?v={item.id}"
-        data = self._run(
+        arguments = [
             "--dump-single-json",
             "--no-playlist",
             "--no-warnings",
+            "--no-write-comments",
             "--format",
             "best[height<=1080][vcodec^=avc1][acodec^=mp4a]/best[height<=1080]/best",
-            video_url,
-        )
+        ]
+        if fast:
+            arguments.extend(
+                (
+                    "--extractor-args",
+                    "youtube:skip=hls,dash,translated_subs",
+                )
+            )
+        data = self._run(*arguments, str(video_url))
         formats = list(data.get("formats") or [])
         explicit_original_languages = {
             str(candidate.get("language") or "").casefold()
@@ -1287,17 +1359,23 @@ class YouTubeService:
             for candidate in muxed_formats
             if original_audio_rank(candidate)
         ]
-        chosen_stream = max(
-            original_muxed,
-            key=lambda candidate: (
-                original_audio_rank(candidate),
-                int(candidate.get("height") or 0),
-                str(candidate.get("vcodec") or "").startswith("avc1"),
-                float(candidate.get("tbr") or 0),
-            ),
-            default=None,
+        chosen_stream = (
+            None
+            if fast
+            else max(
+                original_muxed,
+                key=lambda candidate: (
+                    original_audio_rank(candidate),
+                    int(candidate.get("height") or 0),
+                    str(candidate.get("vcodec") or "").startswith("avc1"),
+                    float(candidate.get("tbr") or 0),
+                ),
+                default=None,
+            )
         )
-        stream_url = chosen_stream.get("url") if chosen_stream else data.get("url")
+        stream_url = data.get("url") if fast else (
+            chosen_stream.get("url") if chosen_stream else data.get("url")
+        )
         if not stream_url:
             raise ServiceError("No compatible YouTube stream was found.")
         headers = {
@@ -1371,12 +1449,16 @@ class YouTubeService:
         return ResolvedStream(
             str(stream_url),
             headers,
-            variants,
-            subtitles,
-            audio_tracks,
-            description=str(data.get("description") or ""),
-            published_date=str(data.get("upload_date") or data.get("release_date") or ""),
-            chapters=self._chapters(data),
+            variants if not fast else [],
+            subtitles if not fast else [],
+            audio_tracks if not fast else [],
+            description=str(data.get("description") or "") if not fast else "",
+            published_date=(
+                str(data.get("upload_date") or data.get("release_date") or "")
+                if not fast
+                else ""
+            ),
+            chapters=self._chapters(data) if not fast else [],
         )
 
     @staticmethod

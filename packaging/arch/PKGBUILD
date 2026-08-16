@@ -6,6 +6,7 @@ arch=('any')
 url='https://github.com/doromiert/tubefin'
 license=('GPL-3.0-or-later')
 depends=(
+  'deno'
   'ffmpeg'
   'gst-libav'
   'gst-plugins-bad'

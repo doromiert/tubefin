@@ -55,8 +55,10 @@ from tubefin.mpv_player import MpvPlayer  # noqa: E402
 from tubefin.oauth import COMMENT_SCOPE, MANAGE_SCOPE, OAuthClient  # noqa: E402
 from tubefin.played_cache import PlayedVideoCache  # noqa: E402
 from tubefin.services import (  # noqa: E402
+    ContentUnavailableError,
     JellyfinService,
     SeerrService,
+    ServiceError,
     SponsorBlockService,
     YouTubeService,
 )
@@ -423,6 +425,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_load_summary: Gtk.Label | None = None
         self.playback_load_list: Gtk.ListBox | None = None
         self.playback_load_refresh_source = 0
+        self.playback_enrichment_item_id = ""
+        self.playback_fast_path_item_id = ""
+        self.playback_fast_retry_item_id = ""
         self.expected_page = "home"
         self.player_expanded = False
         self.player_navigation_guard_until = 0.0
@@ -6405,12 +6410,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
             ("Queue prebuffer wait", "queue_wait_start", "worker_ready"),
             ("Background worker dispatch", "worker_queued", "worker_started"),
             ("Stream resolver", "resolver_start", "resolver_end"),
+            ("Reliable resolver fallback", "fallback_start", "fallback_end"),
             ("Played-video disk cache", "played_cache_start", "played_cache_end"),
             ("Legacy cache validation", "legacy_cache_start", "legacy_cache_end"),
             ("Worker → GTK handoff", "worker_done", "worker_ready"),
             ("Cached-prefix proxy", "proxy_start", "proxy_end"),
             ("mpv file open / first byte", "mpv_load", "file_loaded"),
             ("file loaded → playback", "file_loaded", "first_playback"),
+            (
+                "Background enrichment (off critical path)",
+                "enrichment_start",
+                "enrichment_end",
+            ),
         )
         segments: list[tuple[str, str, float | None]] = []
         for label, start_name, end_name in definitions:
@@ -6575,6 +6586,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 "details_cache": "Details cache",
                 "resolver": "Resolver result",
                 "resolver_refresh": "Resolver refresh",
+                "fallback": "Fast-path fallback",
+                "enrichment": "Enrichment",
                 "played_cache": "Played cache",
                 "prefix": "Cached prefix",
                 "stream_label": "Stream",
@@ -7023,10 +7036,33 @@ class TubeFinWindow(Adw.ApplicationWindow):
         try:
             if trace_request_id is not None:
                 self._mark_playback_load(
-                    trace_request_id, resolver=f"fresh {item.source} request"
+                    trace_request_id,
+                    resolver=(
+                        "fresh youtube fast-path request"
+                        if item.source == "youtube"
+                        else f"fresh {item.source} request"
+                    ),
                 )
             if item.source == "youtube":
-                stream = self.youtube.resolve(item)
+                try:
+                    stream = self.youtube.resolve_fast(item)
+                except ContentUnavailableError:
+                    raise
+                except ServiceError as fast_error:
+                    if trace_request_id is not None:
+                        self._mark_playback_load(
+                            trace_request_id,
+                            "fallback_start",
+                            fallback=f"fast resolver failed: {fast_error}",
+                        )
+                    try:
+                        stream = self.youtube.resolve(item)
+                    finally:
+                        if trace_request_id is not None:
+                            self._mark_playback_load(
+                                trace_request_id,
+                                "fallback_end",
+                            )
             elif item.source == "jellyfin":
                 stream = self.jellyfin.resolve(item)
             elif item.source == "offline":
@@ -7086,6 +7122,97 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.mpv_player.set_chapters(chapters)
         return GLib.SOURCE_REMOVE
 
+    def _enrich_current_youtube_playback(self) -> None:
+        if not self.current_item or self.current_item.source != "youtube":
+            return
+        item = self.current_item
+        if self.playback_enrichment_item_id == item.id or not self.played_cache_source:
+            return
+        source_item_id, stream = self.played_cache_source
+        if source_item_id != item.id:
+            return
+        if stream.variants:
+            return
+        self.playback_enrichment_item_id = item.id
+        request_id = self.playback_request
+        self._mark_playback_load(
+            request_id,
+            "enrichment_start",
+            enrichment="resolving qualities, captions, audio, chapters, and metadata",
+        )
+        run_async(
+            lambda: self.youtube.resolve(item),
+            lambda enriched: self._youtube_playback_enriched(
+                item, enriched, request_id
+            ),
+            lambda error: self._youtube_playback_enrichment_failed(
+                error, request_id
+            ),
+        )
+
+    def _youtube_playback_enriched(
+        self,
+        item: MediaItem,
+        stream: ResolvedStream,
+        request_id: int,
+    ) -> bool:
+        self._mark_playback_load(
+            request_id,
+            "enrichment_end",
+            enrichment="complete",
+        )
+        with self.resolved_stream_lock:
+            self.resolved_stream_cache[f"{item.source}:{item.id}"] = (
+                time.monotonic(),
+                stream,
+            )
+        if (
+            request_id != self.playback_request
+            or not self.current_item
+            or self.current_item.id != item.id
+        ):
+            return GLib.SOURCE_REMOVE
+        playback_stream = self.played_cache_source[1] if self.played_cache_source else None
+        matching_stream = bool(
+            playback_stream
+            and self.played_cache.streams_match(playback_stream, stream)
+        )
+        self.played_cache_source = (item.id, stream)
+        buffered = self.played_cache_buffered
+        if buffered and buffered.upstream_is_deferred and matching_stream:
+            buffered.replace_upstream(stream)
+
+        def persist_enrichment() -> None:
+            if not matching_stream:
+                return
+            if buffered:
+                self.played_cache.refresh_stream(item, stream, buffered)
+            else:
+                self.played_cache.refresh_existing_stream(item, stream)
+
+        threading.Thread(
+            target=persist_enrichment,
+            daemon=True,
+            name=f"played-cache-enrichment-{item.id[:12]}",
+        ).start()
+        self._set_player_description(item, stream.description, stream.published_date)
+        if self.mpv_player:
+            self.mpv_player.set_variants(stream.variants)
+            self.mpv_player.set_subtitles(stream.subtitles)
+            self.mpv_player.set_audio_tracks(stream.audio_tracks)
+            self.mpv_player.set_chapters(stream.chapters)
+        return GLib.SOURCE_REMOVE
+
+    def _youtube_playback_enrichment_failed(
+        self, error: Exception, request_id: int
+    ) -> bool:
+        self._mark_playback_load(
+            request_id,
+            "enrichment_end",
+            enrichment=f"failed: {error}",
+        )
+        return GLib.SOURCE_REMOVE
+
     def _start_playback(
         self, item: MediaItem, stream: str | ResolvedStream, request_id: int
     ) -> bool:
@@ -7110,6 +7237,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         else:
             url = stream
             default_label = "Auto"
+        self.playback_fast_path_item_id = (
+            item.id
+            if item.source == "youtube"
+            and isinstance(stream, ResolvedStream)
+            and not stream.variants
+            and default_label != "Local download"
+            else ""
+        )
         self._mark_playback_load(
             request_id,
             "mpv_load",
@@ -7308,6 +7443,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._load_jellyfin_current()
 
     def _mpv_error(self, message: str) -> None:
+        if self._retry_failed_fast_path(message):
+            return
         self._mark_playback_load(
             self.playback_request,
             "failed",
@@ -7319,6 +7456,58 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_status.set_label(f"Playback failed: {message}")
         self.player_status_box.set_visible(True)
         self.toast_overlay.add_toast(Adw.Toast(title=f"Playback failed: {message}"))
+
+    def _retry_failed_fast_path(self, message: str) -> bool:
+        if (
+            "loading failed" not in message.casefold()
+            or not self.current_item
+            or self.current_item.source != "youtube"
+            or self.playback_fast_path_item_id != self.current_item.id
+            or self.playback_fast_retry_item_id == self.current_item.id
+        ):
+            return False
+        item = self.current_item
+        request_id = self.playback_request
+        self.playback_fast_retry_item_id = item.id
+        self.player_status.set_label("Fast stream failed. Retrying with full resolver…")
+        self.player_status_box.set_visible(True)
+        self.player_spinner.start()
+        self._mark_playback_load(
+            request_id,
+            "fallback_start",
+            fallback=f"fast stream rejected by mpv: {message}",
+        )
+        with self.resolved_stream_lock:
+            self.resolved_stream_cache.pop(f"{item.source}:{item.id}", None)
+        run_async(
+            lambda: self.youtube.resolve(item),
+            lambda stream: self._reliable_fallback_ready(
+                item, stream, request_id
+            ),
+            lambda error: self._playback_error(error, request_id),
+        )
+        return True
+
+    def _reliable_fallback_ready(
+        self,
+        item: MediaItem,
+        stream: ResolvedStream,
+        request_id: int,
+    ) -> bool:
+        self._mark_playback_load(
+            request_id,
+            "fallback_end",
+            fallback="full resolver completed",
+        )
+        if request_id != self.playback_request:
+            return GLib.SOURCE_REMOVE
+        with self.resolved_stream_lock:
+            self.resolved_stream_cache[f"{item.source}:{item.id}"] = (
+                time.monotonic(),
+                stream,
+            )
+        self.played_cache_source = (item.id, stream)
+        return self._start_playback(item, stream, request_id)
 
     def _queue_current(self) -> None:
         if self.current_item:
@@ -7966,6 +8155,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.played_cache_source = None
         self.played_cache_buffered = None
         self.played_cache_request_item_id = ""
+        self.playback_enrichment_item_id = ""
+        self.playback_fast_path_item_id = ""
+        self.playback_fast_retry_item_id = ""
 
     def _report_jellyfin_playback(
         self,
@@ -8181,6 +8373,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 after="file_loaded",
             )
             self._cache_current_played_video()
+            self._enrich_current_youtube_playback()
         if (
             self.current_item
             and self.queue

@@ -50,6 +50,10 @@ class PlayedVideoCache:
             )
         )
 
+    @classmethod
+    def streams_match(cls, first: ResolvedStream, second: ResolvedStream) -> bool:
+        return cls._signature(first) == cls._signature(second)
+
     @staticmethod
     def _digest(key: str) -> str:
         return hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()
@@ -250,6 +254,23 @@ class PlayedVideoCache:
     ) -> None:
         """Refresh expiring stream metadata while retaining the cached prefix."""
         self._store(item, stream, buffered)
+
+    def refresh_existing_stream(
+        self,
+        item: MediaItem,
+        stream: ResolvedStream,
+        wait_seconds: float = 20,
+    ) -> None:
+        """Attach enriched metadata after the parallel prefix writer finishes."""
+        deadline = time.monotonic() + max(0, wait_seconds)
+        while True:
+            buffered = self.prepare(item, stream)
+            if buffered is not None:
+                self._store(item, stream, buffered)
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.25)
 
     def prepare(
         self,

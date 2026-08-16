@@ -754,6 +754,19 @@ class MpvPlayer(Gtk.Box):
         self._set_audio_options()
         self._apply_audio_selection()
 
+    def set_subtitles(self, subtitles: list[SubtitleTrack]) -> None:
+        self.subtitles = list(subtitles)
+        was_syncing = self.syncing_options
+        self.syncing_options = True
+        captions = ["Captions off", *(track.label for track in self.subtitles)]
+        self.captions.set_model(Gtk.StringList.new(captions))
+        self.captions.set_selected(self._preferred_caption_index())
+        self.option_rows["Closed captions"].set_visible(bool(self.subtitles))
+        self.option_rows["Subtitle offset"].set_visible(bool(self.subtitles))
+        self.syncing_options = was_syncing
+        GLib.idle_add(self._normalize_option_widths)
+        self._apply_caption_selection()
+
     def set_chapters(self, chapters: list[VideoChapter]) -> None:
         self.chapters = list(chapters)
         self.progress.set_chapters(self.chapters)

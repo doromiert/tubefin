@@ -89,7 +89,7 @@
 
             preFixup = ''
               gappsWrapperArgs+=(
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp pkgs.ffmpeg pkgs.libsecret ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp pkgs.deno pkgs.ffmpeg pkgs.libsecret ]}
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.mpv pkgs.libglvnd ]}
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${
                   pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
@@ -176,6 +176,7 @@
               pkgs.gst_all_1.gst-plugins-ugly
               pkgs.gst_all_1.gst-libav
               pkgs.yt-dlp
+              pkgs.deno
               pkgs.ffmpeg
               pkgs.libsecret
               pkgs.ruff
