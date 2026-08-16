@@ -1158,13 +1158,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return page
 
     def _build_account_page(self) -> Gtk.Widget:
-        scroller = Gtk.ScrolledWindow(vexpand=True)
-        clamp = Adw.Clamp(maximum_size=760)
-        clamp.set_margin_top(28)
-        clamp.set_margin_bottom(28)
-        scroller.set_child(clamp)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        clamp.set_child(content)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
         intro = Gtk.Label(
             label=(
                 "Only configure this when developing TubeFin or when you need remote YouTube "
@@ -1180,48 +1176,65 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.oauth_client_id = Adw.EntryRow(title="Desktop client ID")
         self.oauth_client_id.set_text(str(self.config.load_oauth_settings()["client_id"]))
         group.add(self.oauth_client_id)
-        save_client = Gtk.Button(label="Save client ID")
-        save_client.set_halign(Gtk.Align.END)
-        save_client.connect("clicked", lambda *_: self._save_oauth_client())
-        content.append(group)
-        content.append(save_client)
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        sign_in = Gtk.Button(
-            label="Connect API account (read-only)", icon_name="avatar-default-symbolic"
+        save_row = Adw.ActionRow(
+            title="Client configuration",
+            subtitle="Save the desktop OAuth client ID entered above.",
         )
+        save_client = Gtk.Button(label="Save", valign=Gtk.Align.CENTER)
+        save_client.connect("clicked", lambda *_: self._save_oauth_client())
+        save_row.add_suffix(save_client)
+        group.add(save_row)
+        content.append(group)
+
+        access = Adw.PreferencesGroup(title="API account access")
+        read_only = Adw.ActionRow(
+            title="Read-only account",
+            subtitle="Read subscriptions, likes, history, and playlists.",
+        )
+        sign_in = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER)
         sign_in.add_css_class("suggested-action")
         sign_in.connect("clicked", lambda *_: self._oauth_sign_in(False))
-        actions.append(sign_in)
-        manage = Gtk.Button(
-            label="Connect API account with playlist access",
-            icon_name="document-edit-symbolic",
+        read_only.add_suffix(sign_in)
+        access.add(read_only)
+        managed = Adw.ActionRow(
+            title="Playlist editing account",
+            subtitle="Also create, edit, and delete remote YouTube playlists.",
         )
+        manage = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER)
         manage.connect("clicked", lambda *_: self._oauth_sign_in(True))
-        actions.append(manage)
-        content.append(actions)
+        managed.add_suffix(manage)
+        access.add(managed)
+        content.append(access)
+
+        accounts = Adw.PreferencesGroup(title="Connected API accounts")
         self.account_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.account_list.add_css_class("boxed-list")
-        content.append(self.account_list)
-        feeds = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        accounts.add(self.account_list)
+        content.append(accounts)
+
+        feeds = Adw.PreferencesGroup(title="Account data")
         for label, feed in (
             ("Subscriptions", "subscriptions"),
             ("Liked videos", "liked"),
             ("History / activity", "history"),
             ("Account playlists", "playlists"),
         ):
-            button = Gtk.Button(label=label)
+            row = Adw.ActionRow(title=label)
+            button = Gtk.Button(label="Open", valign=Gtk.Align.CENTER)
             button.connect("clicked", lambda _button, name=feed: self._load_account_feed(name))
-            feeds.append(button)
+            row.add_suffix(button)
+            feeds.add(row)
         content.append(feeds)
-        playlist_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.account_playlist_name = Gtk.Entry(
-            placeholder_text="New account playlist", hexpand=True
+
+        playlists = Adw.PreferencesGroup(title="Remote playlists")
+        self.account_playlist_name = Adw.EntryRow(title="New account playlist")
+        create_account_playlist = Gtk.Button(
+            label="Create", icon_name="list-add-symbolic", valign=Gtk.Align.CENTER
         )
-        playlist_actions.append(self.account_playlist_name)
-        create_account_playlist = Gtk.Button(label="Create", icon_name="list-add-symbolic")
         create_account_playlist.connect("clicked", lambda *_: self._create_account_playlist())
-        playlist_actions.append(create_account_playlist)
-        content.append(playlist_actions)
+        self.account_playlist_name.add_suffix(create_account_playlist)
+        playlists.add(self.account_playlist_name)
+        content.append(playlists)
         self.account_playlist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         content.append(self.account_playlist_box)
         self.account_grid = MediaGrid(
@@ -1236,8 +1249,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
             on_mark_watched=self._mark_watched,
             on_share=self._share_item,
         )
+        self.account_grid.set_size_request(-1, 400)
         content.append(self.account_grid)
-        return scroller
+        return content
 
     def _build_channel_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1664,9 +1678,24 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _build_mini_player(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         bar.add_css_class("mini-player")
-        self.mini_icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
-        self.mini_icon.set_pixel_size(24)
-        bar.append(self.mini_icon)
+        self.mini_previous = Gtk.Button(
+            icon_name="media-skip-backward-symbolic", tooltip_text="Previous"
+        )
+        self.mini_previous.add_css_class("mini-control")
+        self.mini_previous.connect("clicked", lambda *_: self._play_previous_queued())
+        bar.append(self.mini_previous)
+        self.mini_play = Gtk.Button(
+            icon_name="media-playback-start-symbolic", tooltip_text="Play"
+        )
+        self.mini_play.add_css_class("mini-control")
+        self.mini_play.connect("clicked", lambda *_: self._mini_play_pause())
+        bar.append(self.mini_play)
+        self.mini_next = Gtk.Button(
+            icon_name="media-skip-forward-symbolic", tooltip_text="Next"
+        )
+        self.mini_next.add_css_class("mini-control")
+        self.mini_next.connect("clicked", lambda *_: self._skip_queued())
+        bar.append(self.mini_next)
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         self.mini_title = Gtk.Label(xalign=0)
         self.mini_title.add_css_class("heading")
@@ -1678,18 +1707,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.mini_subtitle.set_ellipsize(Pango.EllipsizeMode.END)
         labels.append(self.mini_subtitle)
         bar.append(labels)
-        self.mini_previous = Gtk.Button(
-            icon_name="media-skip-backward-symbolic", tooltip_text="Previous"
-        )
-        self.mini_previous.add_css_class("mini-control")
-        self.mini_previous.connect("clicked", lambda *_: self._play_previous_queued())
-        bar.append(self.mini_previous)
-        self.mini_next = Gtk.Button(
-            icon_name="media-skip-forward-symbolic", tooltip_text="Next"
-        )
-        self.mini_next.add_css_class("mini-control")
-        self.mini_next.connect("clicked", lambda *_: self._skip_queued())
-        bar.append(self.mini_next)
         open_player = Gtk.Button(icon_name="view-fullscreen-symbolic", tooltip_text="Open player")
         open_player.add_css_class("mini-control")
         open_player.connect("clicked", lambda *_: self._show_player())
@@ -3061,12 +3078,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _seerr_result_card(self, result: dict[str, Any]) -> Gtk.Widget:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         card.add_css_class("seerr-card")
+        poster_overlay = Gtk.Overlay()
+        poster_overlay.set_child(
+            Gtk.Image.new_from_icon_name("image-missing-symbolic")
+        )
         poster = Gtk.Picture()
         poster.set_content_fit(Gtk.ContentFit.COVER)
         poster.set_can_shrink(True)
+        poster.set_hexpand(True)
+        poster.set_vexpand(True)
+        poster_overlay.add_overlay(poster)
         frame = Gtk.AspectFrame(ratio=2 / 3, obey_child=False)
         frame.set_size_request(180, 270)
-        frame.set_child(poster)
+        frame.set_child(poster_overlay)
         card.append(frame)
         title = str(result.get("title") or result.get("name") or "Untitled")
         title_label = Gtk.Label(label=title, xalign=0, wrap=True, lines=2)
@@ -3099,10 +3123,21 @@ class TubeFinWindow(Adw.ApplicationWindow):
             ),
         )
         card.append(button)
-        poster_path = str(result.get("posterPath") or "")
+        poster_path = str(
+            result.get("posterPath") or result.get("poster_path") or ""
+        )
         if poster_path:
+            if poster_path.startswith("//"):
+                poster_url = f"https:{poster_path}"
+            elif poster_path.startswith(("http://", "https://")):
+                poster_url = poster_path
+            else:
+                poster_url = (
+                    "https://image.tmdb.org/t/p/w300_and_h450_face/"
+                    f"{poster_path.lstrip('/')}"
+                )
             self.thumbnails.load(
-                f"https://image.tmdb.org/t/p/w500{poster_path}",
+                poster_url,
                 lambda path, picture=poster: self._set_details_result_picture(picture, path),
             )
         return card
@@ -5647,6 +5682,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._refresh_queue()
         self._begin_playback(self.queue[self.queue_index])
 
+    def _mini_play_pause(self) -> None:
+        if self.current_item and self.mpv_player:
+            self.mpv_player.set_paused(not self.last_playback_paused)
+            return
+        if self.queue:
+            self._play_queued(max(0, self.queue_index))
+
     def _play_queued(self, index: int) -> None:
         if index >= len(self.queue):
             return
@@ -5893,6 +5935,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_request += 1
         self._detach_playback()
         self.current_item = None
+        self.mini_play.set_icon_name("media-playback-start-symbolic")
+        self.mini_play.set_tooltip_text("Play")
         if self.queue:
             preview_index = max(0, self.queue_index)
             preview = self.queue[min(preview_index, len(self.queue) - 1)]
@@ -5906,6 +5950,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_request += 1
         self._detach_playback()
         self.current_item = None
+        self.mini_play.set_icon_name("media-playback-start-symbolic")
+        self.mini_play.set_tooltip_text("Play")
         self.queue.clear()
         self.queue_index = -1
         self._refresh_queue()
@@ -6090,6 +6136,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.last_playback_position = position
         self.last_playback_duration = duration
         self.last_playback_paused = paused
+        if hasattr(self, "mini_play"):
+            self.mini_play.set_icon_name(
+                "media-playback-start-symbolic"
+                if paused
+                else "media-playback-pause-symbolic"
+            )
+            self.mini_play.set_tooltip_text("Play" if paused else "Pause")
         manual_segment: SponsorSegment | None = None
         automatically_skipped = False
         if self.current_item and self.current_item.source == "youtube" and self.mpv_player:
@@ -7283,7 +7336,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.home_order_group = Adw.PreferencesGroup(
             title="Home sections",
             description=(
-                "Use the arrows to choose the shelf order. Shelves can be collapsed "
+                "Drag the rows to choose the shelf order. Shelves can be collapsed "
                 "temporarily from Home."
             ),
         )
@@ -7294,7 +7347,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         advanced_group = Adw.PreferencesGroup()
         advanced = Adw.ExpanderRow(title="Optional YouTube API access")
         account_page = self._build_account_page()
-        account_page.set_size_request(-1, 520)
         advanced.add_row(account_page)
         advanced_group.add(advanced)
         content.append(advanced_group)
@@ -7333,42 +7385,57 @@ class TubeFinWindow(Adw.ApplicationWindow):
         for row in getattr(self, "home_order_rows", []):
             group.remove(row)
         self.home_order_rows = []
-        for index, key in enumerate(self.home_section_order):
+        for key in self.home_section_order:
             row = Adw.ActionRow(title=HOME_SECTION_TITLES.get(key, key))
-            controls = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER
+            handle = Gtk.Image.new_from_icon_name("list-drag-handle-symbolic")
+            handle.add_css_class("dim-label")
+            handle.set_tooltip_text("Drag to reorder")
+            row.add_prefix(handle)
+            drag_source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+            drag_source.connect("prepare", self._prepare_home_section_drag, key)
+            row.add_controller(drag_source)
+            drop_target = Gtk.DropTarget.new(
+                GObject.TYPE_STRING, Gdk.DragAction.MOVE
             )
-            up = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Move up")
-            up.add_css_class("square-button")
-            up.set_sensitive(index > 0)
-            up.connect("clicked", lambda *_args, value=key: self._move_home_section(value, -1))
-            controls.append(up)
-            down = Gtk.Button(icon_name="go-down-symbolic", tooltip_text="Move down")
-            down.add_css_class("square-button")
-            down.set_sensitive(index < len(self.home_section_order) - 1)
-            down.connect(
-                "clicked", lambda *_args, value=key: self._move_home_section(value, 1)
-            )
-            controls.append(down)
-            row.add_suffix(controls)
+            drop_target.set_preload(True)
+            drop_target.connect("drop", self._drop_home_section, key)
+            row.add_controller(drop_target)
             group.add(row)
             self.home_order_rows.append(row)
 
-    def _move_home_section(self, key: str, offset: int) -> None:
+    @staticmethod
+    def _prepare_home_section_drag(
+        _source: Gtk.DragSource,
+        _x: float,
+        _y: float,
+        key: str,
+    ) -> Gdk.ContentProvider:
+        value = GObject.Value()
+        value.init(GObject.TYPE_STRING)
+        value.set_string(key)
+        return Gdk.ContentProvider.new_for_value(value)
+
+    def _drop_home_section(
+        self,
+        _target: Gtk.DropTarget,
+        source_key: str,
+        _x: float,
+        _y: float,
+        target_key: str,
+    ) -> bool:
         try:
-            current = self.home_section_order.index(key)
+            source = self.home_section_order.index(source_key)
+            target = self.home_section_order.index(target_key)
         except ValueError:
-            return
-        target = current + offset
-        if target < 0 or target >= len(self.home_section_order):
-            return
-        self.home_section_order[current], self.home_section_order[target] = (
-            self.home_section_order[target],
-            self.home_section_order[current],
-        )
+            return False
+        if source == target:
+            return True
+        section = self.home_section_order.pop(source)
+        self.home_section_order.insert(target, section)
         self.config.save_home_section_order(self.home_section_order)
         self._rebuild_home_sections()
         self._rebuild_home_order_settings()
+        return True
 
     def _sync_identity_changed(
         self, username: Adw.EntryRow, color_button: Gtk.ColorButton

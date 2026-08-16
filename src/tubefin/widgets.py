@@ -84,7 +84,7 @@ class ThumbnailLoader:
             request = urllib.request.Request(
                 url,
                 headers={
-                    "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+                    "Accept": "image/jpeg,image/png,*/*",
                     "User-Agent": "Mozilla/5.0 TubeFin/0.1",
                 },
             )
