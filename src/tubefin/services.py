@@ -840,7 +840,13 @@ class YouTubeService:
             track for track in self._audio_tracks(data) if not track.original
         ]
         return ResolvedStream(
-            str(stream_url), headers, variants, subtitles, audio_tracks
+            str(stream_url),
+            headers,
+            variants,
+            subtitles,
+            audio_tracks,
+            description=str(data.get("description") or ""),
+            published_date=str(data.get("upload_date") or data.get("release_date") or ""),
         )
 
     @staticmethod
@@ -1390,7 +1396,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="1.1.1"'
+        'DeviceId="tubefin-desktop", Version="1.1.2"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:
@@ -1629,6 +1635,12 @@ class JellyfinService:
                 "X-Emby-Token": session.access_token,
             },
             subtitles=subtitles,
+            description=str(item.payload.get("Overview") or ""),
+            published_date=str(
+                item.payload.get("PremiereDate")
+                or item.payload.get("ProductionYear")
+                or ""
+            ),
         )
 
     def report_playback(

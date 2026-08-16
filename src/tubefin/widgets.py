@@ -183,7 +183,7 @@ class MediaCard(Gtk.Box):
         avatar_frame = Gtk.Overlay(width_request=36, height_request=36)
         avatar_frame.set_size_request(36, 36)
         avatar_frame.set_halign(Gtk.Align.START)
-        avatar_frame.set_valign(Gtk.Align.START)
+        avatar_frame.set_valign(Gtk.Align.CENTER)
         avatar_frame.set_overflow(Gtk.Overflow.HIDDEN)
         avatar_frame.add_css_class("channel-avatar")
         avatar_fallback = Gtk.Image.new_from_icon_name("avatar-default-symbolic")
@@ -202,6 +202,7 @@ class MediaCard(Gtk.Box):
                 channel_button = Gtk.Button(child=avatar_frame)
                 channel_button.add_css_class("flat")
                 channel_button.add_css_class("channel-avatar-button")
+                channel_button.set_valign(Gtk.Align.CENTER)
                 channel_button.set_tooltip_text(f"Open {item.subtitle or 'channel'}")
                 channel_button.connect(
                     "clicked",

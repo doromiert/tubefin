@@ -42,6 +42,8 @@ class ResolvedStream:
     subtitles: list[SubtitleTrack] = field(default_factory=list)
     audio_tracks: list[AudioTrack] = field(default_factory=list)
     default_label: str = "Auto"
+    description: str = ""
+    published_date: str = ""
 
 
 @dataclass(slots=True)

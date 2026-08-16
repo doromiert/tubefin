@@ -335,6 +335,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.last_playback_position = 0.0
         self.last_playback_duration = 0.0
         self.last_playback_paused = True
+        self.playback_started_at = 0.0
+        self.queue_advance_item_id = ""
         self.last_reported_pause: bool | None = None
         self.resume_position_offer = 0.0
         self.resume_item_id = ""
@@ -357,6 +359,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.jellyfin_loaded = False
         self.detail_item: MediaItem | None = None
         self.detail_series_play_item: MediaItem | None = None
+        self.detail_series_episodes: list[MediaItem] = []
         self.detail_series_generation = 0
         self.active_playlist_id = ""
         self.youtube_playlist_items: list[MediaItem] = []
@@ -367,6 +370,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.resolved_stream_lock = threading.Lock()
         self.playback_request = 0
         self.expected_page = "home"
+        self.player_expanded = False
+        self.player_navigation_guard_until = 0.0
         self.active_navigation = "home"
         self.syncing_navigation = False
         self.queue: list[MediaItem] = []
@@ -1375,7 +1380,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         back = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back")
         back.connect("clicked", lambda *_: self._leave_player())
         self.header.pack_start(back)
-        self.player_heading = Gtk.Label(label="Now playing")
+        self.player_heading = Gtk.Label()
         self.player_heading.add_css_class("heading")
         self.player_heading.set_ellipsize(Pango.EllipsizeMode.END)
         self.player_comments_button = Gtk.ToggleButton(
@@ -1411,9 +1416,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.mpv_player = MpvPlayer(
             self._mpv_ready,
             self._mpv_error,
-            on_ended=self._play_next_queued,
-            on_previous=self._play_previous_queued,
-            on_next=self._skip_queued,
+            on_previous=lambda: self._play_previous_queued(reveal_player=True),
+            on_next=lambda: self._play_next_queued(reveal_player=True),
             on_fullscreen=self._toggle_fullscreen,
             on_collapse=self._leave_player,
             on_fullscreen_swipe=self._set_fullscreen_swipe_progress,
@@ -1513,10 +1517,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
         playback.append(self.player_comments_panel)
         page.append(playback)
 
-        self.player_details = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.player_details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         details = self.player_details
         details.add_css_class("player-details")
-        channel_cluster = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, hexpand=True)
+        self.player_title = Gtk.Label(xalign=0)
+        self.player_title.add_css_class("title-2")
+        self.player_title.set_ellipsize(Pango.EllipsizeMode.END)
+        details.append(self.player_title)
+        player_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        channel_cluster = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10, hexpand=True
+        )
+        channel_cluster.set_valign(Gtk.Align.CENTER)
         self.player_avatar = Gtk.Overlay(width_request=36, height_request=36)
         self.player_avatar.set_size_request(36, 36)
         self.player_avatar.set_valign(Gtk.Align.CENTER)
@@ -1537,12 +1549,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_avatar_button.set_tooltip_text("Open channel")
         self.player_avatar_button.connect("clicked", lambda *_: self._open_current_channel())
         channel_cluster.append(self.player_avatar_button)
-        player_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        self.player_title = Gtk.Label(xalign=0)
-        self.player_title.add_css_class("title-2")
-        self.player_title.set_ellipsize(Pango.EllipsizeMode.END)
-        self.player_title.set_max_width_chars(46)
-        player_copy.append(self.player_title)
         self.player_subtitle = Gtk.Label(xalign=0)
         self.player_subtitle.add_css_class("dim-label")
         self.player_subtitle.set_ellipsize(Pango.EllipsizeMode.END)
@@ -1550,10 +1556,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_channel_button.add_css_class("flat")
         self.player_channel_button.add_css_class("channel-name-button")
         self.player_channel_button.set_halign(Gtk.Align.START)
+        self.player_channel_button.set_valign(Gtk.Align.CENTER)
         self.player_channel_button.set_tooltip_text("Open channel")
         self.player_channel_button.connect("clicked", lambda *_: self._open_current_channel())
-        player_copy.append(self.player_channel_button)
-        channel_cluster.append(player_copy)
+        channel_cluster.append(self.player_channel_button)
         self.player_subscribe = Gtk.Button(
             icon_name="list-add-symbolic", tooltip_text="Subscribe"
         )
@@ -1562,13 +1568,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_subscribe.set_valign(Gtk.Align.CENTER)
         self.player_subscribe.connect("clicked", lambda *_: self._toggle_current_subscription())
         channel_cluster.append(self.player_subscribe)
-        details.append(channel_cluster)
+        player_actions.append(channel_cluster)
         save_current = labeled_button("Save", "list-add-symbolic")
         save_current.set_valign(Gtk.Align.CENTER)
         save_current.connect(
             "clicked", lambda *_: self.current_item and self._save_item(self.current_item)
         )
-        details.append(save_current)
+        player_actions.append(save_current)
         share_current = Gtk.Button(
             icon_name="send-to-symbolic", tooltip_text="Copy share link"
         )
@@ -1576,13 +1582,22 @@ class TubeFinWindow(Adw.ApplicationWindow):
         share_current.connect(
             "clicked", lambda *_: self.current_item and self._share_item(self.current_item)
         )
-        details.append(share_current)
+        player_actions.append(share_current)
         self.player_download = labeled_button("Download", "folder-download-symbolic")
         self.player_download.set_valign(Gtk.Align.CENTER)
         self.player_download.connect(
             "clicked", lambda *_: self.current_item and self._download_item(self.current_item)
         )
-        details.append(self.player_download)
+        player_actions.append(self.player_download)
+        details.append(player_actions)
+        self.player_description = Gtk.Label(
+            xalign=0, yalign=0, wrap=True, selectable=True
+        )
+        self.player_description.add_css_class("dim-label")
+        self.player_description.set_hexpand(True)
+        self.player_description.set_ellipsize(Pango.EllipsizeMode.END)
+        self.player_description.set_lines(3)
+        details.append(self.player_description)
         page.append(details)
         self._refresh_queue()
         return page
@@ -1647,11 +1662,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.details_channel.connect("clicked", lambda *_: self._open_detail_channel())
         actions.append(self.details_channel)
         download_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        download_row.set_hexpand(True)
         self.details_download_quality = Gtk.DropDown.new_from_strings(
             ["Best quality", "1080p", "720p", "480p", "Audio only"]
         )
         download_row.append(self.details_download_quality)
         self.details_download = labeled_button("Download", "folder-download-symbolic")
+        self.details_download.set_hexpand(True)
         self.details_download.connect("clicked", lambda *_: self._download_detail_item())
         download_row.append(self.details_download)
         actions.append(download_row)
@@ -1690,7 +1707,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
             icon_name="media-skip-backward-symbolic", tooltip_text="Previous"
         )
         self.mini_previous.add_css_class("mini-control")
-        self.mini_previous.connect("clicked", lambda *_: self._play_previous_queued())
+        self.mini_previous.connect(
+            "clicked", lambda *_: self._play_previous_queued(reveal_player=False)
+        )
         bar.append(self.mini_previous)
         self.mini_play = Gtk.Button(
             icon_name="media-playback-start-symbolic", tooltip_text="Play"
@@ -1702,7 +1721,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
             icon_name="media-skip-forward-symbolic", tooltip_text="Next"
         )
         self.mini_next.add_css_class("mini-control")
-        self.mini_next.connect("clicked", lambda *_: self._skip_queued())
+        self.mini_next.connect(
+            "clicked", lambda *_: self._play_next_queued(reveal_player=False)
+        )
         bar.append(self.mini_next)
         labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         self.mini_title = Gtk.Label(xalign=0)
@@ -1727,6 +1748,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _navigation_changed(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if not row or self.syncing_navigation:
+            return
+        if self.player_expanded and time.monotonic() < self.player_navigation_guard_until:
+            self.syncing_navigation = True
+            self.navigation.unselect_all()
+            self.syncing_navigation = False
             return
         name = row.get_name()
         # Gtk.ListBox may emit the selected row again after focus/layout
@@ -4578,6 +4604,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return
         self.detail_item = item
         self.detail_series_play_item = None
+        self.detail_series_episodes = []
         self.detail_series_generation += 1
         series_generation = self.detail_series_generation
         self.details_play.set_child(icon_label("Play", "media-playback-start-symbolic"))
@@ -4642,6 +4669,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         self.detail_item = series
         self.detail_series_play_item = resume
+        self.detail_series_episodes = [
+            episode
+            for section in sections
+            for episode in section.items
+            if episode.playable
+        ]
         self.details_play.set_sensitive(resume is not None)
         if resume and (resume.payload.get("UserData") or {}).get("LastPlayedDate"):
             self.details_play.set_child(
@@ -4706,7 +4739,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
             valign=Gtk.Align.CENTER,
         )
         play.add_css_class("square-button")
-        play.connect("clicked", lambda *_args, value=episode: self._play_selected(value))
+        play.connect(
+            "clicked", lambda *_args, value=episode: self._play_series_episode(value)
+        )
         row.add_suffix(play)
         download = Gtk.Button(
             icon_name="folder-download-symbolic",
@@ -4770,9 +4805,33 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _play_detail_item(self) -> None:
         if self.detail_series_play_item:
-            self._play_selected(self.detail_series_play_item)
+            self._play_series_episode(self.detail_series_play_item)
         elif self.detail_item:
             self._play_selected(self.detail_item)
+
+    def _play_series_episode(self, episode: MediaItem) -> None:
+        if episode.source == "jellyfin" and self._synctube_active():
+            return
+        index = next(
+            (
+                position
+                for position, item in enumerate(self.detail_series_episodes)
+                if item.id == episode.id
+            ),
+            -1,
+        )
+        if index < 0:
+            self._play_selected(episode)
+            return
+        self.queue = list(self.detail_series_episodes)
+        self.queue_index = index
+        self._refresh_queue()
+        if index + 1 < len(self.queue):
+            self._prebuffer_item(self.queue[index + 1])
+        if self.current_item and self.current_item.id == episode.id:
+            self._show_player()
+        else:
+            self._begin_playback(episode)
 
     def _queue_detail_item(self) -> None:
         if self.detail_item:
@@ -5179,13 +5238,15 @@ class TubeFinWindow(Adw.ApplicationWindow):
             in {"music", "audiobooks"}
         )
 
-    def _begin_playback(self, item: MediaItem) -> None:
+    def _begin_playback(self, item: MediaItem, reveal_player: bool = True) -> None:
         self.playback_request += 1
         request_id = self.playback_request
         self._detach_playback()
         # Update this before resolving. Navigation must never consult the item
         # from the stream we just retired while a new selection is loading.
         self.current_item = item
+        self.playback_started_at = time.monotonic()
+        self.queue_advance_item_id = ""
         self.pending_sync_state = None
         self.resume_position_offer = self.history.resume_position(item)
         self.resume_item_id = item.id if self.resume_position_offer else ""
@@ -5239,13 +5300,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_comments_panel.set_visible(False)
         self.fullscreen_title.set_label(item.title)
 
-        self.player_heading.set_label(f"Loading {item.title}…")
         self.player_title.set_label(item.title)
         self.player_subtitle.set_label(item.subtitle)
-        self._set_visible_page("player")
-        self.window_title.set_title("Now Playing")
-        self.window_title.set_subtitle(item.source.capitalize())
-        self.mini_player.set_visible(False)
+        self._set_player_description(item)
+        if reveal_player:
+            self.player_navigation_guard_until = time.monotonic() + 0.75
+            self._set_visible_page("player")
+            self.window_title.set_title("Now Playing")
+            self.window_title.set_subtitle(item.source.capitalize())
+            self.mini_player.set_visible(False)
+        else:
+            self.mini_player.set_visible(True)
         self.player_status.set_label("Preparing video…")
         self.player_status_box.set_visible(True)
         self.player_spinner.start()
@@ -5263,6 +5328,38 @@ class TubeFinWindow(Adw.ApplicationWindow):
             lambda url: self._start_playback(item, url, request_id),
             lambda error: self._playback_error(error, request_id),
         )
+
+    @staticmethod
+    def _release_date_label(value: object) -> str:
+        raw = str(value or "").strip()
+        if len(raw) == 8 and raw.isdigit():
+            return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+        if len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-":
+            return raw[:10]
+        return raw
+
+    def _set_player_description(
+        self,
+        item: MediaItem,
+        description: str = "",
+        published_date: str = "",
+    ) -> None:
+        description = description or str(
+            item.payload.get("description") or item.payload.get("Overview") or ""
+        )
+        published_date = published_date or str(
+            item.payload.get("upload_date")
+            or item.payload.get("PremiereDate")
+            or item.payload.get("ProductionYear")
+            or ""
+        )
+        released = self._release_date_label(published_date)
+        parts = [description]
+        if released:
+            parts.insert(0, f"Released {released}")
+        text = "\n".join(part for part in parts if part)
+        self.player_description.set_label(text)
+        self.player_description.set_visible(bool(text))
 
     def _load_player_avatar(self, item: MediaItem) -> None:
         self.player_avatar_picture.set_visible(False)
@@ -5398,10 +5495,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
             subtitles = stream.subtitles
             audio_tracks = stream.audio_tracks
             default_label = stream.default_label
+            self._set_player_description(
+                item, stream.description, stream.published_date
+            )
         else:
             url = stream
             default_label = "Auto"
-        self.player_heading.set_label(item.title)
+        self.playback_started_at = time.monotonic()
+        self.queue_advance_item_id = ""
         self.mini_title.set_label(item.title)
         self.mini_subtitle.set_label(item.subtitle or item.source.capitalize())
         if self.mpv_player:
@@ -5569,6 +5670,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if item.source == "youtube" and self._jellyfin_syncplay_active():
             return
         self.queue.append(item)
+        self._prebuffer_item(item)
         self._refresh_queue()
         if not self.current_item:
             self.mini_title.set_label(item.title)
@@ -5583,6 +5685,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return
         position = min(len(self.queue), max(0, self.queue_index + 1))
         self.queue.insert(position, item)
+        self._prebuffer_item(item)
         self._refresh_queue()
         self.toast_overlay.add_toast(Adw.Toast(title=f"{item.title} will play next"))
 
@@ -5764,9 +5867,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 ),
             )
 
-    def _play_next_queued(self) -> None:
+    def _play_next_queued(self, reveal_player: bool | None = None) -> None:
         if not self.queue:
             return
+        if reveal_player is None:
+            reveal_player = self.player_expanded
         next_index = self.queue_index + 1
         if next_index >= len(self.queue):
             if self.queue_loop:
@@ -5777,15 +5882,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.queue_index = next_index
         item = self.queue[self.queue_index]
         self._refresh_queue()
-        self._begin_playback(item)
+        self._begin_playback(item, reveal_player=reveal_player)
 
     def _skip_queued(self) -> None:
         if self.queue:
             self._play_next_queued()
 
-    def _play_previous_queued(self) -> None:
+    def _play_previous_queued(self, reveal_player: bool | None = None) -> None:
         if not self.queue:
             return
+        if reveal_player is None:
+            reveal_player = self.player_expanded
         if self.queue_index > 0:
             self.queue_index -= 1
         elif self.queue_loop:
@@ -5793,7 +5900,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         else:
             return
         self._refresh_queue()
-        self._begin_playback(self.queue[self.queue_index])
+        self._begin_playback(
+            self.queue[self.queue_index], reveal_player=reveal_player
+        )
 
     def _mini_play_pause(self) -> None:
         if self.current_item and self.mpv_player:
@@ -5805,10 +5914,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _play_queued(self, index: int) -> None:
         if index >= len(self.queue):
             return
+        reveal_player = self.player_expanded
         self.queue_index = index
         item = self.queue[index]
         self._refresh_queue()
-        self._begin_playback(item)
+        self._begin_playback(item, reveal_player=reveal_player)
 
     def _remove_queued(self, index: int) -> None:
         if index < len(self.queue):
@@ -6145,6 +6255,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 self.navigation_history.append(state)
         self.expected_page = name
         player = name == "player"
+        self.player_expanded = player
         playlist = name == "playlist"
         context = name in {
             "browse-category",
@@ -6155,10 +6266,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         }
         if name not in {"home", "browse", "library", "requests"}:
             self.active_navigation = name
-            self.syncing_navigation = True
-            self.navigation.unselect_all()
-            if not player:
-                self.syncing_navigation = False
+            if current != name:
+                self.syncing_navigation = True
+                self.navigation.unselect_all()
+                if not player:
+                    self.syncing_navigation = False
         self.context_back.set_visible(
             context
             and (bool(self.navigation_history) or name == "browse-category")
@@ -6249,6 +6361,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.last_playback_position = position
         self.last_playback_duration = duration
         self.last_playback_paused = paused
+        if (
+            self.current_item
+            and self.queue
+            and duration > 0
+            and position + 0.5 >= duration
+            and now - self.playback_started_at >= 1
+            and self.queue_advance_item_id != self.current_item.id
+        ):
+            self.queue_advance_item_id = self.current_item.id
+            GLib.idle_add(
+                self._play_next_queued,
+                self.player_expanded,
+            )
         if hasattr(self, "mini_play"):
             self.mini_play.set_icon_name(
                 "media-playback-start-symbolic"
@@ -7981,13 +8106,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 return True
             if keyval in (Gdk.KEY_Left, Gdk.KEY_h):
                 if control:
-                    self._play_previous_queued()
+                    self._play_previous_queued(reveal_player=True)
                 else:
                     self.mpv_player.seek_relative(-10)
                 return True
             if keyval in (Gdk.KEY_Right, Gdk.KEY_l):
                 if control:
-                    self._skip_queued()
+                    self._play_next_queued(reveal_player=True)
                 else:
                     self.mpv_player.seek_relative(10)
                 return True

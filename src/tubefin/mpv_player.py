@@ -87,11 +87,13 @@ def _display_parameters() -> dict[str, int]:
 
 
 class MpvGLArea(Gtk.GLArea):
-    def __init__(self, player: mpv.MPV) -> None:
+    def __init__(self, player: mpv.MPV, on_error: Callable[[str], None]) -> None:
         super().__init__(auto_render=False, hexpand=True, vexpand=True)
         self.player = player
+        self.on_error = on_error
         self.context: mpv.MpvRenderContext | None = None
         self.render_generation = 0
+        self.render_error_reported = False
         self.framebuffer = ctypes.c_int()
         self.proc_address = mpv.MpvGlGetProcAddressFn(
             lambda _instance, name: _egl_get_proc_address(name)
@@ -104,16 +106,34 @@ class MpvGLArea(Gtk.GLArea):
         self.make_current()
         self.render_generation += 1
         generation = self.render_generation
-        self.context = mpv.MpvRenderContext(
-            self.player,
-            "opengl",
-            opengl_init_params={"get_proc_address": self.proc_address},
-            **_display_parameters(),
-        )
+        if error := self.get_error():
+            self._report_render_error(error)
+            return
+        try:
+            self.context = mpv.MpvRenderContext(
+                self.player,
+                "opengl",
+                opengl_init_params={"get_proc_address": self.proc_address},
+                **_display_parameters(),
+            )
+        except Exception as error:
+            logger.exception("Could not create the libmpv OpenGL render context")
+            self._report_render_error(error)
+            return
         self.context.update_cb = lambda: GLib.idle_add(
             self._queue_render,
             generation,
             priority=GLib.PRIORITY_HIGH_IDLE,
+        )
+
+    def _report_render_error(self, error: object) -> None:
+        if self.render_error_reported:
+            return
+        self.render_error_reported = True
+        GLib.idle_add(
+            self.on_error,
+            "OpenGL video output is unavailable. Check the graphics driver "
+            f"or try an X11 session. ({error})",
         )
 
     def _unrealize(self, _area: Gtk.GLArea) -> None:
@@ -208,6 +228,7 @@ class MpvPlayer(Gtk.Box):
         self.swipe_progress = 0.0
         self.swipe_reset_source = 0
         self.time_has_hours = False
+        self.bound_picker_popovers: set[int] = set()
         self.playback_speed = 1.0
         self.sync_speed = 1.0
         self.last_audible_volume = 100.0
@@ -227,7 +248,7 @@ class MpvPlayer(Gtk.Box):
             demuxer_max_bytes="32MiB",
             audio_client_name="TubeFin",
         )
-        self.video = MpvGLArea(self.player)
+        self.video = MpvGLArea(self.player, self.on_error)
         click = Gtk.GestureClick(button=1)
         click.connect("released", self._video_clicked)
         self.video.add_controller(click)
@@ -394,10 +415,12 @@ class MpvPlayer(Gtk.Box):
             self.option_rows[label_text] = row
         self.settings_popover = Gtk.Popover(child=settings_box)
         self.settings_popover.set_autohide(True)
-        self.settings_popover.set_cascade_popdown(False)
+        self.settings_popover.set_cascade_popdown(True)
         self.settings_popover.connect(
             "notify::visible", self._settings_visibility_changed
         )
+        for picker in (self.quality, self.captions, self.audio, self.buffer):
+            picker.connect("realize", self._bind_picker_popovers)
         settings = Gtk.MenuButton(
             icon_name="emblem-system-symbolic",
             tooltip_text="Playback settings",
@@ -421,12 +444,12 @@ class MpvPlayer(Gtk.Box):
 
         @self.player.event_callback("end-file")
         def end_file(event: object) -> None:
-            info = event.as_dict()  # type: ignore[attr-defined]
-            if info.get("reason") == b"error":
-                error = info.get("file_error", b"unknown playback error")
-                message = error.decode() if isinstance(error, bytes) else str(error)
+            data = event.data  # type: ignore[attr-defined]
+            if data.reason == mpv.MpvEventEndFile.ERROR:
+                message = mpv.ErrorCode.exception_for_ec(data.error)
+                message = str(message or "unknown playback error")
                 GLib.idle_add(self.on_error, message)
-            elif info.get("reason") == b"eof" and self.on_ended:
+            elif data.reason == mpv.MpvEventEndFile.EOF and self.on_ended:
                 GLib.idle_add(self.on_ended)
 
         @self.player.property_observer("pause")
@@ -1033,6 +1056,24 @@ class MpvPlayer(Gtk.Box):
         if self.syncing_options:
             return
         self._apply_caption_selection()
+
+    def _bind_picker_popovers(self, picker: Gtk.Widget) -> None:
+        pending = [picker]
+        while pending:
+            widget = pending.pop()
+            child = widget.get_first_child()
+            while child:
+                if (
+                    isinstance(child, Gtk.Popover)
+                    and id(child) not in self.bound_picker_popovers
+                ):
+                    self.bound_picker_popovers.add(id(child))
+                    child.connect("closed", self._picker_popover_closed)
+                pending.append(child)
+                child = child.get_next_sibling()
+
+    def _picker_popover_closed(self, _popover: Gtk.Popover) -> None:
+        GLib.idle_add(self.settings_popover.popdown)
 
     def _apply_caption_selection(self) -> None:
         selected = self.captions.get_selected()

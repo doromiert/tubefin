@@ -349,7 +349,8 @@
   padding-top: 8px;
 }
 
-.details-actions > button {
+.details-actions > button,
+.details-actions > box > button {
   min-height: 38px;
 }
 

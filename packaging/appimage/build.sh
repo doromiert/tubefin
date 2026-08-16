@@ -14,5 +14,5 @@ trap 'rm -rf "$temporary_directory"' EXIT INT TERM
   nix bundle --bundler "$bundler" "$repository_root#default"
   appimage=$(find . -maxdepth 1 \( -type f -o -type l \) -name '*.AppImage' -print -quit)
   test -n "$appimage" && test -e "$appimage"
-  install -Dm755 "$appimage" "$output_directory/TubeFin-1.1.1-x86_64.AppImage"
+  install -Dm755 "$appimage" "$output_directory/TubeFin-1.1.2-x86_64.AppImage"
 )

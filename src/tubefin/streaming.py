@@ -279,6 +279,8 @@ class PrebufferedStream:
             subtitles=self.stream.subtitles,
             audio_tracks=self.stream.audio_tracks,
             default_label=self.stream.default_label,
+            description=self.stream.description,
+            published_date=self.stream.published_date,
         )
 
     def close(self) -> None:

@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.1.2" date="2026-08-16">
+      <description>
+        <p>Fixes timestamp-based queue auto-advance, preserves expanded or mini-player state across skips, queues an entire show when an episode starts, warms upcoming videos for smoother transitions, closes playback options after picker choices, centers channel avatars, adds release dates and descriptions beneath videos, normalizes the details download button, and improves graphics compatibility for packaged builds.</p>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-08-16">
       <description>
         <p>Fixes Seerr discovery, authentication, thumbnails, and Jellyfin-session reuse; adopts native Adwaita season and settings rows; adds drag-and-drop Home ordering and working mini-player transport controls; and improves renderer compatibility.</p>
