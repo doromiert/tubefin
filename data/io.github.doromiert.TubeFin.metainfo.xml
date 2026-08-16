@@ -24,7 +24,7 @@
   <releases>
     <release version="1.1.0" date="2026-08-16">
       <description>
-        <p>Adds Seerr movie and show requests, reorderable and collapsible Home shelves, pull-to-refresh, responsive Jellyfin details, and playback-control polish.</p>
+        <p>Adds Seerr requests, expandable Jellyfin series and episode views, metadata-preserving Jellyfin downloads, reorderable and collapsible Home shelves, pull-to-refresh, responsive details, and playback-control polish.</p>
       </description>
     </release>
     <release version="1.0.0" date="2026-08-16">

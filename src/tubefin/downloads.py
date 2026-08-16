@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
@@ -17,22 +19,32 @@ from tubefin.models import DownloadRecord, DownloadStatus, MediaItem
 from tubefin.services import ServiceError
 
 ProgressCallback = Callable[[DownloadRecord], None]
+DirectResolver = Callable[
+    [MediaItem], tuple[str, dict[str, str], dict[str, str]]
+]
 
 
 class DownloadManager:
     """Run bounded, cancellable yt-dlp downloads backed by the offline library."""
 
     def __init__(
-        self, library: OfflineLibrary, concurrency: int = 2, *, browser: str = ""
+        self,
+        library: OfflineLibrary,
+        concurrency: int = 2,
+        *,
+        browser: str = "",
+        direct_resolver: DirectResolver | None = None,
     ) -> None:
         self.library = library
         self.executable = shutil.which("yt-dlp")
         self.concurrency = max(1, min(concurrency, 4))
         self.browser = browser
+        self.direct_resolver = direct_resolver
         self._semaphore = threading.BoundedSemaphore(self.concurrency)
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._callbacks: dict[str, ProgressCallback] = {}
         self._lock = threading.Lock()
+        self._cancelled: set[str] = set()
         self._shutdown = False
 
     def enqueue(
@@ -47,39 +59,52 @@ class DownloadManager:
     ) -> DownloadRecord:
         if self._shutdown:
             raise ServiceError("The download manager is shutting down.")
-        if item.source != "youtube":
-            raise ServiceError("Offline downloads currently support YouTube items.")
-        if not self.executable:
+        if item.source not in {"youtube", "jellyfin"}:
+            raise ServiceError("This source cannot be downloaded for offline playback.")
+        if item.source == "youtube" and not self.executable:
             raise ServiceError("yt-dlp is not installed.")
+        if item.source == "jellyfin" and not self.direct_resolver:
+            raise ServiceError("Connect to Jellyfin before downloading this item.")
         record_id = uuid.uuid4().hex
         directory = self.library.download_directory / record_id
-        source_url = str(
-            item.payload.get("webpage_url")
-            or item.payload.get("source_url")
-            or f"https://www.youtube.com/watch?v={item.id}"
-        )
+        source_url = str(item.payload.get("webpage_url") or item.payload.get("source_url") or "")
+        if item.source == "youtube" and not source_url:
+            source_url = f"https://www.youtube.com/watch?v={item.id}"
+        download_metadata = {
+            "source": item.source,
+            "source_url": source_url,
+            "channel": item.subtitle,
+            "channel_id": str(item.payload.get("channel_id") or ""),
+            "channel_url": str(item.payload.get("channel_url") or ""),
+            "original_thumbnail_url": (
+                "" if item.source == "jellyfin" else item.thumbnail_url or ""
+            ),
+            "audio_tracks": list(audio_tracks or []),
+        }
+        if item.source == "jellyfin":
+            download_metadata.update(
+                {
+                    "kind": item.kind,
+                    "media_details": dict(item.payload),
+                    "series_metadata": dict(item.payload.get("series_metadata") or {}),
+                    "season_metadata": dict(item.payload.get("season_metadata") or {}),
+                }
+            )
         stored_item = replace(
             item,
+            thumbnail_url=None if item.source == "jellyfin" else item.thumbnail_url,
             payload={
                 **item.payload,
                 "webpage_url": source_url,
                 "source_url": source_url,
-                "download_metadata": {
-                    "source": item.source,
-                    "source_url": source_url,
-                    "channel": item.subtitle,
-                    "channel_id": str(item.payload.get("channel_id") or ""),
-                    "channel_url": str(item.payload.get("channel_url") or ""),
-                    "original_thumbnail_url": item.thumbnail_url or "",
-                    "audio_tracks": list(audio_tracks or []),
-                },
+                "download_metadata": download_metadata,
             },
         )
         record = DownloadRecord(
             id=record_id,
             item=stored_item,
             directory=str(directory),
-            quality=quality,
+            quality="original" if item.source == "jellyfin" else quality,
             audio_only=audio_only,
             audio_tracks=list(audio_tracks or []),
             created_at=time.time(),
@@ -88,8 +113,9 @@ class DownloadManager:
         self.library.upsert(record)
         if callback:
             self._callbacks[record_id] = callback
+        target = self._download_direct if item.source == "jellyfin" else self._download
         threading.Thread(
-            target=self._download,
+            target=target,
             args=(record_id, captions),
             daemon=True,
             name=f"download-{record_id[:8]}",
@@ -104,17 +130,24 @@ class DownloadManager:
             raise KeyError(record_id)
         if callback:
             self._callbacks[record_id] = callback
+        self._cancelled.discard(record_id)
         record.status = DownloadStatus.QUEUED
         record.error = ""
         self.library.upsert(record)
+        target = (
+            self._download_direct
+            if record.item.source == "jellyfin"
+            else self._download
+        )
         threading.Thread(
-            target=self._download,
+            target=target,
             args=(record_id, True),
             daemon=True,
             name=f"download-{record_id[:8]}",
         ).start()
 
     def cancel(self, record_id: str) -> None:
+        self._cancelled.add(record_id)
         with self._lock:
             process = self._processes.get(record_id)
         if process and process.poll() is None:
@@ -123,6 +156,98 @@ class DownloadManager:
         if record:
             record.status = DownloadStatus.CANCELLED
             record.error = "Cancelled"
+            self.library.upsert(record)
+            self._notify(record)
+
+    def _download_direct(self, record_id: str, _captions: bool) -> None:
+        with self._semaphore:
+            record = self.library.get(record_id)
+            if not record or record_id in self._cancelled or self._shutdown:
+                return
+            if not self.direct_resolver:
+                record.status = DownloadStatus.FAILED
+                record.error = "Reconnect to Jellyfin and retry this download."
+                self.library.upsert(record)
+                self._notify(record)
+                return
+            directory = Path(record.directory)
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            record.status = DownloadStatus.DOWNLOADING
+            record.error = ""
+            self.library.upsert(record)
+            self._notify(record)
+            media_temp: Path | None = None
+            try:
+                url, headers, artwork_urls = self.direct_resolver(record.item)
+                media_sources = record.item.payload.get("MediaSources") or []
+                container = str(
+                    (media_sources[0] if media_sources else {}).get("Container") or "mkv"
+                ).split(",", 1)[0]
+                media_path = directory / f"{record.item.id}.{container}"
+                media_temp = media_path.with_suffix(f".{container}.part")
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=30) as response, media_temp.open(
+                    "wb"
+                ) as output:
+                    try:
+                        total = int(response.headers.get("Content-Length") or 0) or None
+                    except ValueError:
+                        total = None
+                    downloaded = 0
+                    last_update = 0.0
+                    while chunk := response.read(1024 * 1024):
+                        if self._shutdown or record_id in self._cancelled:
+                            raise InterruptedError("Download cancelled")
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        record.bytes_downloaded = downloaded
+                        record.total_bytes = total
+                        record.progress = downloaded * 100 / total if total else 0
+                        now = time.monotonic()
+                        if now - last_update >= 0.4:
+                            self.library.upsert(record)
+                            self._notify(record)
+                            last_update = now
+                media_temp.replace(media_path)
+                record.media_path = str(media_path)
+                artwork_url = artwork_urls.get("item", "")
+                if artwork_url:
+                    artwork_path = directory / f"{record.item.id}.jpg"
+                    artwork_request = urllib.request.Request(artwork_url, headers=headers)
+                    with urllib.request.urlopen(artwork_request, timeout=20) as response:
+                        artwork_path.write_bytes(response.read(12 * 1024 * 1024))
+                    record.item.thumbnail_url = artwork_path.resolve().as_uri()
+                metadata = dict(record.item.payload.get("download_metadata") or {})
+                metadata["local_thumbnail_url"] = record.item.thumbnail_url or ""
+                series_artwork_url = artwork_urls.get("series", "")
+                if series_artwork_url:
+                    series_artwork_path = directory / f"{record.item.id}.series.jpg"
+                    series_request = urllib.request.Request(series_artwork_url, headers=headers)
+                    with urllib.request.urlopen(series_request, timeout=20) as response:
+                        series_artwork_path.write_bytes(response.read(12 * 1024 * 1024))
+                    metadata["local_series_artwork_url"] = (
+                        series_artwork_path.resolve().as_uri()
+                    )
+                record.item.payload["download_metadata"] = metadata
+                record.status = DownloadStatus.COMPLETE
+                record.progress = 100.0
+                record.error = ""
+                sidecar = directory / f"{record.item.id}.tubefin.json"
+                sidecar.write_text(
+                    json.dumps(exported_metadata(record), ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                sidecar.chmod(0o600)
+            except InterruptedError:
+                record.status = DownloadStatus.CANCELLED
+                record.error = "Cancelled"
+                if media_temp:
+                    media_temp.unlink(missing_ok=True)
+            except (OSError, urllib.error.URLError, TimeoutError, ServiceError) as error:
+                record.status = DownloadStatus.FAILED
+                record.error = str(error)
+                if media_temp:
+                    media_temp.unlink(missing_ok=True)
             self.library.upsert(record)
             self._notify(record)
 

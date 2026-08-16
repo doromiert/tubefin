@@ -1667,6 +1667,117 @@ class JellyfinService:
             raise ServiceError("Jellyfin did not return the requested item.")
         return self._item(data)
 
+    def get_series_view(
+        self, series_id: str
+    ) -> tuple[MediaItem, list[MediaSection], MediaItem | None]:
+        """Return series metadata, ordered season groups, and the resume episode."""
+        session = self._require_session()
+        series = self.get_item(series_id)
+        seasons_data = self._request_current(
+            f"/Shows/{urllib.parse.quote(series_id)}/Seasons",
+            query={
+                "UserId": session.user_id,
+                "Fields": "Overview,PrimaryImageAspectRatio,MediaSources",
+                "EnableImages": "true",
+                "EnableUserData": "true",
+            },
+        )
+        seasons = self._items(seasons_data.get("Items", []), playable=False)
+        seasons.sort(
+            key=lambda value: (
+                int(value.payload.get("IndexNumber") or 0) <= 0,
+                int(value.payload.get("IndexNumber") or 0),
+            )
+        )
+        sections: list[MediaSection] = []
+        all_episodes: list[MediaItem] = []
+        for season in seasons:
+            episode_data = self._request_current(
+                f"/Shows/{urllib.parse.quote(series_id)}/Episodes",
+                query={
+                    "UserId": session.user_id,
+                    "SeasonId": season.id,
+                    "Fields": "Overview,PrimaryImageAspectRatio,MediaSources",
+                    "EnableImages": "true",
+                    "EnableUserData": "true",
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                },
+            )
+            episodes: list[MediaItem] = []
+            for episode in self._items(episode_data.get("Items", [])):
+                episodes.append(
+                    MediaItem(
+                        id=episode.id,
+                        title=episode.title,
+                        subtitle=episode.subtitle,
+                        source=episode.source,
+                        kind=episode.kind,
+                        thumbnail_url=episode.thumbnail_url,
+                        duration_seconds=episode.duration_seconds,
+                        playable=episode.playable,
+                        payload={
+                            **episode.payload,
+                            "series_metadata": series.payload,
+                            "series_title": series.title,
+                            "season_metadata": season.payload,
+                            "season_title": season.title,
+                        },
+                    )
+                )
+            episodes.sort(
+                key=lambda value: (
+                    int(value.payload.get("ParentIndexNumber") or 0),
+                    int(value.payload.get("IndexNumber") or 0),
+                )
+            )
+            if episodes:
+                sections.append(MediaSection(season.title, episodes))
+                all_episodes.extend(episodes)
+
+        played = [
+            episode
+            for episode in all_episodes
+            if (episode.payload.get("UserData") or {}).get("LastPlayedDate")
+            or (episode.payload.get("UserData") or {}).get("PlaybackPositionTicks")
+        ]
+        resume = max(
+            played,
+            key=lambda episode: str(
+                (episode.payload.get("UserData") or {}).get("LastPlayedDate") or ""
+            ),
+            default=(all_episodes[0] if all_episodes else None),
+        )
+        return series, sections, resume
+
+    def download_source(
+        self, item: MediaItem
+    ) -> tuple[str, dict[str, str], dict[str, str]]:
+        """Resolve authenticated media and artwork URLs without persisting tokens."""
+        resolved = self.resolve(item)
+        session = self._require_session()
+        image_tags = item.payload.get("ImageTags") or {}
+        image_type = "Thumb" if image_tags.get("Thumb") else "Primary"
+        image_tag = str(image_tags.get(image_type) or "")
+        artworks: dict[str, str] = {}
+        if image_tag:
+            artworks["item"] = self._url(
+                session.server_url,
+                f"/Items/{urllib.parse.quote(item.id)}/Images/{image_type}",
+                {"tag": image_tag, "maxWidth": 1280, "quality": 90, "format": "jpg"},
+            )
+        series_metadata = item.payload.get("series_metadata") or {}
+        series_id = str(series_metadata.get("Id") or "")
+        series_tags = series_metadata.get("ImageTags") or {}
+        series_tag = str(series_tags.get("Primary") or "")
+        if series_id and series_tag:
+            artworks["series"] = self._url(
+                session.server_url,
+                f"/Items/{urllib.parse.quote(series_id)}/Images/Primary",
+                {"tag": series_tag, "maxWidth": 1280, "quality": 90, "format": "jpg"},
+            )
+        return resolved.url, resolved.headers, artworks
+
     def syncplay_groups(self) -> list[dict[str, Any]]:
         data = self._request_current("/SyncPlay/List")
         if not isinstance(data, list):

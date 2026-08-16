@@ -273,7 +273,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.seerr_available = False
         self.seerr_search_generation = 0
         self.offline = OfflineLibrary()
-        self.downloads = DownloadManager(self.offline, browser=self.youtube.browser)
+        self.downloads = DownloadManager(
+            self.offline,
+            browser=self.youtube.browser,
+            direct_resolver=self.jellyfin.download_source,
+        )
         self.playlists = PlaylistStore()
         self.history = HistoryStore()
         self.channel_feeds = ChannelFeedCache()
@@ -343,6 +347,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.jellyfin_parent_id = ""
         self.jellyfin_loaded = False
         self.detail_item: MediaItem | None = None
+        self.detail_series_play_item: MediaItem | None = None
+        self.detail_series_generation = 0
         self.active_playlist_id = ""
         self.youtube_playlist_items: list[MediaItem] = []
         self.remote_playlist_active = False
@@ -1599,19 +1605,19 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.details_play.add_css_class("pill")
         self.details_play.connect("clicked", lambda *_: self._play_detail_item())
         actions.append(self.details_play)
-        details_queue = labeled_button("Add to queue", "list-add-symbolic")
-        details_queue.connect("clicked", lambda *_: self._queue_detail_item())
-        actions.append(details_queue)
-        watch_later = labeled_button("Watch later", "alarm-symbolic")
-        watch_later.connect(
+        self.details_queue = labeled_button("Add to queue", "list-add-symbolic")
+        self.details_queue.connect("clicked", lambda *_: self._queue_detail_item())
+        actions.append(self.details_queue)
+        self.details_watch_later = labeled_button("Watch later", "alarm-symbolic")
+        self.details_watch_later.connect(
             "clicked", lambda *_: self.detail_item and self._watch_later(self.detail_item)
         )
-        actions.append(watch_later)
-        share = labeled_button("Copy share link", "send-to-symbolic")
-        share.connect(
+        actions.append(self.details_watch_later)
+        self.details_share = labeled_button("Copy share link", "send-to-symbolic")
+        self.details_share.connect(
             "clicked", lambda *_: self.detail_item and self._share_item(self.detail_item)
         )
-        actions.append(share)
+        actions.append(self.details_share)
         self.details_channel = labeled_button("Open channel", "avatar-default-symbolic")
         self.details_channel.connect("clicked", lambda *_: self._open_detail_channel())
         actions.append(self.details_channel)
@@ -1636,6 +1642,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
         narrow.add_setter(hero, "orientation", Gtk.Orientation.VERTICAL)
         responsive.add_breakpoint(narrow)
         content.append(responsive)
+        self.details_series_loading = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+        )
+        self.details_series_loading.set_halign(Gtk.Align.CENTER)
+        self.details_series_spinner = Gtk.Spinner()
+        self.details_series_loading.append(self.details_series_spinner)
+        self.details_series_loading.append(Gtk.Label(label="Loading seasons and episodes…"))
+        self.details_series_loading.set_visible(False)
+        content.append(self.details_series_loading)
+        self.details_seasons = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=12
+        )
+        self.details_seasons.set_visible(False)
+        content.append(self.details_seasons)
         return scroller
 
     def _build_mini_player(self) -> Gtk.Widget:
@@ -3266,7 +3286,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 path
                 for suffix in ("*.jpg", "*.jpeg", "*.webp", "*.png")
                 for path in directory.glob(suffix)
-                if path.is_file()
+                if path.is_file() and ".series." not in path.name
             ]
             if local_thumbnails:
                 thumbnail_url = max(
@@ -3287,7 +3307,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
 
     def _download_detail_item(self) -> None:
-        if not self.detail_item or self.detail_item.source != "youtube":
+        if not self.detail_item or self.detail_item.source not in {"youtube", "jellyfin"}:
             return
         self._download_item(self.detail_item)
 
@@ -3300,6 +3320,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         captions: bool = True,
     ) -> None:
         if item.source == "jellyfin" and self._synctube_active():
+            return
+        if item.source == "jellyfin":
+            self._start_download(item, "original", False, True)
             return
         if quality is not None:
             self._start_download(item, quality, audio_only, captions)
@@ -4296,6 +4319,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.youtube_playlist_url.set_text(str(item.payload.get("webpage_url") or ""))
             self._browse_youtube_playlist()
             return
+        if item.source == "jellyfin" and item.kind == "Series":
+            self._show_details(item)
+            return
         if item.source == "jellyfin" and not item.playable:
             self.jellyfin_grid.set_loading(f"Opening {item.title}…")
             self.jellyfin_history.append(
@@ -4322,7 +4348,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
         if item.source == "offline":
             if item.playable:
-                self._play_selected(item)
+                self._play_selected(self._history_item(item))
             return
 
         if item.source == "youtube":
@@ -4334,6 +4360,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if item.source == "jellyfin" and self._synctube_active():
             return
         self.detail_item = item
+        self.detail_series_play_item = None
+        self.detail_series_generation += 1
+        series_generation = self.detail_series_generation
+        self.details_play.set_child(icon_label("Play", "media-playback-start-symbolic"))
+        self._clear_box(self.details_seasons)
+        is_series = item.source == "jellyfin" and item.kind == "Series"
+        self.details_seasons.set_visible(is_series)
+        self.details_series_loading.set_visible(is_series)
+        if is_series:
+            self.details_series_spinner.start()
         self.details_title.set_label(item.title)
         payload = item.payload
         meta = [
@@ -4345,11 +4381,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.details_meta.set_label("  •  ".join(meta) or item.subtitle)
         self.details_overview.set_label(payload.get("Overview") or "No description available.")
         self.details_channel.set_visible(False)
-        self.details_download.set_visible(False)
+        self.details_download.set_visible(item.source == "jellyfin" and item.playable)
         self.details_download_quality.set_visible(False)
         self.comments_more.set_visible(False)
-        self.details_playlist.set_visible(item.playable)
-        self.details_play.set_sensitive(item.playable)
+        self.details_playlist.set_visible(item.playable and not is_series)
+        self.details_queue.set_visible(item.playable and not is_series)
+        self.details_watch_later.set_visible(item.playable and not is_series)
+        self.details_play.set_sensitive(item.playable and not is_series)
         self.comment_cursor = None
         self.details_picture.set_paintable(None)
         if item.thumbnail_url:
@@ -4362,6 +4400,116 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.window_title.set_title(item.title)
         self.window_title.set_subtitle(f"{item.source.capitalize()} details")
         self.mini_player.set_visible(bool(self.current_item or self.queue))
+        if is_series:
+            run_async(
+                lambda: self.jellyfin.get_series_view(item.id),
+                lambda result: self._jellyfin_series_loaded(
+                    series_generation, result
+                ),
+                lambda error: self._jellyfin_series_error(
+                    series_generation, error
+                ),
+            )
+
+    def _jellyfin_series_loaded(
+        self,
+        generation: int,
+        result: tuple[MediaItem, list[MediaSection], MediaItem | None],
+    ) -> bool:
+        series, sections, resume = result
+        if (
+            generation != self.detail_series_generation
+            or not self.detail_item
+            or self.detail_item.id != series.id
+        ):
+            return GLib.SOURCE_REMOVE
+        self.detail_item = series
+        self.detail_series_play_item = resume
+        self.details_play.set_sensitive(resume is not None)
+        if resume and (resume.payload.get("UserData") or {}).get("LastPlayedDate"):
+            self.details_play.set_child(
+                icon_label("Resume", "media-playback-start-symbolic")
+            )
+        self.details_series_spinner.stop()
+        self.details_series_loading.set_visible(False)
+        self.details_seasons.set_visible(True)
+        for index, section in enumerate(sections):
+            expander = Gtk.Expander(label=section.title)
+            expander.add_css_class("series-season")
+            expander.set_expanded(index == 0)
+            episodes = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            episodes.add_css_class("boxed-list")
+            for episode in section.items:
+                episodes.append(self._series_episode_row(episode))
+            expander.set_child(episodes)
+            self.details_seasons.append(expander)
+        if not sections:
+            empty = Adw.StatusPage(
+                icon_name="folder-videos-symbolic",
+                title="No episodes available",
+                description="This series does not expose any playable seasons.",
+            )
+            self.details_seasons.append(empty)
+        return GLib.SOURCE_REMOVE
+
+    def _series_episode_row(self, episode: MediaItem) -> Adw.ActionRow:
+        season = int(episode.payload.get("ParentIndexNumber") or 0)
+        number = int(episode.payload.get("IndexNumber") or 0)
+        position = (episode.payload.get("UserData") or {}).get("PlaybackPositionTicks") or 0
+        progress = (
+            f" · Resume at {self._time_label(float(position) / 10_000_000)}"
+            if position
+            else ""
+        )
+        episode_number = f"S{season:02d}E{number:02d}"
+        row = Adw.ActionRow(
+            title=episode.title,
+            subtitle=(
+                f"{episode_number} · {episode.duration_label or 'Episode'}{progress}"
+            ),
+        )
+        picture = Gtk.Picture(width_request=128, height_request=72)
+        picture.set_content_fit(Gtk.ContentFit.COVER)
+        picture.set_overflow(Gtk.Overflow.HIDDEN)
+        picture.add_css_class("episode-thumbnail")
+        row.add_prefix(picture)
+        if episode.thumbnail_url:
+            self.thumbnails.load(
+                episode.thumbnail_url,
+                lambda path, target=picture: self._set_details_result_picture(target, path),
+            )
+        play = Gtk.Button(
+            icon_name="media-playback-start-symbolic",
+            tooltip_text=f"Play {episode.title}",
+            valign=Gtk.Align.CENTER,
+        )
+        play.add_css_class("square-button")
+        play.connect("clicked", lambda *_args, value=episode: self._play_selected(value))
+        row.add_suffix(play)
+        download = Gtk.Button(
+            icon_name="folder-download-symbolic",
+            tooltip_text=f"Download {episode.title}",
+            valign=Gtk.Align.CENTER,
+        )
+        download.add_css_class("square-button")
+        download.connect("clicked", lambda *_args, value=episode: self._download_item(value))
+        row.add_suffix(download)
+        return row
+
+    def _jellyfin_series_error(self, generation: int, error: Exception) -> bool:
+        if generation != self.detail_series_generation:
+            return GLib.SOURCE_REMOVE
+        self.details_series_spinner.stop()
+        self.details_series_loading.set_visible(False)
+        self.details_play.set_sensitive(False)
+        self.details_seasons.append(
+            Adw.StatusPage(
+                icon_name="dialog-error-symbolic",
+                title="Could not load episodes",
+                description=str(error),
+            )
+        )
+        return GLib.SOURCE_REMOVE
 
     def _youtube_details_loaded(self, details: VideoDetails) -> bool:
         if not self.detail_item or details.item.id != self.detail_item.id:
@@ -4399,7 +4547,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _play_detail_item(self) -> None:
-        if self.detail_item:
+        if self.detail_series_play_item:
+            self._play_selected(self.detail_series_play_item)
+        elif self.detail_item:
             self._play_selected(self.detail_item)
 
     def _queue_detail_item(self) -> None:
@@ -4859,7 +5009,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_avatar_button.set_tooltip_text(f"Open {channel_name}")
         self.player_channel_button.set_tooltip_text(f"Open {channel_name}")
         self._load_player_avatar(item)
-        self.player_download.set_visible(item.source == "youtube")
+        self.player_download.set_visible(item.source in {"youtube", "jellyfin"})
         self.comments_more.set_label("Load")
         self.comments_more.set_sensitive(True)
         self.comments_more.set_visible(False)
@@ -4972,7 +5122,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 event.set()
 
     def _local_download_stream(self, item: MediaItem) -> ResolvedStream | None:
-        if item.source != "youtube":
+        if item.source not in {"youtube", "jellyfin"}:
             return None
         record = self.offline.find_complete_for_item(item)
         if not record:
@@ -5046,6 +5196,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 lambda: self._online_variants(item),
                 lambda choices: self._online_variants_loaded(
                     item.id, request_id, choices
+                ),
+                lambda _error: None,
+            )
+        elif item.source == "jellyfin" and default_label == "Local download":
+            run_async(
+                lambda: self.jellyfin.resolve(item),
+                lambda online: self._online_variants_loaded(
+                    item.id,
+                    request_id,
+                    ([StreamVariant("Online · Original", online.url, online.headers)], []),
                 ),
                 lambda _error: None,
             )

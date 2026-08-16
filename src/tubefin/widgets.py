@@ -327,7 +327,7 @@ class MediaCard(Gtk.Box):
                 share.add_css_class("flat")
                 share.connect("clicked", lambda *_: choose(on_share))
                 actions.append(share)
-            if item.playable and on_download and item.source == "youtube":
+            if item.playable and on_download and item.source in {"youtube", "jellyfin"}:
                 download = labeled_button("Download", "folder-download-symbolic")
                 download.add_css_class("flat")
                 download.connect("clicked", lambda *_: choose(on_download))

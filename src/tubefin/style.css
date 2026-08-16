@@ -170,6 +170,15 @@
   max-width: 220px;
 }
 
+.episode-thumbnail {
+  border-radius: 8px;
+}
+
+.series-season {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
 .media-title {
   font-weight: 650;
 }

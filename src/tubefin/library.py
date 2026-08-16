@@ -277,7 +277,7 @@ class OfflineLibrary:
                     path
                     for suffix in ("*.jpg", "*.jpeg", "*.webp", "*.png")
                     for path in directory.glob(suffix)
-                    if path.is_file()
+                    if path.is_file() and ".series." not in path.name
                 ]
                 if thumbnails:
                     local_thumbnail = max(
