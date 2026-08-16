@@ -145,6 +145,17 @@
   padding: 0;
 }
 
+.speed-step-button {
+  min-width: 36px;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.speed-value-button {
+  min-width: 64px;
+  font-variant-numeric: tabular-nums;
+}
+
 .media-title {
   font-weight: 650;
 }

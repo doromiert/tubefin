@@ -2942,6 +2942,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         title.add_css_class("title-2")
         content.append(title)
         quality_choices = [
+            "Automatic",
             "Maximum quality",
             "Minimum quality",
             "No video (audio only)",
@@ -2963,9 +2964,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         audio_scroller.set_max_content_height(150)
         audio_scroller.set_propagate_natural_height(True)
         audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        audio_placeholder = Gtk.Label(label="Loading available audio…", xalign=0)
-        audio_placeholder.add_css_class("dim-label")
-        audio_box.append(audio_placeholder)
+        original_audio = Gtk.CheckButton(label="Original audio")
+        original_audio.set_active(True)
+        audio_box.append(original_audio)
         audio_scroller.set_child(audio_box)
         content.append(audio_scroller)
         audio_buttons: list[tuple[AudioTrack, Gtk.CheckButton]] = []
@@ -2996,6 +2997,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             )
             audio_only = choice == "No video (audio only)"
             selected_quality = {
+                "Automatic": "best",
                 "Maximum quality": "best",
                 "Minimum quality": "worst",
                 "No video (audio only)": "best",
@@ -3055,7 +3057,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         selected = quality.get_selected()
         selected_label = quality_choices[selected] if selected < len(quality_choices) else ""
         exact = [value for value in qualities if value not in quality_choices]
-        quality_choices[2:2] = exact
+        quality_choices[3:3] = exact
         quality.set_model(Gtk.StringList.new(quality_choices))
         if selected_label in quality_choices:
             quality.set_selected(quality_choices.index(selected_label))

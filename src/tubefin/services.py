@@ -719,32 +719,85 @@ class YouTubeService:
             "best[height<=1080][vcodec^=avc1][acodec^=mp4a]/best[height<=1080]/best",
             video_url,
         )
-        stream_url = data.get("url")
+        formats = list(data.get("formats") or [])
+        explicit_original_languages = {
+            str(candidate.get("language") or "").casefold()
+            for candidate in formats
+            if "original" in str(candidate.get("format_note") or "").casefold()
+            and candidate.get("language")
+        }
+        fallback_original_language = str(data.get("language") or "").casefold()
+
+        def original_audio_rank(candidate: dict[str, Any]) -> int:
+            note = str(candidate.get("format_note") or "").casefold()
+            language = str(candidate.get("language") or "").casefold()
+            if "original" in note:
+                return 3
+            if explicit_original_languages and language in explicit_original_languages:
+                return 2
+            if not explicit_original_languages and fallback_original_language and (
+                language == fallback_original_language
+                or language.startswith(f"{fallback_original_language}-")
+            ):
+                return 2
+            # Muxed legacy formats often omit language because their audio is the
+            # video's original track. Prefer them over an explicitly dubbed mux.
+            return 1 if language in {"", "und"} else 0
+
+        muxed_formats = [
+            candidate
+            for candidate in formats
+            if candidate.get("url")
+            and candidate.get("vcodec") not in {None, "none"}
+            and candidate.get("acodec") not in {None, "none"}
+            and int(candidate.get("height") or 0) <= 1080
+        ]
+        original_muxed = [
+            candidate
+            for candidate in muxed_formats
+            if original_audio_rank(candidate)
+        ]
+        chosen_stream = max(
+            original_muxed,
+            key=lambda candidate: (
+                original_audio_rank(candidate),
+                int(candidate.get("height") or 0),
+                str(candidate.get("vcodec") or "").startswith("avc1"),
+                float(candidate.get("tbr") or 0),
+            ),
+            default=None,
+        )
+        stream_url = chosen_stream.get("url") if chosen_stream else data.get("url")
         if not stream_url:
             raise ServiceError("No compatible YouTube stream was found.")
         headers = {
             str(name): str(value)
-            for name, value in (data.get("http_headers") or {}).items()
+            for name, value in (
+                (chosen_stream or {}).get("http_headers")
+                or data.get("http_headers")
+                or {}
+            ).items()
             if value is not None
         }
         variants: list[StreamVariant] = []
-        seen_heights: set[int] = set()
-        formats = sorted(
-            data.get("formats") or [],
-            key=lambda candidate: int(candidate.get("height") or 0),
+        heights = sorted(
+            {int(candidate.get("height") or 0) for candidate in original_muxed},
             reverse=True,
         )
-        for candidate in formats:
-            height = int(candidate.get("height") or 0)
-            if (
-                not height
-                or height in seen_heights
-                or candidate.get("vcodec") == "none"
-                or candidate.get("acodec") == "none"
-                or not candidate.get("url")
-            ):
-                continue
-            seen_heights.add(height)
+        for height in heights:
+            candidates = [
+                candidate
+                for candidate in original_muxed
+                if int(candidate.get("height") or 0) == height
+            ]
+            candidate = max(
+                candidates,
+                key=lambda value: (
+                    original_audio_rank(value),
+                    str(value.get("vcodec") or "").startswith("avc1"),
+                    float(value.get("tbr") or 0),
+                ),
+            )
             variant_headers = {
                 str(name): str(value)
                 for name, value in (candidate.get("http_headers") or headers).items()
@@ -816,6 +869,12 @@ class YouTubeService:
             "uk": "Ukrainian",
             "zh": "Chinese",
         }
+        explicit_original_languages = {
+            str(candidate.get("language") or "").casefold()
+            for candidate in data.get("formats") or []
+            if candidate.get("language")
+            and "original" in str(candidate.get("format_note") or "").casefold()
+        }
         original_language = str(data.get("language") or "").casefold()
         best: dict[str, dict[str, Any]] = {}
         for candidate in data.get("formats") or []:
@@ -842,7 +901,8 @@ class YouTubeService:
             base_language = language.split("-", 1)[0]
             display = names.get(base_language, language.upper() if language != "und" else "Audio")
             original = "original" in note.casefold() or (
-                bool(original_language)
+                not explicit_original_languages
+                and bool(original_language)
                 and (
                     language == original_language
                     or language.startswith(f"{original_language}-")

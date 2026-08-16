@@ -194,6 +194,7 @@ class MpvPlayer(Gtk.Box):
         self.subtitles: list[SubtitleTrack] = []
         self.audio_tracks: list[AudioTrack] = []
         self.original_audio_id = ""
+        self.external_audio_ids: dict[str, str] = {}
         self.default_url = ""
         self.default_headers: dict[str, str] = {}
         self.default_quality_label = "Auto"
@@ -333,14 +334,25 @@ class MpvPlayer(Gtk.Box):
         self.buffer.set_tooltip_text("Network buffer")
         self.buffer.connect("notify::selected", self._buffer_changed)
         self.buffer.set_halign(Gtk.Align.END)
-        self.speed = Gtk.DropDown.new_from_strings(
-            ["0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×"]
-        )
         self.speed_values = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-        self.speed.set_selected(2)
-        self.speed.set_tooltip_text("Playback speed")
-        self.speed.set_halign(Gtk.Align.END)
-        self.speed.connect("notify::selected", self._speed_changed)
+        self.speed_control = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=0
+        )
+        self.speed_control.set_halign(Gtk.Align.END)
+        speed_down = Gtk.Button(label="−", tooltip_text="Decrease playback speed")
+        speed_down.add_css_class("speed-step-button")
+        speed_down.connect("clicked", lambda *_: self._step_playback_speed(-1))
+        self.speed_value = Gtk.Button(
+            label="1×", tooltip_text="Reset playback speed to 1×"
+        )
+        self.speed_value.add_css_class("speed-value-button")
+        self.speed_value.connect("clicked", lambda *_: self.set_playback_speed(1.0))
+        speed_up = Gtk.Button(label="+", tooltip_text="Increase playback speed")
+        speed_up.add_css_class("speed-step-button")
+        speed_up.connect("clicked", lambda *_: self._step_playback_speed(1))
+        self.speed_control.append(speed_down)
+        self.speed_control.append(self.speed_value)
+        self.speed_control.append(speed_up)
         self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 200, 1)
         self.volume.set_draw_value(False)
         self.volume.set_value(100)
@@ -370,7 +382,7 @@ class MpvPlayer(Gtk.Box):
             ("Closed captions", self.captions),
             ("Audio track", self.audio),
             ("Network buffer", self.buffer),
-            ("Playback speed", self.speed),
+            ("Playback speed", self.speed_control),
             ("Volume", self.volume_control),
         ):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
@@ -443,6 +455,7 @@ class MpvPlayer(Gtk.Box):
         self.subtitles = subtitles or []
         self.audio_tracks = audio_tracks or []
         self.original_audio_id = ""
+        self.external_audio_ids.clear()
         self._set_options()
         self._load_url(url, self.default_headers)
 
@@ -533,12 +546,20 @@ class MpvPlayer(Gtk.Box):
     def set_playback_speed(self, speed: float) -> None:
         speed = max(0.5, min(speed, 2.0))
         self.playback_speed = speed
-        selected = min(
-            range(len(self.speed_values)),
-            key=lambda index: abs(self.speed_values[index] - speed),
-        )
-        self.speed.set_selected(selected)
+        self.speed_value.set_label(self._speed_label(speed))
         self._apply_speed()
+
+    @staticmethod
+    def _speed_label(speed: float) -> str:
+        return f"{speed:g}×"
+
+    def _step_playback_speed(self, direction: int) -> None:
+        index = min(
+            range(len(self.speed_values)),
+            key=lambda value: abs(self.speed_values[value] - self.playback_speed),
+        )
+        index = max(0, min(index + direction, len(self.speed_values) - 1))
+        self.set_playback_speed(self.speed_values[index])
 
     def set_volume(self, volume: float) -> None:
         self.volume.set_value(max(0, min(volume, 200)))
@@ -788,8 +809,9 @@ class MpvPlayer(Gtk.Box):
         controls = (
             self.quality,
             self.captions,
+            self.audio,
             self.buffer,
-            self.speed,
+            self.speed_control,
             self.volume_control,
         )
         width = max(
@@ -855,6 +877,8 @@ class MpvPlayer(Gtk.Box):
         return self._ready()
 
     def _load_url(self, url: str, headers: dict[str, str]) -> None:
+        self.original_audio_id = ""
+        self.external_audio_ids.clear()
         self.player.http_header_fields = [f"{name}: {value}" for name, value in headers.items()]
         self.player.loadfile(url, "replace")
         self.player.pause = False
@@ -876,7 +900,7 @@ class MpvPlayer(Gtk.Box):
         labels = ["Original", *(track.label for track in self.audio_tracks)]
         self.audio.set_model(Gtk.StringList.new(labels))
         self.audio.set_selected(self._preferred_audio_index())
-        self.option_rows["Audio track"].set_visible(bool(self.audio_tracks))
+        self.option_rows["Audio track"].set_visible(True)
         self.syncing_options = was_syncing
 
     def _discover_embedded_audio_tracks(self) -> None:
@@ -929,25 +953,51 @@ class MpvPlayer(Gtk.Box):
             self._apply_audio_selection()
 
     def _apply_audio_selection(self) -> None:
+        if self.shutting_down:
+            return
         selected = self.audio.get_selected()
         if selected == 0:
-            self.player.command_async(
-                "set", "aid", self.original_audio_id or "auto"
-            )
+            with suppress(mpv.ShutdownError):
+                self.player.command("set", "aid", self.original_audio_id or "auto")
             return
         if selected > len(self.audio_tracks):
             return
         track = self.audio_tracks[selected - 1]
         if track.url.startswith("mpv://aid/"):
-            self.player.command_async("set", "aid", track.url.rpartition("/")[2])
+            with suppress(mpv.ShutdownError):
+                self.player.command("set", "aid", track.url.rpartition("/")[2])
+            return
+        known_id = self.external_audio_ids.get(track.url)
+        if known_id:
+            with suppress(mpv.ShutdownError):
+                self.player.command("set", "aid", known_id)
             return
         if track.headers:
             self.player.http_header_fields = [
                 f"{name}: {value}" for name, value in track.headers.items()
             ]
-        self.player.command_async(
-            "audio-add", track.url, "cached", track.label, track.language
-        )
+        with suppress(mpv.ShutdownError):
+            before = {
+                str(value.get("id"))
+                for value in (self.player.track_list or [])
+                if value.get("type") == "audio" and value.get("id") is not None
+            }
+            self.player.command(
+                "audio-add", track.url, "select", track.label, track.language
+            )
+            audio_tracks = [
+                value
+                for value in (self.player.track_list or [])
+                if value.get("type") == "audio" and value.get("id") is not None
+            ]
+            added = next(
+                (value for value in reversed(audio_tracks) if str(value["id"]) not in before),
+                next((value for value in audio_tracks if value.get("selected")), None),
+            )
+            if added:
+                track_id = str(added["id"])
+                self.external_audio_ids[track.url] = track_id
+                self.player.command("set", "aid", track_id)
 
     def _set_quality_options(self) -> None:
         self.syncing_options = True
@@ -957,7 +1007,7 @@ class MpvPlayer(Gtk.Box):
         ]
         self.quality.set_model(Gtk.StringList.new(qualities))
         self.quality.set_selected(0)
-        self.option_rows["Quality"].set_visible(bool(self.variants))
+        self.option_rows["Quality"].set_visible(True)
         self.syncing_options = False
         GLib.idle_add(self._normalize_option_widths)
 
@@ -1048,13 +1098,6 @@ class MpvPlayer(Gtk.Box):
         self._apply_speed()
         if self.on_buffer_changed:
             self.on_buffer_changed(self.buffer_seconds)
-
-    def _speed_changed(self, dropdown: Gtk.DropDown, _property: object) -> None:
-        selected = dropdown.get_selected()
-        if selected >= len(self.speed_values):
-            return
-        self.playback_speed = self.speed_values[selected]
-        self._apply_speed()
 
     def _volume_changed(self, scale: Gtk.Scale) -> None:
         if self.shutting_down:
