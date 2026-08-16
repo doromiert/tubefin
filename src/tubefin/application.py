@@ -428,6 +428,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_enrichment_item_id = ""
         self.playback_fast_path_item_id = ""
         self.playback_fast_retry_item_id = ""
+        self.playback_race_item_id = ""
+        self.playback_race_winner = ""
+        self.playback_race_pending: set[str] = set()
+        self.playback_race_errors: dict[str, str] = {}
+        self.playback_race_direct_failed = False
         self.expected_page = "home"
         self.player_expanded = False
         self.player_navigation_guard_until = 0.0
@@ -6410,6 +6415,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             ("Queue prebuffer wait", "queue_wait_start", "worker_ready"),
             ("Background worker dispatch", "worker_queued", "worker_started"),
             ("Stream resolver", "resolver_start", "resolver_end"),
+            ("Validated fast resolver race", "race_fast_start", "race_fast_end"),
+            ("Reliable resolver race", "race_reliable_start", "race_reliable_end"),
             ("Reliable resolver fallback", "fallback_start", "fallback_end"),
             ("Played-video disk cache", "played_cache_start", "played_cache_end"),
             ("Legacy cache validation", "legacy_cache_start", "legacy_cache_end"),
@@ -6590,6 +6597,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 "enrichment": "Enrichment",
                 "played_cache": "Played cache",
                 "prefix": "Cached prefix",
+                "persistent_resolver": "Persistent resolver",
+                "race": "Playback race",
+                "race_errors": "Race failures",
                 "stream_label": "Stream",
                 "queue_prebuffer": "Queue prebuffer",
             }
@@ -6781,6 +6791,22 @@ class TubeFinWindow(Adw.ApplicationWindow):
             played_cache="miss or expired stream URL",
             prefix="none",
         )
+        if item.source == "youtube":
+            # Let mpv's ytdl hook own the cold critical path. It can open the
+            # webpage directly and avoids serializing an extracted URL through
+            # TubeFin before libmpv starts. Full metadata is enriched after the
+            # first frame, while _retry_failed_fast_path remains the safety net.
+            video_url = str(
+                item.payload.get("webpage_url")
+                or f"https://www.youtube.com/watch?v={item.id}"
+            )
+            self._mark_playback_load(
+                request_id,
+                resolver="mpv ytdl hook direct",
+                route="Direct mpv YouTube URL",
+            )
+            self._mark_playback_load(request_id, "worker_done")
+            return ResolvedStream(video_url), None
         self._mark_playback_load(request_id, "resolver_start")
         stream = self._resolve_item(item, request_id)
         self._mark_playback_load(request_id, "resolver_end")
@@ -6810,6 +6836,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if not buffered or not buffered.upstream_is_deferred:
             self.played_cache_source = (item.id, stream)
         self.played_cache_buffered = buffered
+        direct_youtube = bool(
+            item.source == "youtube"
+            and self.youtube.video_id_from_url(stream.url) is not None
+            and not buffered
+        )
+        if direct_youtube:
+            self._start_youtube_playback_race(item, request_id)
         playback_stream = stream
         if buffered:
             self.played_cache_active = buffered
@@ -6829,6 +6862,149 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     ),
                 )
         return self._start_playback(item, playback_stream, request_id)
+
+    def _start_youtube_playback_race(
+        self, item: MediaItem, request_id: int
+    ) -> None:
+        self.playback_race_item_id = item.id
+        self.playback_race_winner = ""
+        self.playback_race_pending = {"validated fast resolver", "reliable resolver"}
+        self.playback_race_errors = {}
+        self.playback_race_direct_failed = False
+        self.playback_enrichment_item_id = item.id
+        self._mark_playback_load(
+            request_id,
+            "enrichment_start",
+            race="mpv direct · validated fast resolver · reliable resolver",
+            enrichment="reliable resolver racing off the critical path",
+        )
+        self._mark_playback_load(request_id, "race_fast_start")
+        self._mark_playback_load(request_id, "race_reliable_start")
+        run_async(
+            lambda: self.youtube.resolve_fast(item),
+            lambda stream: self._youtube_race_candidate_ready(
+                item, stream, request_id, "validated fast resolver"
+            ),
+            lambda error: self._youtube_race_candidate_failed(
+                item, error, request_id, "validated fast resolver"
+            ),
+        )
+        run_async(
+            lambda: self.youtube.resolve(item),
+            lambda stream: self._youtube_race_reliable_ready(
+                item, stream, request_id
+            ),
+            lambda error: self._youtube_race_candidate_failed(
+                item, error, request_id, "reliable resolver"
+            ),
+        )
+
+    def _youtube_race_candidate_ready(
+        self,
+        item: MediaItem,
+        stream: ResolvedStream,
+        request_id: int,
+        candidate: str,
+    ) -> bool:
+        if (
+            request_id != self.playback_request
+            or self.playback_race_item_id != item.id
+        ):
+            return GLib.SOURCE_REMOVE
+        self._mark_playback_load(
+            request_id,
+            (
+                "race_fast_end"
+                if candidate == "validated fast resolver"
+                else "race_reliable_end"
+            ),
+        )
+        self.playback_race_pending.discard(candidate)
+        if not self.playback_race_winner:
+            self.playback_race_winner = candidate
+            self._mark_playback_load(request_id, race=f"winner: {candidate}")
+            self.played_cache_source = (item.id, stream)
+            self._start_playback(item, stream, request_id)
+        return GLib.SOURCE_REMOVE
+
+    def _youtube_race_reliable_ready(
+        self,
+        item: MediaItem,
+        stream: ResolvedStream,
+        request_id: int,
+    ) -> bool:
+        self._youtube_race_candidate_ready(
+            item, stream, request_id, "reliable resolver"
+        )
+        if (
+            request_id != self.playback_request
+            or self.playback_race_item_id != item.id
+        ):
+            return GLib.SOURCE_REMOVE
+        self._mark_playback_load(
+            request_id,
+            "enrichment_end",
+            enrichment="complete",
+        )
+        with self.resolved_stream_lock:
+            self.resolved_stream_cache[f"{item.source}:{item.id}"] = (
+                time.monotonic(),
+                stream,
+            )
+        if self.playback_race_winner != "reliable resolver":
+            self.played_cache_source = (item.id, stream)
+            self._set_player_description(item, stream.description, stream.published_date)
+            if self.mpv_player:
+                self.mpv_player.set_variants(stream.variants)
+                self.mpv_player.set_subtitles(stream.subtitles)
+                self.mpv_player.set_audio_tracks(stream.audio_tracks)
+                self.mpv_player.set_chapters(stream.chapters)
+        return GLib.SOURCE_REMOVE
+
+    def _youtube_race_candidate_failed(
+        self,
+        item: MediaItem,
+        error: Exception,
+        request_id: int,
+        candidate: str,
+    ) -> bool:
+        if (
+            request_id != self.playback_request
+            or self.playback_race_item_id != item.id
+        ):
+            return GLib.SOURCE_REMOVE
+        self._mark_playback_load(
+            request_id,
+            (
+                "race_fast_end"
+                if candidate == "validated fast resolver"
+                else "race_reliable_end"
+            ),
+        )
+        if candidate == "reliable resolver":
+            self._mark_playback_load(
+                request_id,
+                "enrichment_end",
+                enrichment=f"failed: {error}",
+            )
+        self.playback_race_pending.discard(candidate)
+        self.playback_race_errors[candidate] = str(error)
+        self._mark_playback_load(
+            request_id,
+            race_errors=" · ".join(
+                f"{name}: {message}"
+                for name, message in self.playback_race_errors.items()
+            ),
+        )
+        if (
+            not self.playback_race_winner
+            and self.playback_race_direct_failed
+            and not self.playback_race_pending
+        ):
+            self._playback_error(
+                ServiceError("Every YouTube playback route failed."), request_id
+            )
+        return GLib.SOURCE_REMOVE
 
     def _refresh_cached_playback(
         self,
@@ -7063,6 +7239,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                                 trace_request_id,
                                 "fallback_end",
                             )
+                if trace_request_id is not None:
+                    self._mark_playback_load(
+                        trace_request_id,
+                        persistent_resolver=self.youtube.fast_resolver_status,
+                    )
             elif item.source == "jellyfin":
                 stream = self.jellyfin.resolve(item)
             elif item.source == "offline":
@@ -7292,6 +7473,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _mpv_ready(self) -> None:
+        if (
+            self.current_item
+            and self.playback_race_item_id == self.current_item.id
+            and not self.playback_race_winner
+            and self.mpv_player
+            and self.youtube.video_id_from_url(self.mpv_player.default_url) is not None
+        ):
+            self.playback_race_winner = "mpv direct"
+            self._mark_playback_load(
+                self.playback_request,
+                race="winner: mpv direct",
+            )
         self._mark_playback_load(
             self.playback_request,
             "file_loaded",
@@ -7328,9 +7521,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if not self.current_item or not self.played_cache_source:
             return
         item = self.current_item
+        item_id, stream = self.played_cache_source
+        if (
+            item.source == "youtube"
+            and self.youtube.video_id_from_url(stream.url) is not None
+        ):
+            # A watch-page URL is consumed by mpv's ytdl hook, not by the byte
+            # cache. Background enrichment will replace it with a media URL.
+            return
         if self.played_cache_request_item_id == item.id:
             return
-        item_id, stream = self.played_cache_source
         if (
             item.id != item_id
             or item.source not in {"youtube", "jellyfin"}
@@ -7458,16 +7658,56 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.toast_overlay.add_toast(Adw.Toast(title=f"Playback failed: {message}"))
 
     def _retry_failed_fast_path(self, message: str) -> bool:
+        folded_message = message.casefold()
+        stream_failure = any(
+            fragment in folded_message
+            for fragment in (
+                "loading failed",
+                "no audio or video data",
+                "no streams were selected",
+                "failed to recognize file format",
+            )
+        )
         if (
-            "loading failed" not in message.casefold()
+            not stream_failure
             or not self.current_item
             or self.current_item.source != "youtube"
-            or self.playback_fast_path_item_id != self.current_item.id
-            or self.playback_fast_retry_item_id == self.current_item.id
+            or (
+                self.playback_fast_path_item_id != self.current_item.id
+                and self.playback_race_item_id != self.current_item.id
+            )
         ):
             return False
         item = self.current_item
         request_id = self.playback_request
+        if self.playback_race_item_id == item.id:
+            failed_route = self.playback_race_winner or "mpv direct"
+            self.playback_race_direct_failed = True
+            self.playback_race_winner = ""
+            self.playback_race_errors[failed_route] = message
+            self._mark_playback_load(
+                request_id,
+                race=f"{failed_route} failed; waiting for resolver race",
+                race_errors=" · ".join(
+                    f"{name}: {error}"
+                    for name, error in self.playback_race_errors.items()
+                ),
+            )
+            if self.playback_race_pending:
+                self.player_status.set_label(
+                    "Playback route failed. Waiting for another route…"
+                )
+                self.player_status_box.set_visible(True)
+                self.player_spinner.start()
+                return True
+            with self.resolved_stream_lock:
+                cached = self.resolved_stream_cache.get(f"youtube:{item.id}")
+            if cached:
+                self._reliable_fallback_ready(item, cached[1], request_id)
+                return True
+            return False
+        if self.playback_fast_retry_item_id == item.id:
+            return False
         self.playback_fast_retry_item_id = item.id
         self.player_status.set_label("Fast stream failed. Retrying with full resolver…")
         self.player_status_box.set_visible(True)
@@ -8158,6 +8398,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playback_enrichment_item_id = ""
         self.playback_fast_path_item_id = ""
         self.playback_fast_retry_item_id = ""
+        self.playback_race_item_id = ""
+        self.playback_race_winner = ""
+        self.playback_race_pending.clear()
+        self.playback_race_errors.clear()
+        self.playback_race_direct_failed = False
 
     def _report_jellyfin_playback(
         self,

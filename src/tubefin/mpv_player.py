@@ -438,6 +438,7 @@ class MpvPlayer(Gtk.Box):
         self.sync_speed = 1.0
         self.last_audible_volume = 100.0
         self.last_motion: tuple[float, float] | None = None
+        ytdl_raw_options = ["ignore-config=", "js-runtimes=deno"]
         self.player = mpv.MPV(
             vo="libmpv",
             osc=False,
@@ -448,7 +449,8 @@ class MpvPlayer(Gtk.Box):
             keep_open=True,
             hwdec="no",
             gpu_hwdec_interop="no",
-            ytdl=False,
+            ytdl=True,
+            ytdl_raw_options=",".join(ytdl_raw_options),
             cache_secs=buffer_seconds,
             demuxer_max_bytes="32MiB",
             audio_client_name="TubeFin",

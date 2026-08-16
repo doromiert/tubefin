@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import http.cookiejar
+import importlib
 import json
 import os
 import re
@@ -67,9 +68,18 @@ class YouTubeService:
         self.cookie_snapshot_path = (
             Path(self.cookie_snapshot_directory.name) / "cookies.txt"
         )
+        self.cookie_snapshot_path.write_text(
+            "# Netscape HTTP Cookie File\n", encoding="utf-8"
+        )
+        self.cookie_snapshot_path.chmod(0o600)
         self.cookie_snapshot_lock = threading.Lock()
         self.cookie_snapshot_ready = False
         self.cookie_snapshot_browser = ""
+        self.cookie_snapshot_generation = 0
+        self.fast_resolver_lock = threading.Lock()
+        self.fast_resolver: Any | None = None
+        self.fast_resolver_session_key: tuple[str, int] | None = None
+        self.fast_resolver_status = "not used"
 
     @property
     def available(self) -> bool:
@@ -199,6 +209,8 @@ class YouTubeService:
                         self.cookie_snapshot_path.stat().st_size > 32
                     )
                     self.cookie_snapshot_path.chmod(0o600)
+                    if self.cookie_snapshot_ready:
+                        self.cookie_snapshot_generation += 1
                 self.cookie_snapshot_lock.release()
         if result.returncode != 0:
             detail = result.stderr.strip().splitlines()
@@ -1298,6 +1310,108 @@ class YouTubeService:
         """Resolve one progressive stream while avoiding nonessential manifests."""
         return self._resolve_youtube_stream(item, fast=True)
 
+    @staticmethod
+    def _youtube_stream_headers(
+        candidate: dict[str, Any],
+        fallback: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        return {
+            str(name): str(value)
+            for name, value in (
+                candidate.get("http_headers")
+                or (fallback or {}).get("http_headers")
+                or {}
+            ).items()
+            if value is not None
+        }
+
+    @staticmethod
+    def _youtube_stream_responds(url: str, headers: dict[str, str]) -> bool:
+        """Verify a signed media URL without downloading more than one byte."""
+        request_headers = dict(headers)
+        request_headers["Range"] = "bytes=0-0"
+        request_headers["Accept-Encoding"] = "identity"
+        request = urllib.request.Request(url, headers=request_headers)
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.getcode() in {200, 206} and bool(response.read(1))
+        except (
+            OSError,
+            TimeoutError,
+            ValueError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+        ):
+            return False
+
+    def _reset_fast_resolver_locked(self) -> None:
+        resolver = self.fast_resolver
+        self.fast_resolver = None
+        self.fast_resolver_session_key = None
+        if resolver is not None:
+            with suppress(Exception):
+                resolver.close()
+
+    def _resolve_fast_in_process(
+        self,
+        video_url: str,
+        format_selector: str,
+    ) -> dict[str, Any] | None:
+        if self.browser and not self.cookie_snapshot_ready:
+            self.fast_resolver_status = "cookie session not ready · CLI fallback"
+            return None
+        session_key = (self.browser, self.cookie_snapshot_generation)
+        with self.fast_resolver_lock:
+            initialized = False
+            if (
+                self.fast_resolver is None
+                or self.fast_resolver_session_key != session_key
+            ):
+                self._reset_fast_resolver_locked()
+                try:
+                    yt_dlp = importlib.import_module("yt_dlp")
+                    options: dict[str, Any] = {
+                        "extractor_args": {
+                            "youtube": {
+                                "skip": ["hls", "dash", "translated_subs"],
+                            },
+                        },
+                        "format": format_selector,
+                        "getcomments": False,
+                        "noplaylist": True,
+                        "no_warnings": True,
+                        "quiet": True,
+                        "skip_download": True,
+                    }
+                    if self.browser:
+                        options["cookiefile"] = str(self.cookie_snapshot_path)
+                    self.fast_resolver = yt_dlp.YoutubeDL(options)
+                    self.fast_resolver_session_key = session_key
+                    initialized = True
+                except Exception as error:
+                    self._reset_fast_resolver_locked()
+                    self.fast_resolver_status = (
+                        f"unavailable ({str(error)[:120]}) · CLI fallback"
+                    )
+                    return None
+            try:
+                data = self.fast_resolver.extract_info(video_url, download=False)
+            except Exception as error:
+                self._reset_fast_resolver_locked()
+                self.fast_resolver_status = (
+                    f"failed ({str(error)[:120]}) · CLI fallback"
+                )
+                return None
+            if not isinstance(data, dict):
+                self.fast_resolver_status = "unexpected response · CLI fallback"
+                return None
+            self.fast_resolver_status = (
+                "initialized in-process session"
+                if initialized
+                else "reused in-process session"
+            )
+            return data
+
     def resolve(self, item: MediaItem) -> ResolvedStream:
         return self._resolve_youtube_stream(item, fast=False)
 
@@ -1313,6 +1427,7 @@ class YouTubeService:
             "--format",
             "best[height<=1080][vcodec^=avc1][acodec^=mp4a]/best[height<=1080]/best",
         ]
+        format_selector = arguments[-1]
         if fast:
             arguments.extend(
                 (
@@ -1320,7 +1435,13 @@ class YouTubeService:
                     "youtube:skip=hls,dash,translated_subs",
                 )
             )
-        data = self._run(*arguments, str(video_url))
+        data = (
+            self._resolve_fast_in_process(str(video_url), format_selector)
+            if fast
+            else None
+        )
+        if data is None:
+            data = self._run(*arguments, str(video_url))
         formats = list(data.get("formats") or [])
         explicit_original_languages = {
             str(candidate.get("language") or "").casefold()
@@ -1359,34 +1480,55 @@ class YouTubeService:
             for candidate in muxed_formats
             if original_audio_rank(candidate)
         ]
-        chosen_stream = (
-            None
+        ranked_original_muxed = sorted(
+            original_muxed,
+            key=lambda candidate: (
+                original_audio_rank(candidate),
+                int(candidate.get("height") or 0),
+                str(candidate.get("vcodec") or "").startswith("avc1"),
+                float(candidate.get("tbr") or 0),
+            ),
+            reverse=True,
+        )
+        selected: dict[str, Any] | None = None
+        if data.get("url"):
+            selected = {
+                "url": data.get("url"),
+                "http_headers": data.get("http_headers") or {},
+                "format_id": data.get("format_id") or "auto",
+            }
+        # Signed media URLs occasionally arrive already unusable. Every resolver
+        # taking part in the race must prove its candidate with a one-byte range
+        # request before it is allowed to claim playback.
+        candidates = (
+            ([selected] if selected else []) + ranked_original_muxed[:3]
             if fast
-            else max(
-                original_muxed,
-                key=lambda candidate: (
-                    original_audio_rank(candidate),
-                    int(candidate.get("height") or 0),
-                    str(candidate.get("vcodec") or "").startswith("avc1"),
-                    float(candidate.get("tbr") or 0),
-                ),
-                default=None,
+            else ranked_original_muxed[:3] + ([selected] if selected else [])
+        )
+        seen_urls: set[str] = set()
+        chosen_stream = None
+        for candidate in candidates:
+            candidate_url = str(candidate.get("url") or "")
+            if not candidate_url or candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+            candidate_headers = self._youtube_stream_headers(candidate, data)
+            if self._youtube_stream_responds(candidate_url, candidate_headers):
+                chosen_stream = candidate
+                if fast:
+                    format_id = str(candidate.get("format_id") or "auto")
+                    self.fast_resolver_status += f" · verified format {format_id}"
+                break
+        if chosen_stream is None:
+            if fast:
+                self.fast_resolver_status += " · media URL validation failed"
+            raise ServiceError(
+                f"{'Fast' if fast else 'Reliable'} YouTube stream failed validation."
             )
-        )
-        stream_url = data.get("url") if fast else (
-            chosen_stream.get("url") if chosen_stream else data.get("url")
-        )
+        stream_url = chosen_stream.get("url") if chosen_stream else data.get("url")
         if not stream_url:
             raise ServiceError("No compatible YouTube stream was found.")
-        headers = {
-            str(name): str(value)
-            for name, value in (
-                (chosen_stream or {}).get("http_headers")
-                or data.get("http_headers")
-                or {}
-            ).items()
-            if value is not None
-        }
+        headers = self._youtube_stream_headers(chosen_stream or {}, data)
         variants: list[StreamVariant] = []
         heights = sorted(
             {int(candidate.get("height") or 0) for candidate in original_muxed},
@@ -2116,7 +2258,7 @@ class SponsorBlockService:
 class JellyfinService:
     CLIENT_HEADER = (
         'MediaBrowser Client="TubeFin", Device="Linux Desktop", '
-        'DeviceId="tubefin-desktop", Version="1.3.1"'
+        'DeviceId="tubefin-desktop", Version="1.4.0"'
     )
 
     def __init__(self, session: JellyfinSession | None = None) -> None:

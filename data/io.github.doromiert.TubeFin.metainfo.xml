@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.4.0" date="2026-08-17">
+      <description>
+        <p>Races mpv-direct playback, a persistent validated resolver, and the authenticated reliable resolver for faster cold YouTube starts; automatically hands failed routes to a surviving candidate; and expands diagnostics with per-route timings, validation failures, and the winning path.</p>
+      </description>
+    </release>
     <release version="1.3.1" date="2026-08-16">
       <description>
         <p>Halves uncached YouTube startup time by reusing authenticated session cookies, adds reliable resolver fallback and detailed playback diagnostics, and caches details plus the opening video segment after playback.</p>

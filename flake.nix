@@ -39,7 +39,7 @@
         {
           default = python.pkgs.buildPythonApplication {
             pname = "tubefin";
-            version = "1.3.1";
+            version = "1.4.0";
             pyproject = true;
 
             src = ./.;
@@ -54,6 +54,7 @@
             build-system = [ python.pkgs.setuptools ];
             dependencies = [
               python.pkgs.pygobject3
+              python.pkgs.yt-dlp
               pythonMpv
               python.pkgs.websocket-client
             ];
@@ -155,6 +156,7 @@
           };
           python = pkgs.python3.withPackages (ps: [
             ps.pygobject3
+            ps.yt-dlp
             pythonMpv
             ps.websocket-client
           ]);

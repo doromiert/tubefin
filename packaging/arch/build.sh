@@ -3,7 +3,7 @@ set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 output_directory=${1:-"$repository_root/dist"}
-version=1.3.1-1
+version=1.4.0-1
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$repository_root" log -1 --format=%ct)}
 work_directory=$(mktemp -d)
 package_root="$work_directory/package"
