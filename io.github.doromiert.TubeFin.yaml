@@ -3,6 +3,7 @@ runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 command: tubefin
+branch: stable
 
 finish-args:
   - --share=ipc
@@ -91,7 +92,7 @@ modules:
       - pip3 install --no-deps --no-build-isolation --prefix=/app .
       - install -Dm644 data/io.github.doromiert.TubeFin.desktop /app/share/applications/io.github.doromiert.TubeFin.desktop
       - install -Dm644 data/io.github.doromiert.TubeFin.metainfo.xml /app/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml
-      - install -Dm644 data/io.github.doromiert.TubeFin.svg /app/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg
+      - install -Dm644 data/io.github.doromiert.TubeFin.png /app/share/icons/hicolor/128x128/apps/io.github.doromiert.TubeFin.png
     sources:
       - type: dir
         path: .
