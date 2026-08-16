@@ -15,6 +15,7 @@ import urllib.request
 from collections.abc import Iterable
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from tubefin.models import (
@@ -1462,6 +1463,13 @@ class JellyfinService:
             time.sleep(2)
         raise ServiceError("Jellyfin Quick Connect timed out. Request a new code and try again.")
 
+    def authorize_quick_connect(self, code: str) -> None:
+        self._request_current(
+            "/QuickConnect/Authorize",
+            query={"code": code},
+            method="POST",
+        )
+
     def _session_from_auth(self, server: str, data: Any) -> JellyfinSession:
         try:
             session = JellyfinSession(
@@ -1995,13 +2003,47 @@ class JellyfinService:
 class SeerrService:
     """Small Seerr API client with API-key and Jellyfin Quick Connect auth."""
 
-    def __init__(self, base_url: str = "", api_key: str = "") -> None:
+    def __init__(
+        self,
+        base_url: str = "",
+        api_key: str = "",
+        cookie_path: str | Path | None = None,
+    ) -> None:
         self.base_url = self._normalize(base_url)
         self.api_key = api_key.strip()
-        self.cookies = http.cookiejar.CookieJar()
+        self.cookie_path = Path(cookie_path) if cookie_path else None
+        self.cookies: http.cookiejar.CookieJar
+        if self.cookie_path:
+            self.cookies = http.cookiejar.MozillaCookieJar(str(self.cookie_path))
+            with suppress(OSError, http.cookiejar.LoadError):
+                self.cookies.load(ignore_discard=True, ignore_expires=False)
+        else:
+            self.cookies = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cookies)
         )
+
+    @property
+    def has_session(self) -> bool:
+        return any(not cookie.is_expired() for cookie in self.cookies)
+
+    def clear_session(self) -> None:
+        self.cookies.clear()
+        if self.cookie_path:
+            with suppress(FileNotFoundError):
+                self.cookie_path.unlink()
+
+    def _save_session(self) -> None:
+        if not self.cookie_path or not isinstance(
+            self.cookies, http.cookiejar.FileCookieJar
+        ):
+            return
+        try:
+            self.cookie_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.cookies.save(ignore_discard=True, ignore_expires=True)
+            self.cookie_path.chmod(0o600)
+        except OSError:
+            pass
 
     @staticmethod
     def _normalize(value: str) -> str:
@@ -2130,6 +2172,7 @@ class SeerrService:
         try:
             with self.opener.open(request, timeout=12) as response:
                 data = response.read()
+            self._save_session()
             return json.loads(data) if data else {}
         except urllib.error.HTTPError as error:
             if error.code in {401, 403}:

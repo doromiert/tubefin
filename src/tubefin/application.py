@@ -268,10 +268,17 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.jellyfin = JellyfinService(self.config.load_session())
         self.seerr_settings = self.config.load_seerr_settings()
         self.seerr = SeerrService(
-            self.seerr_settings["url"], self.seerr_settings["api_key"]
+            self.seerr_settings["url"],
+            self.seerr_settings["api_key"],
+            self.config.directory / "seerr-cookies.txt",
         )
         self.seerr_available = False
-        self.seerr_authenticated = bool(self.seerr_settings["api_key"])
+        self.seerr_authenticated = bool(
+            self.seerr_settings["api_key"] or self.seerr.has_session
+        )
+        self.seerr_authenticating = False
+        self.seerr_auto_auth_attempted_url = ""
+        self.pending_seerr_credentials: tuple[str, str] | None = None
         self.seerr_search_generation = 0
         self.offline = OfflineLibrary()
         self.downloads = DownloadManager(
@@ -3050,6 +3057,71 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     "in Settings, then return here to search and request media."
                 )
             )
+        if url and not has_access and self.seerr_auto_auth_attempted_url != url:
+            self._authenticate_seerr_from_jellyfin(url)
+        elif has_access or not url:
+            self.pending_seerr_credentials = None
+        return GLib.SOURCE_REMOVE
+
+    def _authenticate_seerr_from_jellyfin(self, url: str) -> None:
+        if self.seerr_authenticating or not self.jellyfin.session:
+            return
+        credentials = self.pending_seerr_credentials
+        self.pending_seerr_credentials = None
+        self.seerr_authenticating = True
+        self.seerr_auto_auth_attempted_url = url
+        self.seerr_connect.set_label("Connecting Seerr…")
+        self.seerr_connect.set_sensitive(False)
+        operation = (
+            (lambda: self.seerr.jellyfin_login(*credentials))
+            if credentials is not None
+            else self._seerr_quick_connect_from_jellyfin
+        )
+        run_async(operation, self._seerr_auto_connected, self._seerr_auto_failed)
+
+    def _seerr_quick_connect_from_jellyfin(self) -> dict[str, Any]:
+        initiated = self.seerr.quick_connect_initiate()
+        code = str(initiated.get("code") or "")
+        secret = str(initiated.get("secret") or "")
+        if not code or not secret:
+            raise RuntimeError("Seerr did not return a Jellyfin Quick Connect code.")
+        self.jellyfin.authorize_quick_connect(code)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.seerr.quick_connect_check(secret):
+                return self.seerr.quick_connect_authenticate(secret)
+            time.sleep(0.25)
+        raise RuntimeError("Seerr did not accept the existing Jellyfin session.")
+
+    def _seerr_auto_connected(self, _result: object) -> bool:
+        self.seerr_authenticating = False
+        if not self.jellyfin.session:
+            self.seerr.clear_session()
+            return GLib.SOURCE_REMOVE
+        self.seerr_authenticated = True
+        self.seerr_search.set_sensitive(True)
+        self.seerr_connect.set_label("Seerr connected")
+        self.seerr_connect.set_tooltip_text("Using your Jellyfin account")
+        self.seerr_connect.set_sensitive(False)
+        self.seerr_status.set_title("Find something to watch")
+        self.seerr_status.set_description(
+            "Search Seerr, then request a movie or every season of a show."
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _seerr_auto_failed(self, error: Exception) -> bool:
+        self.seerr_authenticating = False
+        if not self.jellyfin.session:
+            return GLib.SOURCE_REMOVE
+        self.seerr_authenticated = False
+        self.seerr_search.set_sensitive(False)
+        self.seerr_connect.set_label("Sign in to Seerr")
+        self.seerr_connect.set_sensitive(True)
+        self.seerr_status.set_title("One-time Seerr sign-in needed")
+        self.seerr_status.set_description(
+            "This Seerr version could not reuse the active Jellyfin session. "
+            f"Sign in once to save its session. {error}"
+        )
         return GLib.SOURCE_REMOVE
 
     def _seerr_connect_clicked(self, _button: Gtk.Button) -> None:
@@ -7504,13 +7576,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "url": url.get_text().strip(),
             "api_key": api_key.get_text().strip(),
         }
-        self.seerr_authenticated = bool(self.seerr_settings["api_key"])
         self.config.save_seerr_settings(
             self.seerr_settings["url"], self.seerr_settings["api_key"]
         )
         self.seerr.configure(
             self.seerr_settings["url"], self.seerr_settings["api_key"]
         )
+        self.seerr_authenticated = bool(
+            self.seerr_settings["api_key"] or self.seerr.has_session
+        )
+        self.seerr_auto_auth_attempted_url = ""
         button.set_label("Checking…")
         button.set_sensitive(False)
         self._discover_seerr()
@@ -7794,15 +7869,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
         password: str,
         _button: Gtk.Button,
     ) -> None:
+        self.pending_seerr_credentials = (username, password)
         run_async(
             lambda: self.jellyfin.authenticate(server, username, password),
             self._jellyfin_connected,
-            lambda error: (
-                self.connection_window.show_error(str(error)) if self.connection_window else None
-            ),
+            self._jellyfin_connection_error,
         )
 
+    def _jellyfin_connection_error(self, error: Exception) -> None:
+        self.pending_seerr_credentials = None
+        if self.connection_window:
+            self.connection_window.show_error(str(error))
+
     def _quick_connect_jellyfin(self, server: str, _button: Gtk.Button) -> None:
+        self.pending_seerr_credentials = None
         run_async(
             lambda: self.jellyfin.initiate_quick_connect(server),
             self._jellyfin_quick_code,
@@ -7852,7 +7932,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._disconnect_jellyfin_syncplay()
         self.config.clear_session()
         self.jellyfin.session = None
+        self.seerr.clear_session()
         self.seerr_authenticated = bool(self.seerr_settings["api_key"])
+        self.seerr_authenticating = False
+        self.seerr_auto_auth_attempted_url = ""
+        self.pending_seerr_credentials = None
         self._seerr_discovered("")
         if self._visible_page_name() == "requests":
             self._select_page("library")
