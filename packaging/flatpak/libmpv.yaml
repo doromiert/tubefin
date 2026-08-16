@@ -1,6 +1,7 @@
 name: libmpv
 buildsystem: meson
 config-opts:
+  - -Dlibdir=lib
   - -Dlibmpv=true
   - -Dcplayer=false
   - -Dbuild-date=false
@@ -42,6 +43,8 @@ modules:
 
   - name: libplacebo
     buildsystem: meson
+    config-opts:
+      - -Dlibdir=lib
     sources:
       - type: git
         url: https://github.com/haasn/libplacebo.git
