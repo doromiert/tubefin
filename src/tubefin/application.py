@@ -292,6 +292,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.home_pull_refreshing = False
         self.player_settings = self.config.load_player_settings()
         self.sync_settings = self.config.load_sync_settings()
+        self.youtube_sync_settings = self.config.load_youtube_sync_settings()
         oauth_settings = self.config.load_oauth_settings()
         self.youtube = YouTubeService(str(oauth_settings["browser"]))
         self.sponsorblock = SponsorBlockService()
@@ -2887,7 +2888,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _sync_online_subscriptions(self) -> None:
         if (
-            self.subscriptions_syncing
+            not self.youtube_sync_settings["subscriptions_enabled"]
+            or self.subscriptions_syncing
             or not self.active_oauth_account
             and not self.youtube_browser_session
         ):
@@ -2901,12 +2903,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
 
     def _sync_online_history(self) -> None:
-        if self.history_syncing or not self.youtube_browser_session:
+        if (
+            not self.youtube_sync_settings["history_enabled"]
+            or self.history_syncing
+            or not self.youtube_browser_session
+        ):
             return
         self.history_syncing = True
         self._update_account_sync_status()
         run_async(
-            lambda: self.youtube.personal_feed("history", limit=50),
+            lambda: self.youtube.personal_feed(
+                "history", limit=int(self.youtube_sync_settings["history_limit"])
+            ),
             self._online_history_loaded,
             self._online_history_error,
         )
@@ -2943,7 +2951,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _online_history_loaded(self, items: list[MediaItem]) -> bool:
         self.history_syncing = False
         self._update_account_sync_status()
-        if self.clearing_all_data:
+        if self.clearing_all_data or not self.youtube_sync_settings["history_enabled"]:
             return GLib.SOURCE_REMOVE
         changed = self.history.merge_remote(items)
         visible = self._visible_page_name()
@@ -2956,7 +2964,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _online_subscriptions_loaded(self, items: list[MediaItem]) -> bool:
         self.subscriptions_syncing = False
         self._update_account_sync_status()
-        if self.clearing_all_data:
+        if self.clearing_all_data or not self.youtube_sync_settings["subscriptions_enabled"]:
             return GLib.SOURCE_REMOVE
         synced: list[ChannelSubscription] = []
         existing_subscriptions = {
@@ -10598,29 +10606,78 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 "browser's session cookies."
             ),
         )
-        self.youtube_settings_status = Adw.ActionRow(
+        youtube_section = Adw.ExpanderRow(
             title="YouTube",
             subtitle=self._youtube_connection_status(),
+        )
+        youtube_section.set_expanded(False)
+        self.youtube_settings_status = Adw.ActionRow(
+            title="Login",
+            subtitle="Open YouTube to sign in through your browser.",
         )
         self.youtube_settings_status.add_prefix(
             Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
         )
         self.youtube_sign_in_button = Gtk.Button(
-            label="Open YouTube",
+            label="Login",
             icon_name="web-browser-symbolic",
             valign=Gtk.Align.CENTER,
         )
         self.youtube_sign_in_button.connect("clicked", lambda *_: self._open_youtube_sign_in())
         self.youtube_settings_status.add_suffix(self.youtube_sign_in_button)
-        accounts.add(self.youtube_settings_status)
+        youtube_section.add_row(self.youtube_settings_status)
 
-        jellyfin_status = Adw.ActionRow(
+        subscription_sync = Adw.SwitchRow(
+            title="Sync subscriptions",
+            subtitle="Import your YouTube channel subscriptions into TubeFin.",
+        )
+        subscription_sync.set_active(
+            bool(self.youtube_sync_settings["subscriptions_enabled"])
+        )
+        subscription_sync.connect(
+            "notify::active", self._youtube_sync_toggle_changed, "subscriptions_enabled"
+        )
+        youtube_section.add_row(subscription_sync)
+
+        history_sync = Adw.SwitchRow(
+            title="Sync watch history",
+            subtitle="Import recent YouTube watch history into the local library.",
+        )
+        history_sync.set_active(bool(self.youtube_sync_settings["history_enabled"]))
+        history_sync.connect(
+            "notify::active", self._youtube_sync_toggle_changed, "history_enabled"
+        )
+        youtube_section.add_row(history_sync)
+
+        history_limit_row = Adw.ActionRow(
+            title="Watch history limit",
+            subtitle="Maximum number of recent items imported per sync.",
+        )
+        history_limit = Gtk.SpinButton.new_with_range(1, 1000, 10)
+        history_limit.set_value(float(self.youtube_sync_settings["history_limit"]))
+        history_limit.set_valign(Gtk.Align.CENTER)
+        history_limit.set_sensitive(history_sync.get_active())
+        history_limit.connect("value-changed", self._youtube_history_limit_changed)
+        history_sync.connect(
+            "notify::active",
+            lambda row, _property: history_limit.set_sensitive(row.get_active()),
+        )
+        history_limit_row.add_suffix(history_limit)
+        youtube_section.add_row(history_limit_row)
+        accounts.add(youtube_section)
+
+        jellyfin_section = Adw.ExpanderRow(
             title="Jellyfin",
             subtitle=(self.jellyfin.session.username if self.jellyfin.session else "Not connected"),
         )
+        jellyfin_section.set_expanded(False)
+        jellyfin_status = Adw.ActionRow(
+            title="Login",
+            subtitle="Connect to a Jellyfin server.",
+        )
         jellyfin_status.add_prefix(Gtk.Image.new_from_icon_name("network-server-symbolic"))
         jellyfin_action = Gtk.Button(
-            label="Disconnect" if self.jellyfin.session else "Connect",
+            label="Disconnect" if self.jellyfin.session else "Login",
             icon_name=(
                 "system-log-out-symbolic" if self.jellyfin.session else "web-browser-symbolic"
             ),
@@ -10631,24 +10688,22 @@ class TubeFinWindow(Adw.ApplicationWindow):
         else:
             jellyfin_action.connect("clicked", lambda *_: self._connect_from_settings())
         jellyfin_status.add_suffix(jellyfin_action)
-        if not self._synctube_active():
-            accounts.add(jellyfin_status)
+        jellyfin_section.add_row(jellyfin_status)
+        accounts.add(jellyfin_section)
         content.append(accounts)
 
-        requests = Adw.PreferencesGroup(
+        seerr = Adw.ExpanderRow(
             title="Seerr requests",
-            description=(
-                "TubeFin checks the Jellyfin host on port 5055 automatically. "
-                "Set an address for reverse proxies or a separate Seerr host."
-            ),
+            subtitle="Configure optional media requests through Jellyfin.",
         )
+        seerr.set_expanded(False)
         seerr_url = Adw.EntryRow(title="Seerr address")
         seerr_url.set_text(self.seerr_settings["url"])
         seerr_url.set_input_purpose(Gtk.InputPurpose.URL)
-        requests.add(seerr_url)
+        seerr.add_row(seerr_url)
         seerr_key = Adw.PasswordEntryRow(title="API key (optional)")
         seerr_key.set_text(self.seerr_settings["api_key"])
-        requests.add(seerr_key)
+        seerr.add_row(seerr_key)
         seerr_save_row = Adw.ActionRow(
             title="Requests tab",
             subtitle="The sidebar tab appears whenever Jellyfin is connected.",
@@ -10659,20 +10714,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
             lambda *_: self._save_seerr_settings(seerr_url, seerr_key, seerr_save),
         )
         seerr_save_row.add_suffix(seerr_save)
-        requests.add(seerr_save_row)
-        content.append(requests)
+        seerr.add_row(seerr_save_row)
+        jellyfin_section.add_row(seerr)
 
         playback = Adw.PreferencesGroup(title="Playback")
-        sync_row = Adw.ActionRow(
-            title="SyncTube watch room",
-            subtitle="Create or join a sync-tube.de room for synchronized YouTube playback.",
-        )
-        sync = Gtk.Button(label="Open", icon_name="network-transmit-receive-symbolic")
-        sync.set_valign(Gtk.Align.CENTER)
-        sync.connect("clicked", lambda *_: self._open_sync_from_settings())
-        sync_row.add_suffix(sync)
-        playback.add(sync_row)
-
         sync_name = Adw.EntryRow(title="SyncTube username")
         sync_name.set_text(self.sync_settings["username"])
         playback.add(sync_name)
@@ -10860,6 +10905,22 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.config.save_sync_settings(
             self.sync_settings["username"], self.sync_settings["color"]
         )
+
+    def _youtube_sync_toggle_changed(
+        self, row: Adw.SwitchRow, _property: GObject.ParamSpec, setting: str
+    ) -> None:
+        enabled = row.get_active()
+        self.youtube_sync_settings[setting] = enabled
+        self.config.save_youtube_sync_settings(**{setting: enabled})
+        if setting == "subscriptions_enabled" and enabled:
+            self._sync_online_subscriptions()
+        elif setting == "history_enabled" and enabled:
+            self._sync_online_history()
+
+    def _youtube_history_limit_changed(self, button: Gtk.SpinButton) -> None:
+        history_limit = button.get_value_as_int()
+        self.youtube_sync_settings["history_limit"] = history_limit
+        self.config.save_youtube_sync_settings(history_limit=history_limit)
 
     def _save_seerr_settings(
         self,
@@ -11063,7 +11124,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.youtube_settings_status.set_subtitle(self._youtube_connection_status())
         if hasattr(self, "youtube_sign_in_button"):
             self.youtube_sign_in_button.set_sensitive(True)
-            self.youtube_sign_in_button.set_label("Open YouTube")
+            self.youtube_sign_in_button.set_label("Login")
         if hasattr(self, "comment_composer"):
             self._refresh_comment_composer()
         self.toast_overlay.add_toast(
@@ -11138,11 +11199,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.disconnect_jellyfin()
         if self.settings_window:
             self.settings_window.close()
-
-    def _open_sync_from_settings(self) -> None:
-        if self.settings_window:
-            self.settings_window.close()
-        self.open_sync_room()
 
     def _settings_closed(self, *_args: object) -> bool:
         self.settings_window = None

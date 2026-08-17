@@ -207,6 +207,47 @@ class ConfigStore:
             "active_account_id": active_id,
         }
 
+    def load_youtube_sync_settings(self) -> dict[str, object]:
+        youtube = self._load().get("youtube") or {}
+        if not isinstance(youtube, dict):
+            youtube = {}
+        sync = youtube.get("sync") or {}
+        if not isinstance(sync, dict):
+            sync = {}
+        try:
+            history_limit = max(1, min(1000, int(sync.get("history_limit", 100))))
+        except (TypeError, ValueError):
+            history_limit = 100
+        return {
+            "subscriptions_enabled": bool(sync.get("subscriptions_enabled", True)),
+            "history_enabled": bool(sync.get("history_enabled", True)),
+            "history_limit": history_limit,
+        }
+
+    def save_youtube_sync_settings(
+        self,
+        *,
+        subscriptions_enabled: bool | None = None,
+        history_enabled: bool | None = None,
+        history_limit: int | None = None,
+    ) -> None:
+        payload = self._load()
+        youtube = payload.setdefault("youtube", {})
+        if not isinstance(youtube, dict):
+            youtube = {}
+            payload["youtube"] = youtube
+        sync = youtube.setdefault("sync", {})
+        if not isinstance(sync, dict):
+            sync = {}
+            youtube["sync"] = sync
+        if subscriptions_enabled is not None:
+            sync["subscriptions_enabled"] = subscriptions_enabled
+        if history_enabled is not None:
+            sync["history_enabled"] = history_enabled
+        if history_limit is not None:
+            sync["history_limit"] = max(1, min(1000, history_limit))
+        self._save(payload)
+
     def save_youtube_browser(self, browser: str) -> None:
         payload = self._load()
         youtube = payload.setdefault("youtube", {})

@@ -3,7 +3,7 @@ set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 output_directory=${1:-"$repository_root/dist"}
-version=1.4.0
+version=1.6.3
 
 mkdir -p "$output_directory"
 work_directory=$(mktemp -d)

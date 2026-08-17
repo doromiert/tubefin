@@ -727,6 +727,49 @@ class ConfigStoreTests(unittest.TestCase):
                 {"username": "Ada", "color": "#12abef"},
             )
 
+    def test_youtube_sync_settings_default_and_round_trip(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": directory}),
+        ):
+            store = ConfigStore()
+
+            self.assertEqual(
+                store.load_youtube_sync_settings(),
+                {
+                    "subscriptions_enabled": True,
+                    "history_enabled": True,
+                    "history_limit": 100,
+                },
+            )
+
+            store.save_youtube_sync_settings(
+                subscriptions_enabled=False,
+                history_enabled=False,
+                history_limit=250,
+            )
+            store.save_youtube_browser("firefox")
+
+            self.assertEqual(
+                store.load_youtube_sync_settings(),
+                {
+                    "subscriptions_enabled": False,
+                    "history_enabled": False,
+                    "history_limit": 250,
+                },
+            )
+
+    def test_youtube_history_sync_limit_is_clamped(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": directory}),
+        ):
+            store = ConfigStore()
+
+            store.save_youtube_sync_settings(history_limit=5000)
+
+            self.assertEqual(store.load_youtube_sync_settings()["history_limit"], 1000)
+
     def test_clear_all_removes_the_config_file(self) -> None:
         with (
             tempfile.TemporaryDirectory() as directory,
