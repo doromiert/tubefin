@@ -5,6 +5,7 @@
 
 .sidebar-brand {
   font-weight: 700;
+  letter-spacing: -0.03em;
 }
 
 .navigation-sidebar {
@@ -38,8 +39,9 @@
   min-width: 180px;
   min-height: 122px;
   padding: 18px;
-  border-radius: 12px;
+  border-radius: 18px;
   background: alpha(@card_bg_color, 0.72);
+  box-shadow: 0 1px 3px alpha(black, 0.12);
 }
 
 .browse-destination:hover,
@@ -54,15 +56,16 @@
 
 .feature-card {
   padding: 22px;
-  border-radius: 12px;
+  border-radius: 16px;
   background: alpha(@card_bg_color, 0.85);
+  box-shadow: 0 1px 3px alpha(black, 0.12);
 }
 
 .media-card {
   padding: 10px;
   min-width: 250px;
   min-height: 215px;
-  border-radius: 8px;
+  border-radius: 13px;
   background: transparent;
   box-shadow: none;
 }
@@ -103,7 +106,7 @@
 }
 
 .media-card .thumbnail {
-  border-radius: 8px;
+  border-radius: 11px;
   background: mix(@window_bg_color, @window_fg_color, 0.08);
 }
 
@@ -171,7 +174,7 @@
 }
 
 .media-title {
-  font-weight: 600;
+  font-weight: 650;
 }
 
 .duration-badge {

@@ -19,8 +19,15 @@ from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 from tubefin.models import MediaItem, MediaSection  # noqa: E402
 
 
-def labeled_button(label: str, _icon_name: str) -> Gtk.Button:
-    button = Gtk.Button(label=label)
+def icon_label(label: str, icon_name: str) -> Gtk.Widget:
+    content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    content.append(Gtk.Image.new_from_icon_name(icon_name))
+    content.append(Gtk.Label(label=label, xalign=0))
+    return content
+
+
+def labeled_button(label: str, icon_name: str) -> Gtk.Button:
+    button = Gtk.Button(child=icon_label(label, icon_name))
     button.add_css_class("labeled-action")
     button.set_hexpand(False)
     return button
@@ -130,15 +137,13 @@ class MediaCard(Gtk.Box):
         self.add_css_class("media-card")
         self.set_hexpand(expand)
         self.set_valign(Gtk.Align.START)
-        # Keep a useful minimum while allowing single-column layouts to fill
-        # the available width on narrow windows.
+        # Together with the 10px card padding this is an exact 271x235 tile.
         self.set_size_request(self.CONTENT_WIDTH, self.CONTENT_HEIGHT)
         self.set_overflow(Gtk.Overflow.HIDDEN)
         self.set_tooltip_text(item.title)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         content.set_size_request(self.CONTENT_WIDTH, self.CONTENT_HEIGHT)
-        content.set_hexpand(True)
         content.set_overflow(Gtk.Overflow.HIDDEN)
 
         media_overlay = Gtk.Overlay()
@@ -174,7 +179,6 @@ class MediaCard(Gtk.Box):
 
         labels_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
         labels_row.set_size_request(251, 63)
-        labels_row.set_hexpand(True)
         labels_row.set_overflow(Gtk.Overflow.HIDDEN)
         avatar_frame = Gtk.Overlay(width_request=36, height_request=36)
         avatar_frame.set_size_request(36, 36)
@@ -371,6 +375,16 @@ class MediaCard(Gtk.Box):
                 daemon=True,
                 name="channel-avatar-resolver",
             ).start()
+
+    def do_measure(
+        self, orientation: Gtk.Orientation, _for_size: int
+    ) -> tuple[int, int, int, int]:
+        size = (
+            self.CONTENT_WIDTH
+            if orientation == Gtk.Orientation.HORIZONTAL
+            else self.CONTENT_HEIGHT
+        )
+        return size, size, -1, -1
 
     @classmethod
     def _resolve_avatar(

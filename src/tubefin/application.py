@@ -69,6 +69,7 @@ from tubefin.widgets import (  # noqa: E402
     MediaGrid,
     SectionShelf,
     ThumbnailLoader,
+    icon_label,
     labeled_button,
 )
 
@@ -160,7 +161,7 @@ class ConnectionWindow(Adw.Window):
     ) -> None:
         super().__init__(transient_for=parent, modal=True, title="Connect to Jellyfin")
         self.set_default_size(480, 500)
-        self.set_size_request(360, 300)
+        self.set_resizable(False)
 
         toolbar = Adw.ToolbarView()
         self.set_content(toolbar)
@@ -211,8 +212,6 @@ class ConnectionWindow(Adw.Window):
         self.quick_button.set_halign(Gtk.Align.CENTER)
         self.quick_button.connect("clicked", self._quick_clicked, on_quick_connect)
         content.append(self.quick_button)
-        self.set_default_widget(self.quick_button)
-        GLib.idle_add(self.server.grab_focus)
 
         self.quick_status = Gtk.Label(xalign=0, wrap=True, selectable=True)
         self.quick_status.add_css_class("dim-label")
@@ -547,7 +546,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         toolbar.set_size_request(190, -1)
         header = Adw.HeaderBar()
         header.set_show_end_title_buttons(False)
-        title = Gtk.Label(label="TubeFin", xalign=0)
+        title = Gtk.Label(label="tubefin", xalign=0)
         title.add_css_class("sidebar-brand")
         header.set_title_widget(title)
         toolbar.add_top_bar(header)
@@ -568,6 +567,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         for key, title, icon in [
             ("home", "Home", "user-home-symbolic"),
             ("browse", "Browse", "compass2-symbolic"),
+            ("subscriptions", "Subscriptions", "person-symbolic"),
             ("library", "Library", "library-symbolic"),
         ]:
             row = Adw.ActionRow(title=title)
@@ -583,23 +583,29 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.requests_navigation_row.set_visible(self.jellyfin.session is not None)
         self.navigation.append(self.requests_navigation_row)
 
-        self.sidebar_download = Adw.ActionRow(
-            title="Downloads",
-            subtitle="0 items · 0.0 B",
-        )
-        self.sidebar_download.set_name("downloads")
-        self.sidebar_download.add_prefix(
-            Gtk.Image.new_from_icon_name("folder-download-symbolic")
-        )
-        self.sidebar_download_progress = Gtk.ProgressBar(width_request=54)
-        self.sidebar_download_progress.set_valign(Gtk.Align.CENTER)
-        self.sidebar_download_progress.set_visible(False)
-        self.sidebar_download.add_suffix(self.sidebar_download_progress)
-        self.navigation.append(self.sidebar_download)
-        self._refresh_sidebar_downloads()
-
         spacer = Gtk.Box(vexpand=True)
         sidebar.append(spacer)
+
+        self.sidebar_download = Gtk.Button()
+        self.sidebar_download.add_css_class("flat")
+        self.sidebar_download.add_css_class("sidebar-download")
+        self.sidebar_download.set_tooltip_text("Open downloads")
+        self.sidebar_download.connect("clicked", lambda *_: self._select_page("downloads"))
+        download_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        download_title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        download_title_row.append(Gtk.Image.new_from_icon_name("folder-download-symbolic"))
+        self.sidebar_download_title = Gtk.Label(label="Downloads", xalign=0, hexpand=True)
+        download_title_row.append(self.sidebar_download_title)
+        download_row.append(download_title_row)
+        self.sidebar_download_detail = Gtk.Label(xalign=0)
+        self.sidebar_download_detail.add_css_class("caption")
+        self.sidebar_download_detail.add_css_class("dim-label")
+        download_row.append(self.sidebar_download_detail)
+        self.sidebar_download_progress = Gtk.ProgressBar()
+        download_row.append(self.sidebar_download_progress)
+        self.sidebar_download.set_child(download_row)
+        sidebar.append(self.sidebar_download)
+        self._refresh_sidebar_downloads()
 
         # Kept as state for the connection callbacks; account controls live in Settings.
         self.account_row = Adw.ActionRow(title="Jellyfin", subtitle="Not connected")
@@ -655,11 +661,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         menu.append("About TubeFin", "app.about")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("Settings", "win.settings")
-        menu_button = Gtk.MenuButton(
-            icon_name="open-menu-symbolic",
-            menu_model=menu,
-            tooltip_text="Main Menu",
-        )
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
         self.header.pack_end(menu_button)
         self.account_sync_status = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=6
@@ -669,9 +671,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.account_sync_spinner = Gtk.Spinner()
         self.account_sync_status.append(self.account_sync_spinner)
-        self.account_sync_label = Gtk.Label(label="Syncing")
-        self.account_sync_label.add_css_class("caption")
-        self.account_sync_status.append(self.account_sync_label)
         self.account_sync_status.set_visible(False)
         self.header.pack_end(self.account_sync_status)
         watch_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -706,8 +705,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.syncplay_button = self.watch_together_button
         self.header.pack_end(self.watch_together_button)
         self.header.pack_end(self._build_loop_button())
-        self.watch_together_button.set_visible(False)
-        self.loop_button.set_visible(False)
 
         self.content_overlay = Gtk.Overlay()
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1035,20 +1032,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.library_history = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.library_history)
 
-        subscriptions_title = Gtk.Label(
-            label="Channel subscriptions", xalign=0, hexpand=True
-        )
+        subscriptions_title = Gtk.Label(label="Channel subscriptions", xalign=0)
         subscriptions_title.add_css_class("title-2")
-        subscriptions_heading = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
-        )
-        subscriptions_heading.append(subscriptions_title)
-        latest_subscriptions = Gtk.Button(label="Latest Videos")
-        latest_subscriptions.add_css_class("flat")
-        latest_subscriptions.connect(
-            "clicked", lambda *_: self._select_page("subscriptions")
-        )
-        subscriptions_heading.append(latest_subscriptions)
         self.subscription_lookup: dict[str, ChannelSubscription] = {}
         self.subscription_positions: dict[str, int] = {}
         self.subscription_model = Gtk.StringList.new([])
@@ -1167,7 +1152,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.playlists_box.set_row_spacing(18)
         content.append(self.playlists_box)
         self.library_subscriptions_title = subscriptions_title
-        content.append(subscriptions_heading)
+        content.append(subscriptions_title)
         content.append(self.subscription_alphabet_scroller)
         content.append(self.subscription_stack)
 
@@ -1259,8 +1244,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _build_offline_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        responsive = Adw.BreakpointBin(vexpand=True)
-        responsive.set_child(page)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         toolbar.add_css_class("search-strip")
         self.offline_search = Gtk.SearchEntry(placeholder_text="Search offline library")
@@ -1290,13 +1273,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.offline_grid.set_margin_end(18)
         scroller.set_child(self.offline_grid)
         page.append(scroller)
-        narrow = Adw.Breakpoint.new(
-            Adw.BreakpointCondition.parse("max-width: 520px")
-        )
-        narrow.add_setter(toolbar, "orientation", Gtk.Orientation.VERTICAL)
-        narrow.add_setter(self.offline_usage, "halign", Gtk.Align.START)
-        responsive.add_breakpoint(narrow)
-        return responsive
+        return page
 
     def _build_playlists_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2605,11 +2582,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         narrow.add_setter(hero, "orientation", Gtk.Orientation.VERTICAL)
         responsive.add_breakpoint(narrow)
-        compact = Adw.Breakpoint.new(
-            Adw.BreakpointCondition.parse("max-width: 520px")
-        )
-        compact.add_setter(download_row, "orientation", Gtk.Orientation.VERTICAL)
-        responsive.add_breakpoint(compact)
         content.append(responsive)
         self.details_series_loading = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=8
@@ -4455,21 +4427,21 @@ class TubeFinWindow(Adw.ApplicationWindow):
         ]
         self.sidebar_download.set_visible(True)
         if not records:
-            self.sidebar_download.set_title("Downloads")
-            self.sidebar_download.set_subtitle("0 items · 0.0 B")
+            self.sidebar_download_title.set_label("Downloads")
+            self.sidebar_download_detail.set_label("0 items · 0.0 B")
             self.sidebar_download_progress.set_visible(False)
             return
         if active:
             progress = sum(record.progress for record in active) / len(active)
-            self.sidebar_download.set_title(
+            self.sidebar_download_title.set_label(
                 "Downloading video" if len(active) == 1 else f"Downloading {len(active)} videos"
             )
-            self.sidebar_download.set_subtitle(f"{progress:.0f}% complete")
+            self.sidebar_download_detail.set_label(f"{progress:.0f}% complete")
             self.sidebar_download_progress.set_fraction(max(0, min(1, progress / 100)))
             self.sidebar_download_progress.set_visible(True)
         else:
-            self.sidebar_download.set_title("Downloads")
-            self.sidebar_download.set_subtitle(
+            self.sidebar_download_title.set_label("Downloads")
+            self.sidebar_download_detail.set_label(
                 f"{len(records)} items · {self._size_label(self.offline.storage_usage())}"
             )
             self.sidebar_download_progress.set_visible(False)
@@ -5633,7 +5605,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.detail_series_episodes = []
         self.detail_series_generation += 1
         series_generation = self.detail_series_generation
-        self.details_play.set_label("Play")
+        self.details_play.set_child(icon_label("Play", "media-playback-start-symbolic"))
         self._clear_box(self.details_seasons)
         is_series = item.source == "jellyfin" and item.kind == "Series"
         self.details_seasons.set_visible(is_series)
@@ -5703,7 +5675,9 @@ class TubeFinWindow(Adw.ApplicationWindow):
         ]
         self.details_play.set_sensitive(resume is not None)
         if resume and (resume.payload.get("UserData") or {}).get("LastPlayedDate"):
-            self.details_play.set_label("Resume")
+            self.details_play.set_child(
+                icon_label("Resume", "media-playback-start-symbolic")
+            )
         self.details_series_spinner.stop()
         self.details_series_loading.set_visible(False)
         self.details_seasons.set_visible(True)
@@ -9311,7 +9285,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "history",
             "playlist",
         }
-        if name not in {"home", "browse", "library", "requests", "downloads"}:
+        if name not in {"home", "browse", "library", "requests"}:
             self.active_navigation = name
             if current != name:
                 self.syncing_navigation = True
@@ -9324,8 +9298,6 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.home_refresh.set_visible(name == "home")
         self.subs_refresh.set_visible(name == "subscriptions")
-        self.watch_together_button.set_visible(player)
-        self.loop_button.set_visible(player)
         if hasattr(self, "player_header_controls"):
             for control in self.player_header_controls:
                 control.set_visible(player)
@@ -10099,9 +10071,15 @@ class TubeFinWindow(Adw.ApplicationWindow):
         members.append(empty_member)
         content.append(members)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        create_button = Gtk.Button(label="Create SyncTube Room")
-        join_button = Gtk.Button(label="Join Room")
-        disconnect_button = Gtk.Button(label="Leave Room")
+        create_button = Gtk.Button(
+            child=icon_label("Create SyncTube room", "list-add-symbolic")
+        )
+        join_button = Gtk.Button(
+            child=icon_label("Join room", "network-transmit-receive-symbolic")
+        )
+        disconnect_button = Gtk.Button(
+            child=icon_label("Leave room", "network-offline-symbolic")
+        )
 
         def connect(create: bool) -> None:
             client = SyncTubeClient(
@@ -10815,7 +10793,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         for row in getattr(self, "home_order_rows", []):
             group.remove(row)
         self.home_order_rows = []
-        for index, key in enumerate(self.home_section_order):
+        for key in self.home_section_order:
             row = Adw.ActionRow(title=HOME_SECTION_TITLES.get(key, key))
             handle = Gtk.Image.new_from_icon_name("list-drag-handle-symbolic")
             handle.add_css_class("dim-label")
@@ -10830,42 +10808,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             drop_target.set_preload(True)
             drop_target.connect("drop", self._drop_home_section, key)
             row.add_controller(drop_target)
-            move_up = Gtk.Button(
-                icon_name="go-up-symbolic",
-                tooltip_text="Move Up",
-                valign=Gtk.Align.CENTER,
-                sensitive=index > 0,
-            )
-            move_up.connect(
-                "clicked", lambda _button, value=key: self._move_home_section(value, -1)
-            )
-            row.add_suffix(move_up)
-            move_down = Gtk.Button(
-                icon_name="go-down-symbolic",
-                tooltip_text="Move Down",
-                valign=Gtk.Align.CENTER,
-                sensitive=index + 1 < len(self.home_section_order),
-            )
-            move_down.connect(
-                "clicked", lambda _button, value=key: self._move_home_section(value, 1)
-            )
-            row.add_suffix(move_down)
             group.add(row)
             self.home_order_rows.append(row)
-
-    def _move_home_section(self, key: str, offset: int) -> None:
-        try:
-            source = self.home_section_order.index(key)
-        except ValueError:
-            return
-        target = source + offset
-        if not 0 <= target < len(self.home_section_order):
-            return
-        section = self.home_section_order.pop(source)
-        self.home_section_order.insert(target, section)
-        self.config.save_home_section_order(self.home_section_order)
-        self._rebuild_home_sections()
-        self._rebuild_home_order_settings()
 
     @staticmethod
     def _prepare_home_section_drag(
