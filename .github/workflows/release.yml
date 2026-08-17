@@ -5,21 +5,35 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
-  appimage:
-    name: Nix and AppImage
+  # Separate job strictly for validating Nix configuration
+  nix-check:
+    name: Validate Nix Flake
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Validate the flake
+      - name: Validate flake
         run: nix flake check --no-build
+
+  appimage:
+    name: AppImage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
         run: packaging/appimage/build.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: tubefin-appimage
@@ -31,14 +45,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Flatpak tooling
         run: |
           sudo apt-get update
           sudo apt-get install --yes appstream flatpak flatpak-builder
           flatpak remote-add --user --if-not-exists flathub \
             https://flathub.org/repo/flathub.flatpakrepo
+
       - name: Build Flatpak bundle
         run: packaging/flatpak/build.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: tubefin-flatpak
@@ -50,12 +67,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
       - name: Install archive tooling
         run: |
           sudo apt-get update
           sudo apt-get install --yes zstd
+
       - name: Build Arch package
         run: packaging/arch/build.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: tubefin-arch
@@ -65,7 +85,7 @@ jobs:
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [appimage, flatpak, arch]
+    needs: [nix-check, appimage, flatpak, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -74,18 +94,27 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
       - name: Create checksums
         working-directory: dist
         run: sha256sum TubeFin-* tubefin-* > SHA256SUMS
+
       - name: Publish artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          TARGET_FILES=(
+            dist/TubeFin-*.AppImage
+            dist/TubeFin-*.flatpak
+            dist/tubefin-*.pkg.tar.zst
+            dist/SHA256SUMS
+          )
+
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release upload "$GITHUB_REF_NAME" "${TARGET_FILES[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
+            gh release create "$GITHUB_REF_NAME" "${TARGET_FILES[@]}" \
               --title "TubeFin ${GITHUB_REF_NAME#v}" \
               --generate-notes
           fi
