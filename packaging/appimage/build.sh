@@ -16,12 +16,19 @@ mkdir -p "$appdir/usr/lib/tubefin" "$appdir/usr/bin" "$appdir/usr/share/applicat
 cp -a "$repository_root/src/tubefin" "$appdir/usr/lib/tubefin/"
 find "$appdir/usr/lib/tubefin" -type d -name __pycache__ -prune -exec rm -rf {} +
 
+# 2. Vendor python dependencies directly into the AppDir
+python3 -m pip install \
+  --target="$appdir/usr/lib/tubefin" \
+  --break-system-packages \
+  --no-cache-dir \
+  websocket-client python-mpv yt-dlp
+
 install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.desktop" "$appdir/usr/share/applications/io.github.doromiert.TubeFin.desktop"
 install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg"
 cp "$repository_root/data/io.github.doromiert.TubeFin.svg" "$appdir/io.github.doromiert.TubeFin.svg"
 cp "$repository_root/data/io.github.doromiert.TubeFin.desktop" "$appdir/io.github.doromiert.TubeFin.desktop"
 
-# 2. Launcher entrypoint (uses host system Python/GTK/GStreamer seamlessly)
+# 3. Launcher entrypoint
 cat << 'EOF' > "$appdir/AppRun"
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "${0}")")"
@@ -30,11 +37,7 @@ exec python3 -m tubefin "$@"
 EOF
 chmod +x "$appdir/AppRun"
 
-# 3. Fetch appimagetool and assemble
-wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O "$work_directory/appimagetool"
-chmod +x "$work_directory/appimagetool"
-
-# Fetch appimagetool and assemble with explicit ARCH set
+# 4. Fetch appimagetool and bundle
 wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O "$work_directory/appimagetool"
 chmod +x "$work_directory/appimagetool"
 
