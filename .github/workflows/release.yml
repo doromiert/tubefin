@@ -5,6 +5,9 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -21,19 +24,10 @@ jobs:
       - name: Validate the flake
         run: nix flake check --no-build
 
-      - name: Build binary with Nix
-        run: nix build .#default -o result
-
-      - name: Package AppImage on Host
+      - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
-        run: |
-          # Fetch appimagetool on host to avoid nix glvnd/driver isolation traps
-          sudo wget https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
-          sudo chmod +x /usr/local/bin/appimagetool
-          
-          # Hand off to your script (ensure it pulls from ./result and uses host appimagetool)
-          packaging/appimage/build.sh
+        run: packaging/appimage/build.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -66,21 +60,16 @@ jobs:
   arch:
     name: Arch Linux package
     runs-on: ubuntu-24.04
-    # Run natively in Arch container to avoid corrupted libarchive/zstd metadata from host ubuntu
-    container:
-      image: archlinux:base-devel
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Arch build environment
+      - name: Install archive tooling
         run: |
-          pacman -Syu --noconfirm git libarchive zstd
-          # makepkg refuses to run as root
-          useradd builder -m
-          chown -R builder:builder .
+          sudo apt-get update
+          sudo apt-get install --yes zstd
 
       - name: Build Arch package
-        run: su builder -c "packaging/arch/build.sh"
+        run: packaging/arch/build.sh
 
       - uses: actions/upload-artifact@v4
         with:
