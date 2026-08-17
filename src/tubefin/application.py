@@ -453,6 +453,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.browse_search_results = False
         self.browse_cache: dict[str, tuple[float, list[MediaItem]]] = {}
         self.channel_cache: dict[str, tuple[float, ChannelDetails]] = {}
+        self.subs_feed_channel_url = ""
+        self.subs_feed_channel_id = ""
+        self.subs_feed_loading = False
+        self.subs_feed_generation = 0
+        self.subs_feed_next = 1
+        self.subs_feed_page = 1
+        self.subs_feed_has_more = False
+        self.subs_feed_loaded_once = False
+        self.subs_feed_items: list[MediaItem] = []
+        self.subs_feed_cache: dict[str, dict[str, Any]] = {}
+        self.subs_rail_positions: dict[str, int] = {}
+        self.subs_rail_tiles: dict[str, Gtk.Widget] = {}
         self.recommendation_shelf: SectionShelf | None = None
         self.recommendation_items: list[MediaItem] = []
         self.recommendation_next = 1
@@ -543,6 +555,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         for key, title, icon in [
             ("home", "Home", "user-home-symbolic"),
             ("browse", "Browse", "compass2-symbolic"),
+            ("subscriptions", "Subscriptions", "person-symbolic"),
             ("library", "Library", "library-symbolic"),
         ]:
             row = Adw.ActionRow(title=title)
@@ -624,6 +637,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.home_refresh.connect("clicked", lambda *_: self._refresh_home())
         self.header.pack_start(self.home_refresh)
+        self.subs_refresh = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text="Refresh subscriptions",
+            visible=False,
+        )
+        self.subs_refresh.connect("clicked", lambda *_: self._refresh_subscriptions_view())
+        self.header.pack_start(self.subs_refresh)
 
         menu = Gio.Menu()
         menu.append("About TubeFin", "app.about")
@@ -697,6 +717,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.pages.add_named(self._build_home_page(), "home")
         self.pages.add_named(self._build_browse_page(), "browse")
         self.pages.add_named(self._build_browse_category_page(), "browse-category")
+        self.pages.add_named(self._build_subscriptions_page(), "subscriptions")
         self.pages.add_named(self._build_library_page(), "library")
         self.pages.add_named(self._build_requests_page(), "requests")
         self.pages.add_named(self._build_offline_page(), "downloads")
@@ -1423,6 +1444,354 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         page.append(self.channel_grid)
         return page
+
+    def _build_subscriptions_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        header.add_css_class("subscriptions-header")
+        header.set_margin_top(10)
+        header.set_margin_start(14)
+        header.set_margin_end(14)
+
+        alphabet = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        alphabet.add_css_class("channel-alphabet-rail")
+        for letter in ("#", *"ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+            jump = Gtk.Button(label=letter, tooltip_text=f"Jump to {letter}")
+            jump.add_css_class("flat")
+            jump.add_css_class("alphabet-jump")
+            jump.connect(
+                "clicked",
+                lambda _button, value=letter: self._jump_to_subscription_rail(value),
+            )
+            alphabet.append(jump)
+        alphabet_scroller = Gtk.ScrolledWindow()
+        alphabet_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        alphabet_scroller.set_child(alphabet)
+        alphabet_scroller.set_hexpand(True)
+        alphabet_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        alphabet_row.append(alphabet_scroller)
+        self.subs_more_spinner = Gtk.Spinner(tooltip_text="Loading more videos")
+        self.subs_more_spinner.set_valign(Gtk.Align.CENTER)
+        self.subs_more_spinner.set_visible(False)
+        alphabet_row.append(self.subs_more_spinner)
+        header.append(alphabet_row)
+
+        self.subs_rail = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.subs_rail.add_css_class("subscription-rail")
+        self.subs_rail_scroller = Gtk.ScrolledWindow()
+        self.subs_rail_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER
+        )
+        self.subs_rail_scroller.set_child(self.subs_rail)
+        header.append(self.subs_rail_scroller)
+
+        page.append(header)
+
+        self.subscriptions_grid = MediaGrid(
+            self.thumbnails,
+            self._activate_item,
+            self._add_to_queue,
+            self._prebuffer_item,
+            self._add_to_queue_next,
+            self._save_item,
+            self._watch_later,
+            avatar_resolver=self.youtube.channel_avatar,
+            on_download=self._download_item,
+            on_mark_watched=self._mark_watched,
+            on_share=self._share_item,
+        )
+        self.subscriptions_grid.scroller.get_vadjustment().connect(
+            "value-changed", self._subscriptions_feed_scrolled
+        )
+        page.append(self.subscriptions_grid)
+        return page
+
+    def _open_subscriptions_view(self) -> None:
+        self._populate_subscriptions_rail()
+        if not self.subs_feed_loaded_once:
+            self._select_subscription_feed_channel("", "", "All")
+
+    def _refresh_subscriptions_view(self) -> None:
+        self.subs_feed_cache.clear()
+        self._populate_subscriptions_rail()
+        channel_id = self.subs_feed_channel_id
+        url = self.subs_feed_channel_url
+        self._select_subscription_feed_channel(channel_id, url, "")
+
+    def _make_subscription_rail_tile(
+        self, channel_id: str, title: str, url: str, avatar_url: str, *, is_all: bool
+    ) -> Gtk.Button:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_size_request(96, -1)
+        avatar_frame = Gtk.Overlay(width_request=56, height_request=56)
+        avatar_frame.set_size_request(56, 56)
+        avatar_frame.set_halign(Gtk.Align.CENTER)
+        avatar_frame.set_overflow(Gtk.Overflow.HIDDEN)
+        avatar_frame.add_css_class("channel-avatar")
+        fallback = Gtk.Image.new_from_icon_name(
+            "view-grid-symbolic" if is_all else "avatar-default-symbolic"
+        )
+        fallback.set_pixel_size(28)
+        avatar_frame.set_child(fallback)
+        box.append(avatar_frame)
+        label = Gtk.Label(
+            label=title,
+            ellipsize=Pango.EllipsizeMode.END,
+            max_width_chars=11,
+            justify=Gtk.Justification.CENTER,
+        )
+        label.add_css_class("caption")
+        box.append(label)
+        button = Gtk.Button(child=box)
+        button.add_css_class("flat")
+        button.add_css_class("subscription-rail-tile")
+        button.connect(
+            "clicked",
+            lambda *_a: self._select_subscription_feed_channel(channel_id, url, title),
+        )
+        self.subs_rail_tiles[channel_id or "__all__"] = button
+        if not is_all:
+            if avatar_url and url:
+                self.youtube.remember_channel_avatar(url, avatar_url)
+            avatar = Gtk.Picture(width_request=56, height_request=56)
+            avatar.set_size_request(56, 56)
+            avatar.set_content_fit(Gtk.ContentFit.COVER)
+            avatar.set_visible(False)
+            avatar_frame.add_overlay(avatar)
+            if avatar_url:
+                self.thumbnails.load(
+                    avatar_url, lambda path: self._set_rail_tile_avatar(avatar, path)
+                )
+            elif url:
+                run_async(
+                    lambda link=url: self.youtube.channel_avatar(link),
+                    lambda link: self._load_rail_tile_avatar(avatar, link),
+                    lambda _error: None,
+                )
+        return button
+
+    def _set_rail_tile_avatar(self, avatar: Gtk.Picture, path: object) -> bool:
+        if path:
+            avatar.set_filename(str(path))
+            avatar.set_visible(True)
+        return GLib.SOURCE_REMOVE
+
+    def _load_rail_tile_avatar(self, avatar: Gtk.Picture, url: str | None) -> bool:
+        if url:
+            self.thumbnails.load(
+                url, lambda path: self._set_rail_tile_avatar(avatar, path)
+            )
+        return GLib.SOURCE_REMOVE
+
+    def _populate_subscriptions_rail(self) -> None:
+        child = self.subs_rail.get_first_child()
+        while child:
+            following = child.get_next_sibling()
+            self.subs_rail.remove(child)
+            child = following
+        self.subs_rail_positions = {}
+        self.subs_rail_tiles = {}
+        self.subs_rail.append(
+            self._make_subscription_rail_tile("", "All", "", "", is_all=True)
+        )
+        subscriptions = sorted(
+            self.subscriptions.list(), key=lambda sub: sub.title.casefold()
+        )
+        for index, subscription in enumerate(subscriptions):
+            first = subscription.title[:1].upper()
+            letter = first if "A" <= first <= "Z" else "#"
+            self.subs_rail_positions.setdefault(letter, index + 1)
+            self.subs_rail.append(
+                self._make_subscription_rail_tile(
+                    subscription.channel_id,
+                    subscription.title,
+                    subscription.url,
+                    subscription.avatar_url,
+                    is_all=False,
+                )
+            )
+        self._refresh_subscription_rail_selection()
+
+    def _refresh_subscription_rail_selection(self) -> None:
+        active = self.subs_feed_channel_id or "__all__"
+        for key, tile in self.subs_rail_tiles.items():
+            if key == active:
+                tile.add_css_class("selected")
+            else:
+                tile.remove_css_class("selected")
+
+    def _select_subscription_feed_channel(
+        self, channel_id: str, url: str, _title: str
+    ) -> None:
+        self.subs_feed_channel_id = channel_id
+        self.subs_feed_channel_url = url
+        self.subs_feed_loaded_once = True
+        self.subs_feed_generation += 1
+        self.subs_feed_loading = False
+        self._refresh_subscription_rail_selection()
+        cached = self.subs_feed_cache.get(channel_id or "__all__")
+        if cached:
+            self.subs_feed_items = list(cached["items"])
+            self.subs_feed_next = cached["next"]
+            self.subs_feed_page = cached["page"]
+            self.subs_feed_has_more = cached["has_more"]
+            self.subscriptions_grid.set_items(self.subs_feed_items)
+            return
+        self.subs_feed_items = []
+        self.subs_feed_next = 1
+        self.subs_feed_page = 1
+        self.subs_feed_has_more = False
+        self.subscriptions_grid.set_loading("Loading…")
+        self._load_subscriptions_feed(reset=True)
+
+    def _store_subs_feed_cache(self) -> None:
+        self.subs_feed_cache[self.subs_feed_channel_id or "__all__"] = {
+            "items": list(self.subs_feed_items),
+            "next": self.subs_feed_next,
+            "page": self.subs_feed_page,
+            "has_more": self.subs_feed_has_more,
+        }
+
+    def _load_subscriptions_feed(self, *, reset: bool) -> None:
+        if self.subs_feed_loading:
+            return
+        self.subs_feed_loading = True
+        if not reset:
+            self.subs_more_spinner.set_visible(True)
+            self.subs_more_spinner.start()
+        generation = self.subs_feed_generation
+        if self.subs_feed_channel_url:
+            page = 1 if reset else self.subs_feed_page + 1
+            url = self.subs_feed_channel_url
+            run_async(
+                lambda: self.youtube.channel(url, page=page),
+                lambda channel: self._subs_channel_loaded(
+                    generation, page, reset, channel
+                ),
+                lambda error: self._subs_feed_error(generation, reset, error),
+            )
+        else:
+            start = 1 if reset else self.subs_feed_next
+            page_size = 48
+            run_async(
+                lambda: self.youtube.personal_feed_page(
+                    "subscriptions", start, page_size
+                ),
+                lambda items: self._subs_aggregate_loaded(
+                    generation, start, page_size, reset, items
+                ),
+                lambda error: self._subs_feed_error(generation, reset, error),
+            )
+
+    def _subs_aggregate_loaded(
+        self,
+        generation: int,
+        start: int,
+        page_size: int,
+        reset: bool,
+        items: list[MediaItem],
+    ) -> bool:
+        self._stop_subs_more_spinner()
+        if generation != self.subs_feed_generation:
+            return GLib.SOURCE_REMOVE
+        self.subs_feed_loading = False
+        if reset and not items:
+            self.subscriptions_grid.set_status(
+                "avatar-default-symbolic",
+                "No subscription videos",
+                "Sign in to YouTube to see the latest from channels you follow.",
+            )
+            self.subs_feed_has_more = False
+            return GLib.SOURCE_REMOVE
+        if reset:
+            self.subs_feed_items = list(items)
+            self.subscriptions_grid.set_items(items)
+        else:
+            self.subs_feed_items.extend(items)
+            self.subscriptions_grid.append_items(items)
+        self.subs_feed_next = start + len(items)
+        self.subs_feed_has_more = len(items) >= page_size
+        self._store_subs_feed_cache()
+        return GLib.SOURCE_REMOVE
+
+    def _subs_channel_loaded(
+        self, generation: int, page: int, reset: bool, channel: ChannelDetails
+    ) -> bool:
+        self._stop_subs_more_spinner()
+        if generation != self.subs_feed_generation:
+            return GLib.SOURCE_REMOVE
+        self.subs_feed_loading = False
+        self.subs_feed_page = page
+        self.subs_feed_has_more = channel.continuation is not None
+        if reset and not channel.videos:
+            self.subscriptions_grid.set_status(
+                "avatar-default-symbolic",
+                "No videos",
+                f"{channel.title} hasn't posted any videos yet.",
+            )
+            return GLib.SOURCE_REMOVE
+        if reset:
+            self.subs_feed_items = list(channel.videos)
+            self.subscriptions_grid.set_items(channel.videos)
+        else:
+            self.subs_feed_items.extend(channel.videos)
+            self.subscriptions_grid.append_items(channel.videos)
+        self._store_subs_feed_cache()
+        return GLib.SOURCE_REMOVE
+
+    def _subs_feed_error(
+        self, generation: int, reset: bool, error: Exception
+    ) -> bool:
+        self._stop_subs_more_spinner()
+        if generation != self.subs_feed_generation:
+            return GLib.SOURCE_REMOVE
+        self.subs_feed_loading = False
+        if reset:
+            self._grid_error(self.subscriptions_grid, error)
+        else:
+            self.toast_overlay.add_toast(Adw.Toast(title=str(error)))
+        return GLib.SOURCE_REMOVE
+
+    def _stop_subs_more_spinner(self) -> None:
+        self.subs_more_spinner.stop()
+        self.subs_more_spinner.set_visible(False)
+
+    def _subscriptions_feed_scrolled(self, adjustment: Gtk.Adjustment) -> None:
+        if (
+            self.subs_feed_has_more
+            and not self.subs_feed_loading
+            and adjustment.get_value() + adjustment.get_page_size()
+            >= adjustment.get_upper() - 320
+        ):
+            self._load_subscriptions_feed(reset=False)
+
+    def _jump_to_subscription_rail(self, letter: str) -> None:
+        position = self._alphabet_position(self.subs_rail_positions, letter)
+        if position is None:
+            return
+        child = self.subs_rail.get_first_child()
+        for _ in range(position):
+            if child is None:
+                return
+            child = child.get_next_sibling()
+        if child is None:
+            return
+
+        def scroll() -> bool:
+            adjustment = self.subs_rail_scroller.get_hadjustment()
+            allocation = child.get_allocation()
+            target = max(
+                adjustment.get_lower(),
+                min(
+                    float(allocation.x),
+                    adjustment.get_upper() - adjustment.get_page_size(),
+                ),
+            )
+            adjustment.set_value(target)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(scroll)
 
     def _build_jellyfin_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2168,6 +2537,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 ),
             ),
             "library": ("Library", "History, subscriptions, and playlists"),
+            "subscriptions": ("Subscriptions", "Latest from channels you follow"),
             "requests": ("Requests", "Search and request from Seerr"),
             "downloads": ("Downloads", "Offline videos and active transfers"),
         }
@@ -2202,6 +2572,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self.global_search.grab_focus)
         elif name == "library":
             self._load_library()
+        elif name == "subscriptions":
+            self._open_subscriptions_view()
         elif name == "downloads":
             self._load_offline()
 
@@ -8493,6 +8865,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             and (bool(self.navigation_history) or name == "browse-category")
         )
         self.home_refresh.set_visible(name == "home")
+        self.subs_refresh.set_visible(name == "subscriptions")
         if hasattr(self, "player_header_controls"):
             for control in self.player_header_controls:
                 control.set_visible(player)

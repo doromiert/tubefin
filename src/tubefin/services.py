@@ -49,6 +49,56 @@ class ContentUnavailableError(ServiceError):
         self.availability = availability
 
 
+class ChannelAvatarCache:
+    """Persistent channel-URL -> avatar-image-URL map shared across the UI.
+
+    One store backs the channel page, subscription filters, and every video
+    card, so a channel's avatar is resolved at most once and survives restarts.
+    """
+
+    def __init__(self) -> None:
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        self.path = cache_root / "tubefin" / "channel-avatars.json"
+        self._lock = threading.Lock()
+        self._resolved: dict[str, str] = {}
+        self._missing: set[str] = set()
+        with suppress(OSError, ValueError):
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._resolved = {str(k): str(v) for k, v in data.items() if v}
+
+    @staticmethod
+    def key(channel_url: str) -> str:
+        return (channel_url or "").rstrip("/")
+
+    def get(self, channel_url: str) -> str | None:
+        return self._resolved.get(self.key(channel_url))
+
+    def known_missing(self, channel_url: str) -> bool:
+        return self.key(channel_url) in self._missing
+
+    def put(self, channel_url: str, avatar_url: str | None) -> None:
+        key = self.key(channel_url)
+        if not key:
+            return
+        with self._lock:
+            if avatar_url:
+                if self._resolved.get(key) == avatar_url:
+                    return
+                self._resolved[key] = avatar_url
+                self._missing.discard(key)
+                self._save_locked()
+            else:
+                self._missing.add(key)
+
+    def _save_locked(self) -> None:
+        with suppress(OSError):
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._resolved), encoding="utf-8")
+            tmp.replace(self.path)
+
+
 class YouTubeService:
     PERSONAL_FEEDS = {
         "home": "https://www.youtube.com/",
@@ -61,7 +111,9 @@ class YouTubeService:
     def __init__(self, browser: str = "") -> None:
         self.executable = shutil.which("yt-dlp")
         self.browser = browser
-        self.avatar_cache: dict[str, str | None] = {}
+        self.avatar_cache = ChannelAvatarCache()
+        self._avatar_locks: dict[str, threading.Lock] = {}
+        self._avatar_locks_guard = threading.Lock()
         self.cookie_snapshot_directory = tempfile.TemporaryDirectory(
             prefix="tubefin-youtube-cookies-"
         )
@@ -574,7 +626,25 @@ class YouTubeService:
             url,
         ]
         data = self._run(*arguments)
-        return [self._item(entry) for entry in data.get("entries") or [] if entry]
+        return [
+            self._item(entry)
+            for entry in data.get("entries") or []
+            if entry and not self._is_mix_entry(entry)
+        ]
+
+    @classmethod
+    def _is_mix_entry(cls, entry: dict[str, Any]) -> bool:
+        """Detect YouTube auto-generated Mix/radio playlists that fail to play."""
+        if entry.get("_type") == "playlist":
+            return True
+        entry_id = str(entry.get("id", ""))
+        if entry_id.startswith("RD"):
+            return True
+        for value in (entry.get("url"), entry.get("webpage_url")):
+            playlist_id = cls.playlist_id_from_url(str(value or ""))
+            if playlist_id and playlist_id.startswith("RD"):
+                return True
+        return False
 
     def download_options(
         self, item: MediaItem
@@ -1287,24 +1357,55 @@ class YouTubeService:
 
         return walk(data)
 
+    def remember_channel_avatar(self, channel_url: str, avatar_url: str | None) -> None:
+        """Seed the shared avatar cache from data we already have (feeds, subs)."""
+        if channel_url and avatar_url:
+            self.avatar_cache.put(channel_url, avatar_url)
+
+    def _avatar_lock(self, key: str) -> threading.Lock:
+        with self._avatar_locks_guard:
+            lock = self._avatar_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._avatar_locks[key] = lock
+            return lock
+
     def channel_avatar(self, channel_url: str) -> str | None:
-        if channel_url in self.avatar_cache:
-            return self.avatar_cache[channel_url]
-        request = urllib.request.Request(
-            channel_url,
-            headers={"User-Agent": "Mozilla/5.0 TubeFin/0.1", "Accept-Language": "en"},
-        )
-        avatar = None
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                page = response.read(4 * 1024 * 1024).decode("utf-8", errors="ignore")
-            match = re.search(r'"avatar":\{"thumbnails":\[\{"url":"([^"]+)', page)
-            if match:
-                avatar = json.loads(f'"{match.group(1)}"')
-        except (OSError, ValueError, urllib.error.URLError, TimeoutError):
-            pass
-        self.avatar_cache[channel_url] = avatar
-        return avatar
+        cached = self.avatar_cache.get(channel_url)
+        if cached:
+            return cached
+        if self.avatar_cache.known_missing(channel_url):
+            return None
+        # Serialize concurrent resolves for the same channel so a feed full of
+        # its videos triggers a single page fetch instead of one per card.
+        with self._avatar_lock(ChannelAvatarCache.key(channel_url)):
+            cached = self.avatar_cache.get(channel_url)
+            if cached:
+                return cached
+            if self.avatar_cache.known_missing(channel_url):
+                return None
+            request = urllib.request.Request(
+                channel_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 TubeFin/0.1",
+                    "Accept-Language": "en",
+                },
+            )
+            avatar = None
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    page = response.read(4 * 1024 * 1024).decode(
+                        "utf-8", errors="ignore"
+                    )
+                match = re.search(
+                    r'"avatar":\{"thumbnails":\[\{"url":"([^"]+)', page
+                )
+                if match:
+                    avatar = json.loads(f'"{match.group(1)}"')
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+                pass
+            self.avatar_cache.put(channel_url, avatar)
+            return avatar
 
     def resolve_fast(self, item: MediaItem) -> ResolvedStream:
         """Resolve one progressive stream while avoiding nonessential manifests."""
@@ -1785,6 +1886,7 @@ class YouTubeService:
             or extracted_avatar
             or self.channel_avatar(channel_url)
         )
+        self.remember_channel_avatar(channel_url, avatar)
         videos: list[MediaItem] = []
         for entry in entries[:page_size]:
             item = self._item(entry)

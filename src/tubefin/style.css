@@ -222,6 +222,23 @@
   min-height: 44px;
 }
 
+.subscription-rail {
+  padding: 4px 2px 8px 2px;
+}
+
+.subscription-rail-tile {
+  padding: 6px 4px;
+  border-radius: 10px;
+}
+
+.subscription-rail-tile.selected {
+  background: alpha(@accent_bg_color, 0.18);
+}
+
+.subscription-rail-tile.selected .channel-avatar {
+  box-shadow: 0 0 0 2px @accent_bg_color;
+}
+
 .content-header-background {
   min-height: 47px;
   background: transparent;
