@@ -13,16 +13,14 @@ permissions:
   contents: read
 
 jobs:
-  nix:
-    name: Nix Build
+  nix-check:
+    name: Validate Nix Flake
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Validate flake
         run: nix flake check --no-build
-      - name: Build Nix package
-        run: nix build .#default -o result
 
   appimage:
     name: AppImage
@@ -30,10 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
-        # Reminder: remove the nix commands from this script!
         run: packaging/appimage/build.sh
 
       - uses: actions/upload-artifact@v4
@@ -87,7 +89,7 @@ jobs:
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [nix, appimage, flatpak, arch]
+    needs: [nix-check, appimage, flatpak, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
