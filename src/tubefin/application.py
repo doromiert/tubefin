@@ -440,19 +440,30 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.syncing_navigation = False
         self.queue: list[MediaItem] = []
         self.queue_index = -1
-        self.queue_loop = False
+        self.loop_mode = "off"  # "off" | "queue" | "video"
+        self.syncing_loop_controls = False
+        self.queue_loop_toggle: Gtk.ToggleButton | None = None
         self.comment_cursor: str | None = None
         self.comments_loading = False
         self.subscription_updates_loading = False
         self.channel_page = 1
         self.channel_loading = False
+        self.channel_request_id = 0
         self.channel_has_more = False
         self.channel_url = ""
+        self.channel_open_url = ""
+        self.channel_tab = "videos"
+        self.channel_empty_tabs: dict[str, set[str]] = {}
+        self.syncing_channel_filter = False
         self.current_channel: ChannelDetails | None = None
         self.syncing_subscription_controls = False
+        self.search_filter = "videos"
+        self.search_request_id = 0
+        self.search_query = ""
+        self.syncing_search_filter = False
         self.browse_search_results = False
         self.browse_cache: dict[str, tuple[float, list[MediaItem]]] = {}
-        self.channel_cache: dict[str, tuple[float, ChannelDetails]] = {}
+        self.channel_cache: dict[tuple[str, str], tuple[float, ChannelDetails]] = {}
         self.subs_feed_channel_url = ""
         self.subs_feed_channel_id = ""
         self.subs_feed_loading = False
@@ -692,6 +703,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         # Compatibility alias for existing state updates and smoke checks.
         self.syncplay_button = self.watch_together_button
         self.header.pack_end(self.watch_together_button)
+        self.header.pack_end(self._build_loop_button())
 
         self.content_overlay = Gtk.Overlay()
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -971,6 +983,21 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.jellyfin_grid = self.youtube_grid
         self.youtube_grid.status.set_visible(False)
+        self.search_filter_bar, self.search_filter_buttons = self._build_filter_bar(
+            [
+                ("videos", "Videos"),
+                ("channels", "Channels"),
+                ("playlists", "Playlists"),
+            ],
+            self.search_filter,
+            self._search_filter_changed,
+        )
+        self.search_filter_bar.set_halign(Gtk.Align.CENTER)
+        self.search_filter_bar.set_margin_start(12)
+        self.search_filter_bar.set_margin_top(6)
+        self.search_filter_bar.set_margin_bottom(6)
+        self.search_filter_bar.set_visible(False)
+        page.append(self.search_filter_bar)
         browse_results = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=8, vexpand=True
         )
@@ -1369,6 +1396,38 @@ class TubeFinWindow(Adw.ApplicationWindow):
         content.append(self.account_grid)
         return content
 
+    def _build_filter_bar(
+        self,
+        options: list[tuple[str, str]],
+        active: str,
+        on_change,
+    ) -> tuple[Gtk.Box, dict[str, Gtk.ToggleButton]]:
+        """Build a linked segmented control. Returns the bar and value→button map."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        bar.add_css_class("linked")
+        bar.add_css_class("filter-bar")
+        buttons: dict[str, Gtk.ToggleButton] = {}
+        group: Gtk.ToggleButton | None = None
+        for value, label in options:
+            button = Gtk.ToggleButton(label=label)
+            button.add_css_class("filter-bar-button")
+            if group is None:
+                group = button
+            else:
+                button.set_group(group)
+            button.set_active(value == active)
+            button.connect("toggled", self._filter_bar_toggled, value, on_change)
+            bar.append(button)
+            buttons[value] = button
+        return bar, buttons
+
+    def _filter_bar_toggled(
+        self, button: Gtk.ToggleButton, value: str, on_change
+    ) -> None:
+        if not button.get_active():
+            return
+        on_change(value)
+
     def _build_channel_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -1425,6 +1484,21 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.channel_more_spinner.set_visible(False)
         heading.append(self.channel_more_spinner)
         page.append(heading)
+        channel_filter_bar, self.channel_filter_buttons = self._build_filter_bar(
+            [
+                ("videos", "Videos"),
+                ("playlists", "Playlists"),
+                ("releases", "Releases"),
+            ],
+            self.channel_tab,
+            self._channel_filter_changed,
+        )
+        channel_filter_bar.set_halign(Gtk.Align.CENTER)
+        channel_filter_bar.set_margin_start(12)
+        channel_filter_bar.set_margin_end(12)
+        channel_filter_bar.set_margin_bottom(6)
+        self.channel_filter_bar = channel_filter_bar
+        page.append(channel_filter_bar)
         self.channel_grid = MediaGrid(
             self.thumbnails,
             self._activate_item,
@@ -1854,15 +1928,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         self.player_live_chat_button.connect("toggled", self._toggle_player_live_chat)
         self.header.pack_end(self.player_live_chat_button)
-        self.queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.queue_box.set_margin_top(10)
-        self.queue_box.set_margin_bottom(10)
-        self.queue_box.set_margin_start(10)
-        self.queue_box.set_margin_end(10)
-        queue_popover = Gtk.Popover(child=self.queue_box)
-        self.queue_button = Gtk.MenuButton(
-            icon_name="view-list-symbolic", tooltip_text="Queue", popover=queue_popover
+        self.queue_button = Gtk.ToggleButton(
+            icon_name="view-list-symbolic", tooltip_text="Queue"
         )
+        self.queue_button.connect("toggled", self._queue_button_toggled)
         self.header.pack_end(self.queue_button)
         self.player_header_controls = [
             back,
@@ -2168,6 +2237,58 @@ class TubeFinWindow(Adw.ApplicationWindow):
         live_chat_input.append(self.live_chat_send)
         live_chat_content.append(live_chat_input)
         self.content_overlay.add_overlay(self.player_live_chat_panel)
+
+        self.player_queue_panel = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=0,
+            width_request=self.player_sidebar_width,
+        )
+        self.player_queue_panel.add_css_class("queue-sidebar")
+        self.player_queue_panel.set_halign(Gtk.Align.END)
+        self.player_queue_panel.set_valign(Gtk.Align.FILL)
+        self.player_queue_panel.set_vexpand(True)
+        self.player_queue_panel.set_visible(False)
+        queue_resize = self._player_sidebar_resize_handle()
+        self.player_queue_panel.append(queue_resize)
+        queue_content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True
+        )
+        queue_content.add_css_class("player-sidebar-content")
+        self.player_queue_panel.append(queue_content)
+        queue_heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        queue_title = Gtk.Label(label="Queue", xalign=0, hexpand=True)
+        queue_title.add_css_class("title-2")
+        queue_heading.append(queue_title)
+        queue_close = Gtk.Button(
+            icon_name="window-close-symbolic", tooltip_text="Close queue"
+        )
+        queue_close.add_css_class("flat")
+        queue_close.connect("clicked", lambda *_: self._close_player_sidebar())
+        queue_heading.append(queue_close)
+        queue_content.append(queue_heading)
+        queue_scroller = Gtk.ScrolledWindow(vexpand=True)
+        queue_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.queue_list = Gtk.ListBox()
+        self.queue_list.add_css_class("queue-list")
+        self.queue_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        list_drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        list_drop.set_preload(True)
+        list_drop.connect("drop", self._drop_queue_at_end)
+        self.queue_list.add_controller(list_drop)
+        queue_scroller.set_child(self.queue_list)
+        queue_content.append(queue_scroller)
+        self.queue_clear_button = Gtk.Button()
+        self.queue_clear_button.set_child(
+            Adw.ButtonContent(
+                label="Clear queue", icon_name="edit-clear-all-symbolic"
+            )
+        )
+        self.queue_clear_button.add_css_class("destructive-action")
+        self.queue_clear_button.set_hexpand(True)
+        self.queue_clear_button.connect("clicked", lambda *_: self._clear_queue())
+        queue_content.append(self.queue_clear_button)
+        self.content_overlay.add_overlay(self.player_queue_panel)
+
         self.player_playback_row = playback
         player_content.append(playback)
         self.player_inline_controls_host = Gtk.Box(
@@ -2278,6 +2399,15 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._refresh_queue()
         return page
 
+    def _queue_button_toggled(self, button: Gtk.ToggleButton) -> None:
+        visible = button.get_active()
+        if visible and self.player_comments_button.get_active():
+            self.player_comments_button.set_active(False)
+        if visible and self.player_live_chat_button.get_active():
+            self.player_live_chat_button.set_active(False)
+        self.player_queue_panel.set_visible(visible)
+        self._update_player_sidebar_layout()
+
     def _close_player_sidebar(self) -> None:
         self.player_navigation_guard_until = time.monotonic() + 0.75
         self.syncing_navigation = True
@@ -2289,6 +2419,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.player_comments_button.set_active(False)
         elif self.player_live_chat_panel.get_visible():
             self.player_live_chat_button.set_active(False)
+        elif self.player_queue_panel.get_visible():
+            self.queue_button.set_active(False)
 
     def _player_sidebar_resize_handle(self) -> Gtk.Widget:
         handle = Gtk.Box(width_request=10)
@@ -2313,7 +2445,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_sidebar_width = max(
             PLAYER_SIDEBAR_MIN_WIDTH, min(width, page_width - 80)
         )
-        for panel in (self.player_comments_panel, self.player_live_chat_panel):
+        for panel in (
+            self.player_comments_panel,
+            self.player_live_chat_panel,
+            self.player_queue_panel,
+        ):
             panel.set_size_request(self.player_sidebar_width, -1)
         self._comment_text_changed()
         self._update_player_sidebar_layout()
@@ -2322,6 +2458,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         visible = self.player_page_active and (
             self.player_comments_panel.get_visible()
             or self.player_live_chat_panel.get_visible()
+            or self.player_queue_panel.get_visible()
         )
         page_width = self.player_page_overlay.get_width()
         if page_width > 0:
@@ -2331,6 +2468,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 for panel in (
                     self.player_comments_panel,
                     self.player_live_chat_panel,
+                    self.player_queue_panel,
                 ):
                     panel.set_size_request(self.player_sidebar_width, -1)
         self.header_sidebar_background.set_size_request(
@@ -2502,7 +2640,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _navigation_changed(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if not row or self.syncing_navigation:
             return
-        if self.player_expanded and time.monotonic() < self.player_navigation_guard_until:
+        if time.monotonic() < self.player_navigation_guard_until:
             self.syncing_navigation = True
             self.navigation.unselect_all()
             self.syncing_navigation = False
@@ -2623,6 +2761,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             return
         self.browse_mode = category
         self.browse_search_results = False
+        self.search_filter_bar.set_visible(False)
         self.browse_category_heading.set_visible(True)
         self.jellyfin_history.clear()
         self.jellyfin_parent_id = ""
@@ -2851,8 +2990,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _youtube_channels_loaded(
-        self, items: list[MediaItem], cache_key: str = ""
+        self,
+        items: list[MediaItem],
+        cache_key: str = "",
+        request_id: int | None = None,
     ) -> bool:
+        if request_id is not None and request_id != self.search_request_id:
+            return GLib.SOURCE_REMOVE
         if cache_key:
             self._browse_cache_put(cache_key, items)
         self.browse_channel_positions = self._alphabet_positions(
@@ -3225,6 +3369,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._set_visible_page("browse-category")
         video_id = self.youtube.video_id_from_url(query)
         if video_id:
+            self.search_filter_bar.set_visible(False)
             webpage_url = f"https://www.youtube.com/watch?v={video_id}"
             item = MediaItem(
                 id=video_id,
@@ -3241,14 +3386,53 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 lambda error: self._grid_error(self.youtube_grid, error),
             )
             return
-        cache_key = f"youtube:video-search:{query.casefold()}"
+        self.search_query = query
+        self.search_filter_bar.set_visible(True)
+        self._run_search_query()
+
+    def _search_filter_changed(self, value: str) -> None:
+        if self.syncing_search_filter or value == self.search_filter:
+            return
+        self.search_filter = value
+        if self.search_query:
+            self._run_search_query()
+
+    def _run_search_query(self) -> None:
+        query = self.search_query
+        if not query:
+            return
+        filter_value = self.search_filter
+        self.search_request_id += 1
+        request_id = self.search_request_id
+        cache_key = f"youtube:{filter_value}-search:{query.casefold()}"
+        if filter_value == "channels":
+            if cached := self._browse_cache_get(cache_key):
+                self._youtube_channels_loaded(cached, request_id=request_id)
+                return
+            self.youtube_grid.set_loading(f"Searching channels for “{query}”…")
+            run_async(
+                lambda: self._youtube_search(query, channels=True),
+                lambda items: self._youtube_channels_loaded(
+                    items, cache_key, request_id
+                ),
+                lambda error: self._grid_error(self.youtube_grid, error),
+            )
+            return
         if cached := self._browse_cache_get(cache_key):
-            self._youtube_results(cached)
+            self._youtube_results(cached, request_id=request_id)
+            return
+        if filter_value == "playlists":
+            self.youtube_grid.set_loading(f"Searching playlists for “{query}”…")
+            run_async(
+                lambda: self.youtube.search_playlists(query),
+                lambda items: self._youtube_results(items, cache_key, request_id),
+                lambda error: self._grid_error(self.youtube_grid, error),
+            )
             return
         self.youtube_grid.set_loading(f"Searching for “{query}”…")
         run_async(
             lambda: self._youtube_search(query),
-            lambda items: self._youtube_results(items, cache_key),
+            lambda items: self._youtube_results(items, cache_key, request_id),
             lambda error: self._grid_error(self.youtube_grid, error),
         )
 
@@ -3263,7 +3447,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self._play_selected(details.item)
         return GLib.SOURCE_REMOVE
 
-    def _youtube_results(self, items: list[MediaItem], cache_key: str = "") -> bool:
+    def _youtube_results(
+        self,
+        items: list[MediaItem],
+        cache_key: str = "",
+        request_id: int | None = None,
+    ) -> bool:
+        if request_id is not None and request_id != self.search_request_id:
+            return GLib.SOURCE_REMOVE
         self.browse_channel_alphabet_scroller.set_visible(False)
         if cache_key:
             self._browse_cache_put(cache_key, items)
@@ -4750,13 +4941,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
             picture_frame.set_halign(Gtk.Align.START)
             picture_frame.set_valign(Gtk.Align.CENTER)
             picture_frame.set_child(picture)
-            row.append(picture_frame)
             if display_item.thumbnail_url:
                 self.thumbnails.load(
                     display_item.thumbnail_url,
                     lambda path, target=picture: self._set_playlist_picture(target, path),
                 )
             copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            copy.set_valign(Gtk.Align.CENTER)
             title = Gtk.Label(label=item.title, xalign=0, ellipsize=Pango.EllipsizeMode.END)
             title.add_css_class("heading")
             copy.append(title)
@@ -4764,9 +4955,14 @@ class TubeFinWindow(Adw.ApplicationWindow):
             subtitle.add_css_class("dim-label")
             subtitle.add_css_class("caption")
             copy.append(subtitle)
-            activate = Gtk.Button(child=copy, hexpand=True)
+            activate_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            activate_content.append(picture_frame)
+            activate_content.append(copy)
+            activate = Gtk.Button(child=activate_content, hexpand=True)
             activate.add_css_class("flat")
-            activate.connect("clicked", lambda _button, value=item: self._activate_item(value))
+            activate.connect(
+                "clicked", lambda _button, pos=index: self._play_playlist_from(pos)
+            )
             row.append(activate)
             if playlist_id:
                 remove = Gtk.Button(icon_name="list-remove-symbolic", tooltip_text="Remove")
@@ -4866,6 +5062,35 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.queue_index = 0
         self._refresh_queue()
         self._begin_playback(self.queue[0])
+
+    def _current_playlist_items(self) -> list[MediaItem]:
+        if self.remote_playlist_active:
+            return list(self.youtube_playlist_items)
+        playlist = next(
+            (value for value in self.playlists.list() if value.id == self.active_playlist_id),
+            None,
+        )
+        return list(playlist.items) if playlist else []
+
+    def _play_playlist_from(self, index: int) -> None:
+        items = self._current_playlist_items()
+        if not (0 <= index < len(items)):
+            return
+        item = items[index]
+        if item.source == "jellyfin" and self._synctube_active():
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Disconnect from SyncTube to use Jellyfin")
+            )
+            return
+        if item.source.startswith("youtube") and self._jellyfin_syncplay_active():
+            self.toast_overlay.add_toast(
+                Adw.Toast(title="Leave the Jellyfin watch party to use YouTube")
+            )
+            return
+        self.queue = items
+        self.queue_index = index
+        self._refresh_queue()
+        self._begin_playback(item)
 
     def _play_active_playlist(self) -> None:
         if not self.remote_playlist_active:
@@ -5620,16 +5845,44 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.channel_url = url
         self._load_channel(1)
 
-    def _load_channel(self, page: int) -> None:
-        if not self.channel_url or self.channel_loading:
+    def _channel_filter_changed(self, tab: str) -> None:
+        if self.syncing_channel_filter or tab == self.channel_tab:
             return
-        if page == 1 and (cached := self.channel_cache.get(self.channel_url)):
+        self.channel_tab = tab
+        self._load_channel(1)
+
+    def _set_channel_tab(self, tab: str) -> None:
+        self.channel_tab = tab
+        self.syncing_channel_filter = True
+        if button := self.channel_filter_buttons.get(tab):
+            button.set_active(True)
+        self.syncing_channel_filter = False
+
+    def _reset_channel_tab_visibility(self) -> None:
+        empty = self.channel_empty_tabs.get(self.channel_url, set())
+        for tab, button in self.channel_filter_buttons.items():
+            button.set_visible(tab == "videos" or tab not in empty)
+
+    def _load_channel(self, page: int) -> None:
+        # Only pagination (page > 1) respects an in-flight load. A page-1 load
+        # (e.g. a tab switch) supersedes any request already running so a stale
+        # response can't land in the newly selected tab.
+        if not self.channel_url or (page > 1 and self.channel_loading):
+            return
+        if page == 1 and self.channel_url != self.channel_open_url:
+            self.channel_open_url = self.channel_url
+            self._set_channel_tab("videos")
+            self._reset_channel_tab_visibility()
+        self.channel_request_id += 1
+        request_id = self.channel_request_id
+        cache_key = (self.channel_url, self.channel_tab)
+        if page == 1 and (cached := self.channel_cache.get(cache_key)):
             created, channel = cached
             if time.monotonic() - created <= 10 * 60:
                 self._set_visible_page("channel")
-                self._channel_loaded(channel, 1, cache_result=False)
+                self._channel_loaded(channel, 1, request_id, cache_result=False)
                 return
-            self.channel_cache.pop(self.channel_url, None)
+            self.channel_cache.pop(cache_key, None)
         self.channel_loading = True
         if page == 1:
             self.channel_share.set_sensitive(False)
@@ -5638,26 +5891,42 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.channel_more_spinner.set_visible(True)
             self.channel_more_spinner.start()
         self._set_visible_page("channel")
+        tab = self.channel_tab
         run_async(
-            lambda: self.youtube.channel(self.channel_url, page=page),
-            lambda channel: self._channel_loaded(channel, page),
-            lambda error: self._channel_error(error, page),
+            lambda: self.youtube.channel(self.channel_url, page=page, tab=tab),
+            lambda channel: self._channel_loaded(channel, page, request_id),
+            lambda error: self._channel_error(error, page, request_id),
         )
 
     def _channel_loaded(
         self,
         channel: ChannelDetails,
         page: int = 1,
+        request_id: int | None = None,
         *,
         cache_result: bool = True,
     ) -> bool:
+        if request_id is not None and request_id != self.channel_request_id:
+            return GLib.SOURCE_REMOVE
         self.channel_loading = False
         self.channel_more_spinner.stop()
         self.channel_more_spinner.set_visible(False)
+        if page == 1 and self.channel_tab != "videos" and not channel.videos:
+            self.channel_empty_tabs.setdefault(self.channel_url, set()).add(
+                self.channel_tab
+            )
+            if button := self.channel_filter_buttons.get(self.channel_tab):
+                button.set_visible(False)
+            self._set_channel_tab("videos")
+            self._load_channel(1)
+            return GLib.SOURCE_REMOVE
         self.current_channel = channel
         self.channel_share.set_sensitive(bool(channel.url))
         if page == 1 and self.channel_url and cache_result:
-            self.channel_cache[self.channel_url] = (time.monotonic(), channel)
+            self.channel_cache[(self.channel_url, self.channel_tab)] = (
+                time.monotonic(),
+                channel,
+            )
         self.channel_page = page
         self.channel_has_more = channel.continuation is not None
         self.channel_heading.set_label(channel.title)
@@ -5692,7 +5961,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
             value = f"{count / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
         return f"{value} subscribers"
 
-    def _channel_error(self, error: Exception, page: int) -> bool:
+    def _channel_error(
+        self, error: Exception, page: int, request_id: int | None = None
+    ) -> bool:
+        if request_id is not None and request_id != self.channel_request_id:
+            return GLib.SOURCE_REMOVE
         self.channel_loading = False
         self.channel_more_spinner.stop()
         self.channel_more_spinner.set_visible(False)
@@ -6247,10 +6520,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         )
         actions.append(replies_toggle)
         card.append(actions)
-        for reply in comment.replies:
+        for reply_item in comment.replies:
             replies.append(
                 self._comment_reply_row(
-                    reply,
+                    reply_item,
                     comment,
                     replies,
                     indicator,
@@ -8335,7 +8608,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             reveal_player = self.player_expanded
         next_index = self.queue_index + 1
         if next_index >= len(self.queue):
-            if self.queue_loop:
+            if self.loop_mode == "queue":
                 next_index = 0
             else:
                 self._clear_queue()
@@ -8356,7 +8629,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             reveal_player = self.player_expanded
         if self.queue_index > 0:
             self.queue_index -= 1
-        elif self.queue_loop:
+        elif self.loop_mode == "queue":
             self.queue_index = len(self.queue) - 1
         else:
             return
@@ -8403,9 +8676,71 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.queue_index += 1
         self._refresh_queue()
 
+    def _build_loop_button(self) -> Gtk.MenuButton:
+        menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        menu.set_margin_top(8)
+        menu.set_margin_bottom(8)
+        menu.set_margin_start(8)
+        menu.set_margin_end(8)
+        self.loop_off_check = Gtk.CheckButton(label="Off")
+        self.loop_off_check.set_active(True)
+        self.loop_queue_check = Gtk.CheckButton(label="Repeat queue")
+        self.loop_queue_check.set_group(self.loop_off_check)
+        self.loop_video_check = Gtk.CheckButton(label="Repeat video")
+        self.loop_video_check.set_group(self.loop_off_check)
+        for widget, mode in (
+            (self.loop_off_check, "off"),
+            (self.loop_queue_check, "queue"),
+            (self.loop_video_check, "video"),
+        ):
+            widget.connect("toggled", self._loop_option_toggled, mode)
+            menu.append(widget)
+        self.loop_popover = Gtk.Popover(child=menu)
+        self.loop_button = Gtk.MenuButton(
+            icon_name="media-playlist-repeat-symbolic",
+            tooltip_text="Loop",
+            popover=self.loop_popover,
+        )
+        return self.loop_button
+
+    def _loop_option_toggled(self, button: Gtk.CheckButton, mode: str) -> None:
+        if self.syncing_loop_controls or not button.get_active():
+            return
+        self._set_loop_mode(mode)
+
     def _queue_loop_toggled(self, button: Gtk.ToggleButton) -> None:
-        self.queue_loop = button.get_active()
+        if self.syncing_loop_controls:
+            return
+        self._set_loop_mode("queue" if button.get_active() else "off")
+
+    def _set_loop_mode(self, mode: str) -> None:
+        if mode not in ("off", "queue", "video"):
+            mode = "off"
+        self.loop_mode = mode
+        if self.mpv_player:
+            self.mpv_player.set_loop_file(mode == "video")
+        self._sync_loop_controls()
         self._update_transport_buttons()
+
+    def _sync_loop_controls(self) -> None:
+        self.syncing_loop_controls = True
+        if hasattr(self, "loop_off_check"):
+            self.loop_off_check.set_active(self.loop_mode == "off")
+            self.loop_queue_check.set_active(self.loop_mode == "queue")
+            self.loop_video_check.set_active(self.loop_mode == "video")
+        if hasattr(self, "loop_button"):
+            if self.loop_mode == "video":
+                self.loop_button.set_icon_name("media-playlist-repeat-song-symbolic")
+                self.loop_button.add_css_class("accent")
+            elif self.loop_mode == "queue":
+                self.loop_button.set_icon_name("media-playlist-repeat-symbolic")
+                self.loop_button.add_css_class("accent")
+            else:
+                self.loop_button.set_icon_name("media-playlist-repeat-symbolic")
+                self.loop_button.remove_css_class("accent")
+        if hasattr(self, "queue_loop_toggle") and self.queue_loop_toggle is not None:
+            self.queue_loop_toggle.set_active(self.loop_mode == "queue")
+        self.syncing_loop_controls = False
 
     def _clear_queue(self) -> None:
         self.queue.clear()
@@ -8428,67 +8763,141 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 and state.get("browse_search_results")
             )
         ]
-        if self.pages.get_visible_child_name() != "browse-category":
-            return
-        if self._visible_page_name() == "player":
-            self.pages.set_visible_child_name("browse")
-        else:
-            self._select_page("browse", record=False)
 
     def _refresh_queue(self) -> None:
-        child = self.queue_box.get_first_child()
+        if not hasattr(self, "queue_list"):
+            return
+        # Rebuilding the queue list forces a layout pass that can make the
+        # navigation sidebar re-emit its selected row. Arm the guard so that
+        # stray emission cannot collapse the player or navigate away.
+        self.player_navigation_guard_until = time.monotonic() + 0.75
+        child = self.queue_list.get_first_child()
         while child:
             following = child.get_next_sibling()
-            self.queue_box.remove(child)
+            self.queue_list.remove(child)
             child = following
-        queue_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        loop = Gtk.ToggleButton(label="Loop", icon_name="media-playlist-repeat-symbolic")
-        loop.set_active(self.queue_loop)
-        loop.connect("toggled", self._queue_loop_toggled)
-        queue_actions.append(loop)
-        clear = Gtk.Button(label="Clear", icon_name="edit-clear-all-symbolic")
-        clear.connect("clicked", lambda *_: self._clear_queue())
-        queue_actions.append(clear)
-        self.queue_box.append(queue_actions)
         if not self.queue:
-            self.queue_box.append(Gtk.Label(label="Queue is empty"))
-        for index, item in enumerate(self.queue):
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            play = Gtk.Button(label=item.title, hexpand=True)
-            if index == self.queue_index:
-                play.add_css_class("suggested-action")
-            play.connect("clicked", lambda _button, position=index: self._play_queued(position))
-            row.append(play)
-            up = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Move up")
-            up.set_sensitive(index > 0)
-            up.connect(
-                "clicked", lambda _button, position=index: self._move_queued(position, position - 1)
-            )
-            row.append(up)
-            down = Gtk.Button(icon_name="go-down-symbolic", tooltip_text="Move down")
-            down.set_sensitive(index + 1 < len(self.queue))
-            down.connect(
-                "clicked", lambda _button, position=index: self._move_queued(position, position + 1)
-            )
-            row.append(down)
-            remove = Gtk.Button(icon_name="edit-delete-symbolic", tooltip_text="Remove")
-            remove.connect("clicked", lambda _button, position=index: self._remove_queued(position))
-            row.append(remove)
-            self.queue_box.append(row)
+            empty = Gtk.Label(label="Queue is empty")
+            empty.add_css_class("dim-label")
+            empty.set_margin_top(12)
+            self.queue_list.append(empty)
+        else:
+            for index, item in enumerate(self.queue):
+                self.queue_list.append(self._make_queue_row(index, item))
         self.queue_button.set_tooltip_text(f"Queue ({len(self.queue)})")
+        if hasattr(self, "queue_clear_button"):
+            self.queue_clear_button.set_sensitive(bool(self.queue))
         self._update_transport_buttons()
+
+    def _make_queue_row(self, index: int, item: MediaItem) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        row.add_css_class("queue-row")
+        row.set_cursor_from_name("grab")
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        play = Gtk.Button(label=item.title, hexpand=True)
+        play.add_css_class("flat")
+        play.set_halign(Gtk.Align.FILL)
+        label = play.get_child()
+        if isinstance(label, Gtk.Label):
+            label.set_xalign(0)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+        if index == self.queue_index:
+            play.add_css_class("suggested-action")
+        play.connect(
+            "clicked", lambda _button, position=index: self._play_queued(position)
+        )
+        box.append(play)
+        remove = Gtk.Button(icon_name="edit-delete-symbolic", tooltip_text="Remove")
+        remove.add_css_class("flat")
+        remove.set_valign(Gtk.Align.CENTER)
+        remove.connect(
+            "clicked", lambda _button, position=index: self._remove_queued(position)
+        )
+        box.append(remove)
+        row.set_child(box)
+        drag_source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        drag_source.connect("prepare", self._prepare_queue_drag, index)
+        drag_source.connect("drag-begin", self._queue_drag_begin, row)
+        drag_source.connect("drag-end", self._queue_drag_end)
+        drag_source.connect("drag-cancel", self._queue_drag_cancel)
+        row.add_controller(drag_source)
+        drop_target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        drop_target.set_preload(True)
+        drop_target.connect("drop", self._drop_queue_item, index)
+        row.add_controller(drop_target)
+        return row
+
+    @staticmethod
+    def _prepare_queue_drag(
+        _source: Gtk.DragSource, _x: float, _y: float, index: int
+    ) -> Gdk.ContentProvider:
+        value = GObject.Value()
+        value.init(GObject.TYPE_STRING)
+        value.set_string(str(index))
+        return Gdk.ContentProvider.new_for_value(value)
+
+    def _queue_drag_begin(
+        self, source: Gtk.DragSource, _drag: Gdk.Drag, row: Gtk.ListBoxRow
+    ) -> None:
+        paintable = Gtk.WidgetPaintable.new(row)
+        source.set_icon(paintable, 0, 0)
+        if self.mpv_player:
+            self.mpv_player.swipe_suppressed = True
+
+    def _queue_drag_end(
+        self, _source: Gtk.DragSource, _drag: Gdk.Drag, _delete: bool
+    ) -> None:
+        if self.mpv_player:
+            self.mpv_player.swipe_suppressed = False
+
+    def _queue_drag_cancel(
+        self, _source: Gtk.DragSource, _drag: Gdk.Drag, _reason: object
+    ) -> bool:
+        if self.mpv_player:
+            self.mpv_player.swipe_suppressed = False
+        return False
+
+    def _drop_queue_item(
+        self,
+        _target: Gtk.DropTarget,
+        value: str,
+        _x: float,
+        _y: float,
+        index: int,
+    ) -> bool:
+        try:
+            old = int(value)
+        except (TypeError, ValueError):
+            return False
+        if old == index or not (0 <= old < len(self.queue)):
+            return False
+        self._move_queued(old, index)
+        return True
+
+    def _drop_queue_at_end(
+        self, _target: Gtk.DropTarget, value: str, _x: float, _y: float
+    ) -> bool:
+        try:
+            old = int(value)
+        except (TypeError, ValueError):
+            return False
+        if not (0 <= old < len(self.queue)):
+            return False
+        self._move_queued(old, len(self.queue) - 1)
+        return True
 
     def _update_transport_buttons(self) -> None:
         multiple = len(self.queue) > 1
+        queue_loop = self.loop_mode == "queue"
         has_previous = bool(
             self.queue
-            and (self.queue_index > 0 or self.queue_loop and multiple)
+            and (self.queue_index > 0 or queue_loop and multiple)
         )
         has_next = bool(
             self.queue
             and (
                 self.queue_index + 1 < len(self.queue)
-                or self.queue_loop and multiple
+                or queue_loop and multiple
             )
         )
         if self.mpv_player:
@@ -8872,8 +9281,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if not player:
                 self.player_comments_button.set_active(False)
                 self.player_live_chat_button.set_active(False)
+                self.queue_button.set_active(False)
                 self.player_comments_panel.set_visible(False)
                 self.player_live_chat_panel.set_visible(False)
+                self.player_queue_panel.set_visible(False)
             self.player_live_chat_button.set_visible(
                 bool(
                     player
@@ -10833,6 +11244,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             and (
                 self.player_comments_panel.get_visible()
                 or self.player_live_chat_panel.get_visible()
+                or self.player_queue_panel.get_visible()
             )
         ):
             self._close_player_sidebar()

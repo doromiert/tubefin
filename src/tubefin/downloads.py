@@ -285,10 +285,19 @@ class DownloadManager:
             if self.browser:
                 arguments[1:1] = ["--cookies-from-browser", self.browser]
             selected_audio = [track for track in record.audio_tracks if track]
-            if selected_audio:
-                if record.audio_only:
-                    selector = "+".join(selected_audio)
-                elif record.quality in {"min", "minimum", "worst"}:
+            if record.audio_only:
+                # Always transcode to m4a so thumbnail embedding is supported.
+                # A single native audio stream would otherwise stay in a .webm
+                # container, which yt-dlp cannot embed a thumbnail into.
+                arguments += ["--extract-audio", "--audio-format", "m4a"]
+                if selected_audio:
+                    arguments += [
+                        "--audio-multistreams",
+                        "--format",
+                        "+".join(selected_audio),
+                    ]
+            elif selected_audio:
+                if record.quality in {"min", "minimum", "worst"}:
                     selector = "+".join(["worstvideo", *selected_audio])
                 elif record.quality not in {"", "best", "auto"}:
                     height = "".join(
@@ -306,8 +315,6 @@ class DownloadManager:
                     "--merge-output-format",
                     "mkv",
                 ]
-            elif record.audio_only:
-                arguments += ["--extract-audio", "--audio-format", "m4a"]
             elif record.quality in {"min", "minimum", "worst"}:
                 arguments += [
                     "--format",

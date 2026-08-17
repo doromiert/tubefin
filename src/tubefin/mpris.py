@@ -183,8 +183,8 @@ class MprisService:
             GLib.idle_add(player.set_volume, float(unpacked) * 100)
             return True
         if name == "LoopStatus":
-            self.window.queue_loop = str(unpacked) == "Playlist"
-            GLib.idle_add(self.window._update_transport_buttons)
+            mode = {"Playlist": "queue", "Track": "video"}.get(str(unpacked), "off")
+            GLib.idle_add(self.window._set_loop_mode, mode)
             return True
         if name == "Shuffle":
             return not bool(unpacked)
@@ -207,15 +207,16 @@ class MprisService:
         player = self.window.mpv_player
         has_media = bool(player and self.window.current_item)
         multiple = len(self.window.queue) > 1
+        queue_loop = self.window.loop_mode == "queue"
         has_previous = bool(
             self.window.queue
-            and (self.window.queue_index > 0 or self.window.queue_loop and multiple)
+            and (self.window.queue_index > 0 or queue_loop and multiple)
         )
         has_next = bool(
             self.window.queue
             and (
                 self.window.queue_index + 1 < len(self.window.queue)
-                or self.window.queue_loop and multiple
+                or queue_loop and multiple
             )
         )
         status = "Stopped"
@@ -224,7 +225,10 @@ class MprisService:
         return {
             "PlaybackStatus": GLib.Variant("s", status),
             "LoopStatus": GLib.Variant(
-                "s", "Playlist" if self.window.queue_loop else "None"
+                "s",
+                {"queue": "Playlist", "video": "Track"}.get(
+                    self.window.loop_mode, "None"
+                ),
             ),
             "Rate": GLib.Variant("d", player.playback_speed if player else 1.0),
             "Shuffle": GLib.Variant("b", False),

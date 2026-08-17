@@ -239,6 +239,15 @@
   box-shadow: 0 0 0 2px @accent_bg_color;
 }
 
+.filter-bar-button {
+  padding: 4px 14px;
+}
+
+.filter-bar-button:checked {
+  background: @accent_bg_color;
+  color: @accent_fg_color;
+}
+
 .content-header-background {
   min-height: 47px;
   background: transparent;
@@ -419,9 +428,19 @@
 }
 
 .comments-sidebar,
-.live-chat-sidebar {
+.live-chat-sidebar,
+.queue-sidebar {
   border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
   background: @view_bg_color;
+}
+
+.queue-list {
+  background: transparent;
+}
+
+.queue-row {
+  padding: 4px 2px;
+  border-radius: 10px;
 }
 
 .player-sidebar-content {

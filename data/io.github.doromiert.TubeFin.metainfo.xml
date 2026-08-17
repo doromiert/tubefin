@@ -22,6 +22,16 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.6.0" date="2026-08-17">
+      <description>
+        <p>Improves the play queue with an inline sidebar, drag-and-drop reordering onto rows or empty space, and click-to-play from anywhere in a playlist; adds channel and search result filters for videos, playlists, and releases that no longer bleed results between tabs when switched quickly; and adds queue and single-video looping with MPRIS controls.</p>
+      </description>
+    </release>
+    <release version="1.5.0" date="2026-08-17">
+      <description>
+        <p>Adds a Subscriptions tab with a channel-avatar filter rail, alphabetical scroll skipper, cached per-channel and aggregate feeds, a refresh button, and infinite scrolling; filters out non-playable YouTube Mix playlists; and backs channel avatars with one persistent shared cache so each resolves once and survives restarts.</p>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-08-17">
       <description>
         <p>Races mpv-direct playback, a persistent validated resolver, and the authenticated reliable resolver for faster cold YouTube starts; automatically hands failed routes to a surviving candidate; and expands diagnostics with per-route timings, validation failures, and the winning path.</p>

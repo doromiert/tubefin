@@ -374,6 +374,26 @@ class YouTubeService:
         except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
             raise ServiceError("Could not search YouTube channels.") from error
 
+    def search_playlists(self, query: str, limit: int = 18) -> list[MediaItem]:
+        # yt-dlp's search-URL extractor resolves YouTube's playlist filter (sp)
+        # into flat playlist entries, which sidesteps brittle HTML scraping.
+        data = self._run(
+            "--dump-single-json",
+            "--flat-playlist",
+            "--no-warnings",
+            "--playlist-end",
+            str(limit),
+            "https://www.youtube.com/results?"
+            + urllib.parse.urlencode({"search_query": query, "sp": "EgIQAw=="}),
+        )
+        items: list[MediaItem] = []
+        for entry in data.get("entries") or []:
+            if not entry:
+                continue
+            if entry.get("_type") == "playlist" or entry.get("ie_key") == "YoutubeTab":
+                items.append(self._playlist_item(entry))
+        return items
+
     @staticmethod
     def _channel_renderer_item(renderer: dict[str, Any]) -> MediaItem:
         def text(value: object) -> str:
@@ -1852,7 +1872,18 @@ class YouTubeService:
             availability_message=self._availability_message(availability),
         )
 
-    def channel(self, channel_url: str, *, page: int = 1, page_size: int = 24) -> ChannelDetails:
+    CHANNEL_TABS = {"videos", "playlists", "releases", "posts"}
+
+    def channel(
+        self,
+        channel_url: str,
+        *,
+        page: int = 1,
+        page_size: int = 24,
+        tab: str = "videos",
+    ) -> ChannelDetails:
+        tab = tab if tab in self.CHANNEL_TABS else "videos"
+        as_playlists = tab in {"playlists", "releases"}
         page = max(1, page)
         start = (page - 1) * page_size + 1
         data = self._run(
@@ -1863,7 +1894,7 @@ class YouTubeService:
             str(start),
             "--playlist-end",
             str(start + page_size),
-            channel_url.rstrip("/") + "/videos",
+            channel_url.rstrip("/") + "/" + tab,
         )
         entries = [entry for entry in data.get("entries") or [] if entry]
         channel_id = str(
@@ -1889,14 +1920,16 @@ class YouTubeService:
         self.remember_channel_avatar(channel_url, avatar)
         videos: list[MediaItem] = []
         for entry in entries[:page_size]:
-            item = self._item(entry)
+            item = self._playlist_item(entry) if as_playlists else self._item(entry)
             payload = dict(item.payload)
             payload["channel_id"] = payload.get("channel_id") or channel_id
             payload["channel_url"] = payload.get("channel_url") or channel_url
             payload["channel_avatar_url"] = (
                 payload.get("channel_avatar_url") or avatar or ""
             )
-            if not item.subtitle or item.subtitle.casefold() == "youtube":
+            if not as_playlists and (
+                not item.subtitle or item.subtitle.casefold() == "youtube"
+            ):
                 item.subtitle = channel_title
             item.payload = payload
             videos.append(item)
@@ -2299,6 +2332,37 @@ class YouTubeService:
             kind="video",
             thumbnail_url=thumbnail,
             duration_seconds=entry.get("duration"),
+            payload={
+                "webpage_url": webpage_url,
+                "channel_id": entry.get("channel_id"),
+                "channel_url": entry.get("channel_url") or entry.get("uploader_url"),
+            },
+        )
+
+    @staticmethod
+    def _playlist_item(entry: dict[str, Any]) -> MediaItem:
+        playlist_id = str(entry.get("id", ""))
+        webpage_url = entry.get("webpage_url") or entry.get("url") or ""
+        if not str(webpage_url).startswith(("http://", "https://")):
+            webpage_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+        thumbnails = entry.get("thumbnails") or []
+        thumbnail = next(
+            (
+                candidate.get("url")
+                for candidate in reversed(thumbnails)
+                if candidate.get("url")
+            ),
+            entry.get("thumbnail"),
+        )
+        count = entry.get("playlist_count") or entry.get("video_count")
+        return MediaItem(
+            id=playlist_id,
+            title=entry.get("title") or "Playlist",
+            subtitle=f"{count} videos" if count else "Playlist",
+            source="youtube-playlist",
+            kind="playlist",
+            thumbnail_url=str(thumbnail) if thumbnail else None,
+            playable=False,
             payload={
                 "webpage_url": webpage_url,
                 "channel_id": entry.get("channel_id"),

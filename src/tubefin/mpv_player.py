@@ -413,6 +413,7 @@ class MpvPlayer(Gtk.Box):
         self.seeking = False
         self.should_play = False
         self.shutting_down = False
+        self.loop_file = False
         self.variants: list[StreamVariant] = []
         self.subtitles: list[SubtitleTrack] = []
         self.audio_tracks: list[AudioTrack] = []
@@ -428,6 +429,8 @@ class MpvPlayer(Gtk.Box):
         self.single_click_source = 0
         self.fullscreen_mode = False
         self.collapse_swipe_from_top = False
+        self.touch_swipe_active = False
+        self.swipe_suppressed = False
         self.touch_swipe_direction = ""
         self.swipe_progress = 0.0
         self.swipe_reset_source = 0
@@ -737,6 +740,7 @@ class MpvPlayer(Gtk.Box):
         self.original_audio_id = ""
         self.external_audio_ids.clear()
         self._set_options()
+        self.set_loop_file(self.loop_file)
         self._load_url(url, self.default_headers)
 
     def set_variants(self, variants: list[StreamVariant]) -> None:
@@ -836,6 +840,13 @@ class MpvPlayer(Gtk.Box):
         if not self.shutting_down:
             with suppress(mpv.ShutdownError):
                 self.player.pause = paused
+
+    def set_loop_file(self, enabled: bool) -> None:
+        """Repeat the current file indefinitely via mpv's native loop-file."""
+        self.loop_file = enabled
+        if not self.shutting_down:
+            with suppress(mpv.ShutdownError):
+                self.player["loop-file"] = "inf" if enabled else "no"
 
     def set_speed(self, speed: float) -> None:
         self.sync_speed = max(0.9, min(speed, 1.1))
@@ -1020,26 +1031,30 @@ class MpvPlayer(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _touch_drag_begin(
-        self, _gesture: Gtk.GestureDrag, _x: float, y: float
+        self, _gesture: Gtk.GestureDrag, _x: float, _y: float
     ) -> None:
-        height = max(1, self.video.get_allocated_height())
-        edge_zone = max(64, min(160, height * 0.18))
-        self.collapse_swipe_from_top = y <= edge_zone
-        if self.collapse_swipe_from_top:
-            self.touch_swipe_direction = "down"
-        elif not self.fullscreen_mode and y >= height - edge_zone:
-            self.touch_swipe_direction = "up"
-        else:
-            self.touch_swipe_direction = ""
-        if self.touch_swipe_direction:
-            if self.swipe_reset_source:
-                GLib.source_remove(self.swipe_reset_source)
-                self.swipe_reset_source = 0
-            self.reveal_controls()
+        # Vertical swipes work from anywhere on the video surface; the
+        # direction is resolved from the drag motion rather than the
+        # starting edge.
+        if self.swipe_suppressed:
+            return
+        self.touch_swipe_active = True
+        self.touch_swipe_direction = ""
+        if self.swipe_reset_source:
+            GLib.source_remove(self.swipe_reset_source)
+            self.swipe_reset_source = 0
+        self.reveal_controls()
 
     def _touch_drag_update(
         self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float
     ) -> None:
+        if not self.touch_swipe_active:
+            return
+        if abs(offset_y) > abs(offset_x):
+            if offset_y > 0:
+                self.touch_swipe_direction = "down"
+            elif not self.fullscreen_mode:
+                self.touch_swipe_direction = "up"
         if self.touch_swipe_direction != "down" or not self.fullscreen_mode:
             return
         if offset_y <= 0 or offset_y <= abs(offset_x) * 0.75:
@@ -1052,6 +1067,7 @@ class MpvPlayer(Gtk.Box):
         self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float
     ) -> None:
         direction = self.touch_swipe_direction
+        self.touch_swipe_active = False
         self.collapse_swipe_from_top = False
         self.touch_swipe_direction = ""
         distance = max(80, self.video.get_allocated_height() * 0.12)
