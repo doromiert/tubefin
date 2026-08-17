@@ -13,7 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  # Separate job strictly for validating Nix configuration
   nix-check:
     name: Validate Nix Flake
     runs-on: ubuntu-24.04
@@ -28,6 +27,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      
+      # your script still needs nix, so we put it back here
+      - uses: cachix/install-nix-action@v31
 
       - name: Build AppImage
         env:
