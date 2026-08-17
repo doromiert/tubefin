@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.6.1" date="2026-08-17">
+      <description>
+        <p>Fixes touch playback controls so a single tap toggles the seek bar again instead of only showing it while held; the reveal now waits for a real swipe rather than firing on every touch.</p>
+      </description>
+    </release>
     <release version="1.6.0" date="2026-08-17">
       <description>
         <p>Improves the play queue with an inline sidebar, drag-and-drop reordering onto rows or empty space, and click-to-play from anywhere in a playlist; adds channel and search result filters for videos, playlists, and releases that no longer bleed results between tabs when switched quickly; and adds queue and single-video looping with MPRIS controls.</p>

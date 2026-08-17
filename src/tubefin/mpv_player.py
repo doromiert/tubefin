@@ -1043,18 +1043,22 @@ class MpvPlayer(Gtk.Box):
         if self.swipe_reset_source:
             GLib.source_remove(self.swipe_reset_source)
             self.swipe_reset_source = 0
-        self.reveal_controls()
 
     def _touch_drag_update(
         self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float
     ) -> None:
         if not self.touch_swipe_active:
             return
+        previous_direction = self.touch_swipe_direction
         if abs(offset_y) > abs(offset_x):
             if offset_y > 0:
                 self.touch_swipe_direction = "down"
             elif not self.fullscreen_mode:
                 self.touch_swipe_direction = "up"
+        # Reveal controls only once a real swipe is recognized, so a plain tap
+        # keeps toggling visibility instead of merely revealing while held.
+        if self.touch_swipe_direction and not previous_direction:
+            self.reveal_controls()
         if self.touch_swipe_direction != "down" or not self.fullscreen_mode:
             return
         if offset_y <= 0 or offset_y <= abs(offset_x) * 0.75:
