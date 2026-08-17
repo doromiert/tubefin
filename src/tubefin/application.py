@@ -537,6 +537,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         controller.connect("key-pressed", self._key_pressed)
         self.add_controller(controller)
+        self.connect("notify::is-active", self._window_active_changed)
         self.connect("close-request", self._close_player)
         self.mpris = MprisService(self)
 
@@ -2378,6 +2379,13 @@ class TubeFinWindow(Adw.ApplicationWindow):
             "clicked", lambda *_: self.current_item and self._download_item(self.current_item)
         )
         player_actions.append(self.player_download)
+        self.player_refresh = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text="Refresh video (clear cache and reload)",
+        )
+        self.player_refresh.set_valign(Gtk.Align.CENTER)
+        self.player_refresh.connect("clicked", lambda *_: self._refresh_current_video())
+        player_actions.append(self.player_refresh)
         self.player_comments_button = Gtk.ToggleButton(
             icon_name="user-available-symbolic", tooltip_text="Comments"
         )
@@ -7261,6 +7269,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.playback_load_list.append(row)
         return GLib.SOURCE_CONTINUE
 
+    def _refresh_current_video(self) -> None:
+        item = self.current_item
+        if not item:
+            return
+        # Drop every cached representation of this video so the reload resolves a
+        # fresh stream instead of replaying a stale, expired one that fails with
+        # ('loading failed', -13).
+        with self.resolved_stream_lock:
+            self.resolved_stream_cache.pop(f"{item.source}:{item.id}", None)
+        self.played_cache.forget(item)
+        self.prebuffer.discard(item)
+        self.toast_overlay.add_toast(Adw.Toast(title="Refreshing video"))
+        self._begin_playback(item, reveal_player=self._visible_page_name() == "player")
+
     def _begin_playback(self, item: MediaItem, reveal_player: bool = True) -> None:
         self._cancel_pending_playback_load_trace(self.playback_request)
         self.playback_request += 1
@@ -7335,6 +7357,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.player_channel_button.set_tooltip_text(f"Open {channel_name}")
         self._load_player_avatar(item)
         self.player_download.set_visible(item.source in {"youtube", "jellyfin"})
+        self.player_refresh.set_visible(item.source in {"youtube", "jellyfin"})
         self.comments_more.set_label("Load")
         self.comments_more.set_sensitive(True)
         self.comments_more.set_visible(False)
@@ -11218,6 +11241,26 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.account_row.set_title("Jellyfin")
         self.account_row.set_subtitle("Not connected")
         self.toast_overlay.add_toast(Adw.Toast(title="Disconnected from Jellyfin"))
+
+    def _window_active_changed(self, *_args: object) -> None:
+        # Folding a 2-in-1 into tablet mode removes the keyboard device; folding
+        # back adds a new one. Across that seat change GTK4 can leave the
+        # toplevel pointing at a stale/detached focus widget, so key events are
+        # routed to a dead end and the window's capture controller never sees
+        # them — leaving every shortcut silently broken until a restart.
+        # Whenever the window regains focus, drop a focus widget that no longer
+        # belongs to a live, mapped part of this window so shortcuts recover.
+        if not self.is_active():
+            return
+        focus = self.get_focus()
+        if isinstance(focus, (Gtk.Editable, Gtk.TextView)):
+            return
+        if focus is not None and focus.get_root() is self and focus.get_mapped():
+            return
+        if self._visible_page_name() == "player" and self.mpv_player:
+            self.mpv_player.grab_focus()
+        else:
+            self.navigation.grab_focus()
 
     def _key_pressed(
         self,

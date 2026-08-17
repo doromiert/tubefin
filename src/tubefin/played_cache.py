@@ -400,6 +400,16 @@ class PlayedVideoCache:
                 with suppress(FileNotFoundError):
                     meta_temp.unlink()
 
+    def forget(self, item: MediaItem) -> None:
+        """Drop the persisted details, stream metadata, and prefix for an item."""
+        key = self.key(item)
+        data_path, meta_path = self._paths(key)
+        with self.lock:
+            self.cached_this_session.discard(key)
+            for path in (data_path, meta_path):
+                with suppress(OSError):
+                    path.unlink()
+
     def _prune_locked(self, exclude: Path | None = None) -> None:
         entries: list[tuple[float, int, Path]] = []
         total = 0

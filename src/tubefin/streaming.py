@@ -611,6 +611,16 @@ class PrebufferManager:
         else:
             future.cancel()
 
+    def discard(self, item: MediaItem) -> None:
+        key = self.key(item)
+        with self.lock:
+            entry = self.entries.pop(key, None)
+            sidecar = self.sidecars.pop(key, None)
+        if entry is not None:
+            self._discard_future(entry[1])
+        if sidecar is not None:
+            sidecar.cancel()
+
     def clear(self) -> None:
         with self.lock:
             entries = list(self.entries.values())
