@@ -13,27 +13,27 @@ permissions:
   contents: read
 
 jobs:
-  nix-check:
-    name: Validate Nix Flake
+  nix:
+    name: Nix Build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Validate flake
         run: nix flake check --no-build
+      - name: Build Nix package
+        run: nix build .#default -o result
 
   appimage:
     name: AppImage
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      
-      # your script still needs nix, so we put it back here
-      - uses: cachix/install-nix-action@v31
 
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
+        # Reminder: remove the nix commands from this script!
         run: packaging/appimage/build.sh
 
       - uses: actions/upload-artifact@v4
@@ -87,7 +87,7 @@ jobs:
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [nix-check, appimage, flatpak, arch]
+    needs: [nix, appimage, flatpak, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
