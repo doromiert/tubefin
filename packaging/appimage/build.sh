@@ -34,4 +34,8 @@ chmod +x "$appdir/AppRun"
 wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O "$work_directory/appimagetool"
 chmod +x "$work_directory/appimagetool"
 
-ARCH=all VERSION="$version" "$work_directory/appimagetool" "$appdir" "$output_directory/TubeFin-$version-any.AppImage"
+# Fetch appimagetool and assemble with explicit ARCH set
+wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O "$work_directory/appimagetool"
+chmod +x "$work_directory/appimagetool"
+
+ARCH=x86_64 VERSION="$version" "$work_directory/appimagetool" "$appdir" "$output_directory/TubeFin-$version-x86_64.AppImage"
