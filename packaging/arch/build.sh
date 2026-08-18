@@ -3,7 +3,7 @@ set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 output_directory=${1:-"$repository_root/dist"}
-version=1.6.3-1
+version="$(python3 -c "import sys; sys.path.insert(0, '$repository_root/src'); from tubefin import __version__; print(__version__)")-1"
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$repository_root" log -1 --format=%ct)}
 work_directory=$(mktemp -d)
 package_root="$work_directory/package"
