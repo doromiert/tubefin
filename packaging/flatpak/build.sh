@@ -5,6 +5,7 @@ repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 output_directory=${1:-"$repository_root/dist"}
 build_directory="$repository_root/.flatpak-builder-tubefin"
 repository_directory="$repository_root/.flatpak-repo-tubefin"
+version=$(python3 -c "import sys; sys.path.insert(0, '$repository_root/src'); from tubefin import __version__; print(__version__)")
 
 mkdir -p "$output_directory"
 flatpak-builder \
@@ -16,7 +17,7 @@ flatpak-builder \
   "$repository_root/io.github.doromiert.TubeFin.yaml"
 flatpak build-bundle \
   "$repository_directory" \
-  "$output_directory/TubeFin-1.4.0.flatpak" \
+  "$output_directory/TubeFin-$version.flatpak" \
   io.github.doromiert.TubeFin \
   stable \
   --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
