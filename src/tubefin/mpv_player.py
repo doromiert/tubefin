@@ -392,6 +392,7 @@ class MpvPlayer(Gtk.Box):
         on_state_changed: Callable[[float, float, bool], None] | None = None,
         default_caption_language: str = "",
         default_audio_language: str = "",
+        youtube_browser: str = "",
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_focusable(True)
@@ -442,6 +443,8 @@ class MpvPlayer(Gtk.Box):
         self.last_audible_volume = 100.0
         self.last_motion: tuple[float, float] | None = None
         ytdl_raw_options = ["ignore-config=", "js-runtimes=deno"]
+        if youtube_browser:
+            ytdl_raw_options.append(f"cookies-from-browser={youtube_browser}")
         self.player = mpv.MPV(
             vo="libmpv",
             osc=False,
@@ -1223,6 +1226,12 @@ class MpvPlayer(Gtk.Box):
         self._apply_audio_selection()
         self._apply_caption_selection()
         return self._ready()
+
+    def set_youtube_browser(self, browser: str) -> None:
+        options = ["ignore-config=", "js-runtimes=deno"]
+        if browser:
+            options.append(f"cookies-from-browser={browser}")
+        self.player.ytdl_raw_options = ",".join(options)
 
     def _load_url(self, url: str, headers: dict[str, str]) -> None:
         self.original_audio_id = ""

@@ -39,7 +39,7 @@
         {
           default = python.pkgs.buildPythonApplication {
             pname = "tubefin";
-            version = "1.4.0";
+            version = "1.6.4";
             pyproject = true;
 
             src = ./.;

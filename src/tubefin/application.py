@@ -1386,6 +1386,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self.thumbnails,
             self._activate_item,
             self._add_to_queue,
+            on_preview=self._prebuffer_item,
             on_queue_next=self._add_to_queue_next,
             on_save=self._save_item,
             on_watch_later=self._watch_later,
@@ -1980,6 +1981,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             on_state_changed=self._player_state_changed,
             default_caption_language=self.default_caption_language,
             default_audio_language=self.preferred_audio_language,
+            youtube_browser=self.youtube.browser,
         )
         stage.set_child(self.mpv_player)
         self.fullscreen_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
@@ -3064,6 +3066,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     on_download=self._download_item,
                     on_mark_watched=self._mark_watched,
                     on_share=self._share_item,
+                    on_preview=self._prebuffer_item,
                 )
             )
         else:
@@ -3616,6 +3619,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     expand_cards=True,
                     on_mark_watched=self._mark_watched,
                     on_share=self._share_item,
+                    on_preview=self._prebuffer_item,
                 )
             )
         downloaded = [self._offline_item(record) for record in self.offline.list()]
@@ -3827,6 +3831,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 expand_cards=True,
                 on_mark_watched=self._mark_watched,
                 on_share=self._share_item,
+                on_preview=self._prebuffer_item,
             )
             self._set_home_section("recommendations", self.recommendation_shelf)
         return GLib.SOURCE_REMOVE
@@ -3876,6 +3881,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                     expand_cards=True,
                     on_mark_watched=self._mark_watched,
                     on_share=self._share_item,
+                    on_preview=self._prebuffer_item,
                 )
             self._set_home_section(key or title.casefold().replace(" ", "_"), shelf)
         return GLib.SOURCE_REMOVE
@@ -3984,6 +3990,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                         expand_cards=True,
                         on_mark_watched=self._mark_watched,
                         on_share=self._share_item,
+                        on_preview=self._prebuffer_item,
                     )
                 title = section.title.casefold()
                 key = "jellyfin_continue" if "continue" in title else "jellyfin_recent"
@@ -5608,14 +5615,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
     def _show_details(self, item: MediaItem) -> None:
         if item.source == "jellyfin" and self._synctube_active():
             return
+        is_series = item.source == "jellyfin" and item.kind == "Series"
         self.detail_item = item
+        if item.playable and not is_series:
+            self._prebuffer_item(item)
         self.detail_series_play_item = None
         self.detail_series_episodes = []
         self.detail_series_generation += 1
         series_generation = self.detail_series_generation
         self.details_play.set_child(icon_label("Play", "media-playback-start-symbolic"))
         self._clear_box(self.details_seasons)
-        is_series = item.source == "jellyfin" and item.kind == "Series"
         self.details_seasons.set_visible(is_series)
         self.details_series_loading.set_visible(is_series)
         if is_series:
@@ -7594,6 +7603,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 if candidate == "validated fast resolver"
                 else "race_reliable_end"
             ),
+            persistent_resolver=(
+                self.youtube.fast_resolver_status
+                if candidate == "validated fast resolver"
+                else None
+            ),
         )
         self.playback_race_pending.discard(candidate)
         if not self.playback_race_winner:
@@ -7655,6 +7669,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 "race_fast_end"
                 if candidate == "validated fast resolver"
                 else "race_reliable_end"
+            ),
+            persistent_resolver=(
+                self.youtube.fast_resolver_status
+                if candidate == "validated fast resolver"
+                else None
             ),
         )
         if candidate == "reliable resolver":
@@ -11086,6 +11105,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
         if browser:
             self.youtube.browser = browser
             self.downloads.browser = browser
+            if self.mpv_player:
+                self.mpv_player.set_youtube_browser(browser)
             self.config.save_youtube_browser(browser)
             self.youtube_browser_session = None
             self.youtube_browser_error = ""

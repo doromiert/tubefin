@@ -82,7 +82,13 @@ class YouTubeServiceTests(unittest.TestCase):
         service._run("--dump-single-json", "https://www.youtube.com/")
 
         command = run.call_args.args[0]  # type: ignore[attr-defined]
-        self.assertEqual(command[:3], ["yt-dlp", "--cookies-from-browser", "firefox"])
+        self.assertEqual(command[0], "yt-dlp")
+        self.assertIn("--ignore-config", command)
+        browser_option = command.index("--cookies-from-browser")
+        self.assertEqual(
+            command[browser_option : browser_option + 2],
+            ["--cookies-from-browser", "firefox"],
+        )
 
     def test_browser_session_verifies_and_returns_identity(self) -> None:
         service = YouTubeService("firefox")
@@ -400,6 +406,9 @@ class YouTubeServiceTests(unittest.TestCase):
                 "pl": [{"name": "Polish", "ext": "vtt", "url": "https://subs/pl.vtt"}]
             },
         }
+        service._youtube_stream_responds = staticmethod(  # type: ignore[method-assign]
+            lambda _url, _headers: True
+        )
 
         stream = service.resolve(item)
 

@@ -131,6 +131,7 @@ class MediaCard(Gtk.Box):
         expand: bool = False,
         on_mark_watched: Callable[[MediaItem], None] | None = None,
         on_share: Callable[[MediaItem], None] | None = None,
+        on_preview: Callable[[MediaItem], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.item = item
@@ -141,6 +142,39 @@ class MediaCard(Gtk.Box):
         self.set_size_request(self.CONTENT_WIDTH, self.CONTENT_HEIGHT)
         self.set_overflow(Gtk.Overflow.HIDDEN)
         self.set_tooltip_text(item.title)
+        preview_source = 0
+
+        def preview() -> bool:
+            nonlocal preview_source
+            preview_source = 0
+            if on_preview:
+                on_preview(item)
+            return GLib.SOURCE_REMOVE
+
+        def schedule_preview(*_args: object) -> None:
+            nonlocal preview_source
+            if not preview_source:
+                preview_source = GLib.timeout_add(600, preview)
+
+        def cancel_preview(*_args: object) -> None:
+            nonlocal preview_source
+            if preview_source:
+                GLib.source_remove(preview_source)
+                preview_source = 0
+
+        def activate(*_args: object) -> None:
+            cancel_preview()
+            on_activate(item)
+
+        if item.playable and on_preview:
+            motion = Gtk.EventControllerMotion()
+            motion.connect("enter", schedule_preview)
+            motion.connect("leave", cancel_preview)
+            self.add_controller(motion)
+            focus = Gtk.EventControllerFocus()
+            focus.connect("enter", schedule_preview)
+            focus.connect("leave", cancel_preview)
+            self.add_controller(focus)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         content.set_size_request(self.CONTENT_WIDTH, self.CONTENT_HEIGHT)
@@ -244,12 +278,12 @@ class MediaCard(Gtk.Box):
         thumbnail_button = Gtk.Button(child=aspect_frame)
         thumbnail_button.add_css_class("flat")
         thumbnail_button.add_css_class("media-card-target")
-        thumbnail_button.connect("clicked", lambda *_: on_activate(item))
+        thumbnail_button.connect("clicked", activate)
         content.append(thumbnail_button)
         title_button = Gtk.Button(child=labels, hexpand=True)
         title_button.add_css_class("flat")
         title_button.add_css_class("media-card-target")
-        title_button.connect("clicked", lambda *_: on_activate(item))
+        title_button.connect("clicked", activate)
         labels_row.append(title_button)
         if any(
             (
@@ -532,6 +566,7 @@ class MediaGrid(Gtk.Box):
                     True,
                     self.on_mark_watched,
                     self.on_share,
+                    self.on_preview,
                 )
             )
             if index < 4 and item.playable and self.on_preview:
@@ -558,6 +593,7 @@ class MediaGrid(Gtk.Box):
                     True,
                     self.on_mark_watched,
                     self.on_share,
+                    self.on_preview,
                 )
             )
 
@@ -601,6 +637,7 @@ class SectionShelf(Gtk.Box):
         expand_cards: bool = False,
         on_mark_watched: Callable[[MediaItem], None] | None = None,
         on_share: Callable[[MediaItem], None] | None = None,
+        on_preview: Callable[[MediaItem], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.thumbnail_loader = thumbnail_loader
@@ -616,6 +653,7 @@ class SectionShelf(Gtk.Box):
         self.expand_cards = expand_cards
         self.on_mark_watched = on_mark_watched
         self.on_share = on_share
+        self.on_preview = on_preview
         self.flow: Gtk.FlowBox | None = None
         self.row: Gtk.Box | None = None
         self.content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -661,6 +699,7 @@ class SectionShelf(Gtk.Box):
                         expand=expand_cards,
                         on_mark_watched=on_mark_watched,
                         on_share=on_share,
+                        on_preview=on_preview,
                     )
                 )
             scroller = Gtk.ScrolledWindow()
@@ -709,6 +748,7 @@ class SectionShelf(Gtk.Box):
             self.expand_cards,
             self.on_mark_watched,
             self.on_share,
+            self.on_preview,
         )
 
     def append_items(self, items: list[MediaItem]) -> None:

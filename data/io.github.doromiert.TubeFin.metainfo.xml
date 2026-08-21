@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.6.4" date="2026-08-21">
+      <description>
+        <p>Speeds up and hardens YouTube playback with authenticated mpv resolution, first-success stream validation, bounded fast-resolver fallbacks, and intent-driven prebuffering across grids, home shelves, account feeds, and detail pages.</p>
+      </description>
+    </release>
     <release version="1.6.2" date="2026-08-17">
       <description>
         <p>Recovers keyboard shortcuts that silently stopped working after a laptop was folded into tablet mode and back, by re-establishing window focus when it regains keyboard focus. Adds a Refresh video button that clears the cached stream and reloads, so a stale expired cache no longer leaves a video stuck on a loading failure.</p>

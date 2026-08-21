@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,6 +101,12 @@ class ChannelAvatarCache:
 
 
 class YouTubeService:
+    # The fast resolver must stay fast: when an in-process attempt exceeds
+    # this budget, further fallbacks are skipped so the playback race is left
+    # to the reliable resolver instead of a second slow contender.
+    FAST_ATTEMPT_BUDGET_SECONDS = 2.0
+    FAST_TOTAL_BUDGET_SECONDS = 1.5
+
     PERSONAL_FEEDS = {
         "home": "https://www.youtube.com/",
         "subscriptions": "https://www.youtube.com/feed/subscriptions",
@@ -128,9 +135,6 @@ class YouTubeService:
         self.cookie_snapshot_ready = False
         self.cookie_snapshot_browser = ""
         self.cookie_snapshot_generation = 0
-        self.fast_resolver_lock = threading.Lock()
-        self.fast_resolver: Any | None = None
-        self.fast_resolver_session_key: tuple[str, int] | None = None
         self.fast_resolver_status = "not used"
 
     @property
@@ -1465,73 +1469,81 @@ class YouTubeService:
         ):
             return False
 
-    def _reset_fast_resolver_locked(self) -> None:
-        resolver = self.fast_resolver
-        self.fast_resolver = None
-        self.fast_resolver_session_key = None
-        if resolver is not None:
-            with suppress(Exception):
-                resolver.close()
+    def _extract_fast(
+        self,
+        video_url: str,
+        format_selector: str,
+        *,
+        player_client: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run one throwaway in-process extraction; sessions save nothing."""
+        yt_dlp = importlib.import_module("yt_dlp")
+        youtube_arguments: dict[str, list[str]] = {
+            "skip": ["hls", "dash", "translated_subs"],
+            "player_skip": ["initial_data"],
+        }
+        if player_client:
+            youtube_arguments["player_client"] = player_client
+        options: dict[str, Any] = {
+            "extractor_args": {"youtube": youtube_arguments},
+            "format": format_selector,
+            "getcomments": False,
+            "noplaylist": True,
+            "no_warnings": True,
+            "quiet": True,
+            "skip_download": True,
+            "socket_timeout": 10,
+        }
+        if self.browser and self.cookie_snapshot_ready:
+            options["cookiefile"] = str(self.cookie_snapshot_path)
+        with yt_dlp.YoutubeDL(options) as resolver:
+            data = resolver.extract_info(video_url, download=False)
+        return data if isinstance(data, dict) else None
 
     def _resolve_fast_in_process(
         self,
         video_url: str,
         format_selector: str,
     ) -> dict[str, Any] | None:
-        if self.browser and not self.cookie_snapshot_ready:
-            self.fast_resolver_status = "cookie session not ready · CLI fallback"
-            return None
-        session_key = (self.browser, self.cookie_snapshot_generation)
-        with self.fast_resolver_lock:
-            initialized = False
-            if (
-                self.fast_resolver is None
-                or self.fast_resolver_session_key != session_key
-            ):
-                self._reset_fast_resolver_locked()
-                try:
-                    yt_dlp = importlib.import_module("yt_dlp")
-                    options: dict[str, Any] = {
-                        "extractor_args": {
-                            "youtube": {
-                                "skip": ["hls", "dash", "translated_subs"],
-                            },
-                        },
-                        "format": format_selector,
-                        "getcomments": False,
-                        "noplaylist": True,
-                        "no_warnings": True,
-                        "quiet": True,
-                        "skip_download": True,
-                    }
-                    if self.browser:
-                        options["cookiefile"] = str(self.cookie_snapshot_path)
-                    self.fast_resolver = yt_dlp.YoutubeDL(options)
-                    self.fast_resolver_session_key = session_key
-                    initialized = True
-                except Exception as error:
-                    self._reset_fast_resolver_locked()
-                    self.fast_resolver_status = (
-                        f"unavailable ({str(error)[:120]}) · CLI fallback"
-                    )
-                    return None
+        authenticated = bool(self.browser) and self.cookie_snapshot_ready
+        # Default clients first for the best muxed quality; the android VR
+        # client is the fastest extractor and works without authentication,
+        # so it rescues sessions YouTube flags as bots or blocks cookieless.
+        attempts: list[tuple[str, list[str] | None]] = [
+            ("in-process session", None),
+            ("cookieless android_vr client", ["android_vr"]),
+        ]
+        started = time.monotonic()
+        last_error: Exception | None = None
+        for label, player_client in attempts:
             try:
-                data = self.fast_resolver.extract_info(video_url, download=False)
-            except Exception as error:
-                self._reset_fast_resolver_locked()
-                self.fast_resolver_status = (
-                    f"failed ({str(error)[:120]}) · CLI fallback"
+                data = self._extract_fast(
+                    video_url,
+                    format_selector,
+                    player_client=player_client,
                 )
-                return None
-            if not isinstance(data, dict):
-                self.fast_resolver_status = "unexpected response · CLI fallback"
-                return None
-            self.fast_resolver_status = (
-                "initialized in-process session"
-                if initialized
-                else "reused in-process session"
-            )
-            return data
+            except Exception as error:
+                last_error = error
+            else:
+                if data is not None:
+                    self.fast_resolver_status = (
+                        f"{label} · cookies"
+                        if authenticated
+                        else f"{label} · no cookies"
+                    )
+                    return data
+                last_error = ServiceError("The extractor returned no metadata.")
+            # A first attempt that already burned its budget signals a slow or
+            # throttled session; stacking another client onto it turns the
+            # "fast" resolver into a second slow one and ruins the race.
+            if time.monotonic() - started > self.FAST_ATTEMPT_BUDGET_SECONDS:
+                break
+        self.fast_resolver_status = (
+            f"failed ({str(last_error)[:120]}) · CLI fallback"
+            if last_error is not None
+            else "unexpected response · CLI fallback"
+        )
+        return None
 
     def resolve(self, item: MediaItem) -> ResolvedStream:
         return self._resolve_youtube_stream(item, fast=False)
@@ -1556,12 +1568,22 @@ class YouTubeService:
                     "youtube:skip=hls,dash,translated_subs",
                 )
             )
+        fast_started = time.monotonic()
         data = (
             self._resolve_fast_in_process(str(video_url), format_selector)
             if fast
             else None
         )
         if data is None:
+            if fast and (
+                time.monotonic() - fast_started > self.FAST_TOTAL_BUDGET_SECONDS
+            ):
+                # The in-process attempts already spent the fast budget; the
+                # reliable resolver covers this case without doubling the work.
+                raise ServiceError(
+                    "Fast YouTube stream exceeded its time budget"
+                    f" ({self.fast_resolver_status})."
+                )
             data = self._run(*arguments, str(video_url))
         formats = list(data.get("formats") or [])
         explicit_original_languages = {
@@ -1626,20 +1648,53 @@ class YouTubeService:
             if fast
             else ranked_original_muxed[:3] + ([selected] if selected else [])
         )
+        unique_candidates: list[tuple[dict[str, Any], str, dict[str, str]]] = []
         seen_urls: set[str] = set()
-        chosen_stream = None
         for candidate in candidates:
             candidate_url = str(candidate.get("url") or "")
             if not candidate_url or candidate_url in seen_urls:
                 continue
             seen_urls.add(candidate_url)
-            candidate_headers = self._youtube_stream_headers(candidate, data)
-            if self._youtube_stream_responds(candidate_url, candidate_headers):
-                chosen_stream = candidate
-                if fast:
-                    format_id = str(candidate.get("format_id") or "auto")
-                    self.fast_resolver_status += f" · verified format {format_id}"
-                break
+            unique_candidates.append(
+                (
+                    candidate,
+                    candidate_url,
+                    self._youtube_stream_headers(candidate, data),
+                )
+            )
+
+        def responds(entry: tuple[dict[str, Any], str, dict[str, str]]) -> bool:
+            _, candidate_url, candidate_headers = entry
+            return self._youtube_stream_responds(candidate_url, candidate_headers)
+
+        # Probe every candidate at once; signed URLs frequently arrive dead and
+        # sequential probes would stack a full round trip per dead candidate.
+        chosen_stream = None
+        if len(unique_candidates) == 1:
+            if responds(unique_candidates[0]):
+                chosen_stream = unique_candidates[0][0]
+        elif unique_candidates:
+            pool = ThreadPoolExecutor(
+                max_workers=len(unique_candidates),
+                thread_name_prefix="stream-validate",
+            )
+            futures = {
+                pool.submit(responds, entry): entry for entry in unique_candidates
+            }
+            try:
+                for future in as_completed(futures):
+                    if future.result():
+                        chosen_stream = futures[future][0]
+                        break
+            finally:
+                for future in futures:
+                    future.cancel()
+                # A dead candidate may still be inside urllib's timeout. Do not
+                # hold playback for it after another candidate has validated.
+                pool.shutdown(wait=chosen_stream is None, cancel_futures=True)
+        if chosen_stream is not None and fast:
+            format_id = str(chosen_stream.get("format_id") or "auto")
+            self.fast_resolver_status += f" · verified format {format_id}"
         if chosen_stream is None:
             if fast:
                 self.fast_resolver_status += " · media URL validation failed"
