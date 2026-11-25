@@ -495,7 +495,6 @@ class MpvPlayer(Gtk.Box):
         self.swipe_progress = 0.0
         self.swipe_reset_source = 0
         self.time_has_hours = False
-        self.bound_picker_popovers: set[int] = set()
         self.playback_speed = 1.0
         self.subtitle_offset = 0.0
         self.sync_speed = 1.0
@@ -644,7 +643,7 @@ class MpvPlayer(Gtk.Box):
             orientation=Gtk.Orientation.HORIZONTAL, spacing=6
         )
         self.speed_control.set_halign(Gtk.Align.FILL)
-        self.speed_control.set_hexpand(True)
+        self.speed_control.set_hexpand(False)
         speed_down = Gtk.Button(label="−", tooltip_text="Decrease playback speed")
         speed_down.add_css_class("speed-step-button")
         speed_down.connect("clicked", lambda *_: self._step_playback_speed(-1))
@@ -664,7 +663,7 @@ class MpvPlayer(Gtk.Box):
             orientation=Gtk.Orientation.HORIZONTAL, spacing=6
         )
         self.subtitle_offset_control.set_halign(Gtk.Align.FILL)
-        self.subtitle_offset_control.set_hexpand(True)
+        self.subtitle_offset_control.set_hexpand(False)
         subtitle_earlier = Gtk.Button(
             label="−", tooltip_text="Show subtitles 0.1 seconds earlier"
         )
@@ -734,12 +733,10 @@ class MpvPlayer(Gtk.Box):
             self.option_rows[label_text] = row
         self.settings_popover = Gtk.Popover(child=settings_box)
         self.settings_popover.set_autohide(True)
-        self.settings_popover.set_cascade_popdown(True)
+        self.settings_popover.set_cascade_popdown(False)
         self.settings_popover.connect(
             "notify::visible", self._settings_visibility_changed
         )
-        for picker in (self.quality, self.captions, self.audio, self.buffer):
-            picker.connect("realize", self._bind_picker_popovers)
         settings = Gtk.MenuButton(
             icon_name="emblem-system-symbolic",
             tooltip_text="Playback settings",
@@ -1476,24 +1473,6 @@ class MpvPlayer(Gtk.Box):
         if self.syncing_options:
             return
         self._apply_caption_selection()
-
-    def _bind_picker_popovers(self, picker: Gtk.Widget) -> None:
-        pending = [picker]
-        while pending:
-            widget = pending.pop()
-            child = widget.get_first_child()
-            while child:
-                if (
-                    isinstance(child, Gtk.Popover)
-                    and id(child) not in self.bound_picker_popovers
-                ):
-                    self.bound_picker_popovers.add(id(child))
-                    child.connect("closed", self._picker_popover_closed)
-                pending.append(child)
-                child = child.get_next_sibling()
-
-    def _picker_popover_closed(self, _popover: Gtk.Popover) -> None:
-        GLib.idle_add(self.settings_popover.popdown)
 
     def _apply_caption_selection(self) -> None:
         selected = self.captions.get_selected()

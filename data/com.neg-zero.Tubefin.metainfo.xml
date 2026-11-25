@@ -22,6 +22,11 @@
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.7.4" date="2026-11-25">
+      <description>
+        <p>Keeps playback settings open when dismissing a picker and aligns subtitle offset controls with the other settings.</p>
+      </description>
+    </release>
     <release version="1.7.3" date="2026-11-25">
       <description>
         <p>Fixes YouTube playback using adaptive video and audio with bounded HTTP requests. Adds screen-matched automatic quality, unrestricted manual resolutions, video-only HDR in the Nix build, dedicated embedded sign-in, and KeePassXC autofill.</p>
