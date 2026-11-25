@@ -50,7 +50,7 @@ def main() -> int:
         )
         from tubefin.sync import SyncTubeClient
 
-        application = TubeFinApplication(f"io.github.doromiert.TubeFin.FlowSmoke{os.getpid()}")
+        application = TubeFinApplication(f"com.neg-zero.Tubefin.FlowSmoke{os.getpid()}")
         failures: list[BaseException] = []
 
         def verify() -> bool:

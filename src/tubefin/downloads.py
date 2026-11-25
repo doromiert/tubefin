@@ -33,11 +33,13 @@ class DownloadManager:
         concurrency: int = 2,
         *,
         browser: str = "",
+        cookie_file: Path | None = None,
         direct_resolver: DirectResolver | None = None,
     ) -> None:
         self.library = library
         self.executable = shutil.which("yt-dlp")
         self.concurrency = max(1, min(concurrency, 4))
+        self.cookie_file = cookie_file
         self.browser = browser
         self.direct_resolver = direct_resolver
         self._semaphore = threading.BoundedSemaphore(self.concurrency)
@@ -282,7 +284,9 @@ class DownloadManager:
                 "--output",
                 template,
             ]
-            if self.browser:
+            if self.cookie_file is not None and self.cookie_file.exists():
+                arguments[1:1] = ["--cookies", str(self.cookie_file)]
+            elif self.browser:
                 arguments[1:1] = ["--cookies-from-browser", self.browser]
             selected_audio = [track for track in record.audio_tracks if track]
             if record.audio_only:

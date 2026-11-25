@@ -15,7 +15,9 @@ It currently supports:
 - Video details, channels, authenticated comments, chapter seeking, captions, dubbed audio, and quality selection
 - A mixed YouTube/Jellyfin queue with reordering, looping, prebuffering, and auto-advance
 - Multi-audio YouTube and metadata-preserving Jellyfin downloads, an offline library, and local playlists
-- Google desktop OAuth with subscriptions, liked videos, activity, and playlist management
+- Dedicated embedded YouTube sign-in with KeePassXC autofill; optional Google API access
+- Adaptive video/audio streams at every available resolution, with a screen-matched default
+- HDR10 and HLG video with SDR application chrome in the Nix build
 - Reorderable, runtime-collapsible homepage sections with pull-to-refresh
 - Watch-together rooms through SyncTube for YouTube and SyncPlay for Jellyfin
 - Adaptive libadwaita navigation, a mini player, dark mode, and keyboard shortcuts
@@ -76,18 +78,29 @@ outside your trusted local network.
 
 ## YouTube
 
-TubeFin invokes the packaged `yt-dlp` executable. YouTube changes frequently, so
-updating the flake input is the normal way to pick up a newer resolver:
-
-```sh
-nix flake update
-```
+TubeFin invokes the packaged `yt-dlp` executable. The Nix build pins resolver
+2026.11.23; bump the `ytDlp` version and source hash in `flake.nix` to update it.
+`nix flake update` updates the underlying runtime packages.
 
 Use TubeFin in accordance with YouTube's terms and the laws in your jurisdiction.
 
 ### YouTube account
 
-Account features require a Google OAuth **Desktop app** client ID with the YouTube
+Open **Settings → YouTube → Login** and sign in on Google's page inside TubeFin.
+Choose **Continue** after YouTube finishes signing you in. TubeFin owns this session;
+it does not read Firefox or any other browser profile. **Sign Out** removes the
+dedicated browser session and resolver cookies. Session data lives in the private
+TubeFin configuration directory; exported cookies have mode `0600`.
+
+Choose **Fill from KeePassXC** to use a matching Google login. KeePassXC (or Keyslot)
+must be running with Browser Integration enabled. Approve TubeFin in its connection
+dialog the first time. Autofill runs only on `https://accounts.google.com`, never
+submits the form, and does not save the password in TubeFin. Choose a login once; it carries through Google's separate email and password steps
+automatically. TubeFin stores only the public KeePassXC association identifier.
+
+### Optional Google API access
+
+Optional API features require a Google OAuth **Desktop app** client ID with the YouTube
 Data API enabled. Open **YouTube account**, paste the client ID, and choose either
 standard access with commenting or the explicit playlist-management scope. Authorization uses PKCE
 and a temporary loopback callback. Refresh tokens are stored through Secret Service
@@ -96,7 +109,28 @@ keyring entry.
 
 YouTube's public Data API does not expose a complete watch-history feed. TubeFin shows
 account activity where the API provides it and keeps its own device-local playback
-history for Continue Watching and signed-out channel suggestions.
+history for Continue Watching and signed-out channel suggestions. Signed-in online
+playback offers a Resume toast for local or YouTube account-saved progress. If both
+positions exist, the toast offers the furthest one. Playback starts at the beginning
+unless you choose Resume. Videos are automatically
+marked fully watched only at their end.
+
+### Resolution and HDR
+
+Automatic quality uses the physical pixel height of the monitor containing the
+TubeFin window when playback starts, including fractional scaling. It selects the
+highest available resolution that fits that screen. Signed-in playback combines
+account metadata with public adaptive streams, so account-client restrictions do
+not hide working 4K/HDR choices for public videos. Every available resolution
+remains selectable manually, including 4K and 8K. Separate video and original-audio
+streams are played together; HDR variants are labelled in the quality menu.
+
+The Nix package includes an application-local GTK 4.22 backport that keeps windows,
+menus and controls sRGB/8-bit while explicitly PQ/HLG-tagged video uses an independent
+PQ float16 surface. HLG is converted to PQ by mpv. HDR requires a compatible Wayland
+compositor and an HDR-enabled display. Unsupported output paths use GTK's SDR
+fallback. A 10-bit SDR video does not enable HDR. Other distribution builds require
+the same GTK backport for this media-only HDR path.
 
 ## Offline media and playlists
 
@@ -130,10 +164,12 @@ each room only exposes media its backend can synchronize.
 
 ## Architecture
 
-The app intentionally has no embedded browser. Network calls use the Python standard
-library and websocket-client on worker threads; all GTK updates return to the main
-loop. Video is rendered by libmpv into a GTK GLArea using the approach developed by
-Cine.
+The dedicated login uses WebKitGTK 6 with its own persistent network session.
+Media and library requests use the Python standard library and websocket-client on
+worker threads; GTK updates return to the main loop. Video is rendered by libmpv
+into a GTK GLArea using the approach developed by Cine. The GTK HDR backport derives
+from Galeria's media-only HDR work; its source-license attribution is retained in
+`gtk-media-hdr.patch`.
 
 ## Known limitations
 

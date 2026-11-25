@@ -98,10 +98,12 @@ class PlayedVideoCache:
     def _stream_metadata(stream: ResolvedStream) -> dict[str, object]:
         return {
             "url": stream.url,
+            "audio_url": stream.audio_url,
             "headers": stream.headers,
             "default_label": stream.default_label,
             "variants": [
-                {"label": value.label, "url": value.url, "headers": value.headers}
+                {"label": value.label, "url": value.url, "headers": value.headers,
+                 "audio_url": value.audio_url}
                 for value in stream.variants
             ],
             "subtitles": [
@@ -149,6 +151,7 @@ class PlayedVideoCache:
             variants = [
                 StreamVariant(
                     label=str(value.get("label") or "Auto"),
+                    audio_url=str(value.get("audio_url") or ""),
                     url=str(value.get("url") or ""),
                     headers={
                         str(name): str(header)
@@ -196,6 +199,7 @@ class PlayedVideoCache:
         return (
             ResolvedStream(
                 url=url,
+                audio_url=str(stored.get("audio_url") or ""),
                 headers=headers,
                 variants=variants,
                 subtitles=subtitles,

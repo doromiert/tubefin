@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.doromiert.TubeFin</id>
+  <id>com.neg-zero.Tubefin</id>
   <name>TubeFin</name>
   <summary>Watch YouTube and your Jellyfin library</summary>
   <metadata_license>CC0-1.0</metadata_license>
@@ -15,13 +15,18 @@
       libraries, and play compatible media with libmpv.
     </p>
   </description>
-  <launchable type="desktop-id">io.github.doromiert.TubeFin.desktop</launchable>
+  <launchable type="desktop-id">com.neg-zero.Tubefin.desktop</launchable>
   <url type="homepage">https://github.com/doromiert/tubefin</url>
   <url type="bugtracker">https://github.com/doromiert/tubefin/issues</url>
-  <developer id="io.github.doromiert">
+  <developer id="com.neg-zero">
     <name>TubeFin contributors</name>
   </developer>
   <releases>
+    <release version="1.7.3" date="2026-11-25">
+      <description>
+        <p>Fixes YouTube playback using adaptive video and audio with bounded HTTP requests. Adds screen-matched automatic quality, unrestricted manual resolutions, video-only HDR in the Nix build, dedicated embedded sign-in, and KeePassXC autofill.</p>
+      </description>
+    </release>
     <release version="1.6.4" date="2026-08-21">
       <description>
         <p>Speeds up and hardens YouTube playback with authenticated mpv resolution, first-success stream validation, bounded fast-resolver fallbacks, and intent-driven prebuffering across grids, home shelves, account feeds, and detail pages.</p>

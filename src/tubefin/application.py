@@ -73,7 +73,7 @@ from tubefin.widgets import (  # noqa: E402
     labeled_button,
 )
 
-APP_ID = "io.github.doromiert.TubeFin"
+APP_ID = "com.neg-zero.Tubefin"
 PLAYER_SIDEBAR_MIN_WIDTH = 280
 SPONSORBLOCK_CATEGORY_DETAILS = {
     "sponsor": ("Sponsors", "Paid promotions and advertisements"),
@@ -294,7 +294,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.sync_settings = self.config.load_sync_settings()
         self.youtube_sync_settings = self.config.load_youtube_sync_settings()
         oauth_settings = self.config.load_oauth_settings()
-        self.youtube = YouTubeService(str(oauth_settings["browser"]))
+        self.youtube = YouTubeService(cookie_file=self.config.directory / "youtube-cookies.txt")
         self.sponsorblock = SponsorBlockService()
         self.sponsorblock_enabled = bool(self.player_settings["sponsorblock_enabled"])
         self.sponsorblock_categories = dict(
@@ -327,7 +327,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.offline = OfflineLibrary()
         self.downloads = DownloadManager(
             self.offline,
-            browser=self.youtube.browser,
+            cookie_file=self.youtube.cookie_file,
             direct_resolver=self.jellyfin.download_source,
         )
         self.playlists = PlaylistStore()
@@ -1981,7 +1981,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             on_state_changed=self._player_state_changed,
             default_caption_language=self.default_caption_language,
             default_audio_language=self.preferred_audio_language,
-            youtube_browser=self.youtube.browser,
+            youtube_cookie_file=str(self.youtube.cookie_file),
         )
         stage.set_child(self.mpv_player)
         self.fullscreen_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
@@ -7300,7 +7300,18 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.toast_overlay.add_toast(Adw.Toast(title="Refreshing video"))
         self._begin_playback(item, reveal_player=self._visible_page_name() == "player")
 
+    def _update_youtube_screen_quality(self) -> None:
+        surface = self.get_surface()
+        monitor = self.get_display().get_monitor_at_surface(surface) if surface else None
+        if monitor:
+            geometry = monitor.get_geometry()
+            scale = (monitor.get_scale() if hasattr(monitor, "get_scale")
+                     else monitor.get_scale_factor())
+            # Use physical pixels, including fractional desktop scaling.
+            self.youtube.max_height = round(geometry.height * scale)
+
     def _begin_playback(self, item: MediaItem, reveal_player: bool = True) -> None:
+        self._update_youtube_screen_quality()
         self._cancel_pending_playback_load_trace(self.playback_request)
         self.playback_request += 1
         request_id = self.playback_request
@@ -7413,7 +7424,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             self._start_playback(item, local_stream, request_id)
             return
         prefetch_manager = self.prebuffer
-        prefetched = prefetch_manager.claim(item)
+        prefetched = prefetch_manager.claim(item) if item.source != "youtube" else None
         if prefetched is not None:
             self._mark_playback_load(
                 request_id,
@@ -7448,7 +7459,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
     ) -> tuple[ResolvedStream, PrebufferedStream | None]:
         self._mark_playback_load(request_id, "worker_started")
         self._mark_playback_load(request_id, "played_cache_start")
-        cached = self.played_cache.prepare_cached(item)
+        cached = self.played_cache.prepare_cached(item) if item.source != "youtube" else None
         if cached is not None:
             stream, buffered, needs_refresh = cached
             if needs_refresh:
@@ -7477,21 +7488,11 @@ class TubeFinWindow(Adw.ApplicationWindow):
             prefix="none",
         )
         if item.source == "youtube":
-            # Let mpv's ytdl hook own the cold critical path. It can open the
-            # webpage directly and avoids serializing an extracted URL through
-            # TubeFin before libmpv starts. Full metadata is enriched after the
-            # first frame, while _retry_failed_fast_path remains the safety net.
-            video_url = str(
-                item.payload.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={item.id}"
-            )
-            self._mark_playback_load(
-                request_id,
-                resolver="mpv ytdl hook direct",
-                route="Direct mpv YouTube URL",
-            )
+            self._mark_playback_load(request_id, "resolver_start")
+            stream = self.youtube.resolve(item)
+            self._mark_playback_load(request_id, "resolver_end")
             self._mark_playback_load(request_id, "worker_done")
-            return ResolvedStream(video_url), None
+            return stream, None
         self._mark_playback_load(request_id, "resolver_start")
         stream = self._resolve_item(item, request_id)
         self._mark_playback_load(request_id, "resolver_end")
@@ -7973,9 +7974,10 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self, item: MediaItem
     ) -> tuple[list[StreamVariant], list[AudioTrack], list[VideoChapter]]:
         online = self.youtube.resolve(item)
-        variants = [StreamVariant("Online · Auto", online.url, online.headers)]
+        variants = [StreamVariant("Online · Auto", online.url, online.headers, online.audio_url)]
         variants.extend(
-            StreamVariant(f"Online · {variant.label}", variant.url, variant.headers)
+            StreamVariant(f"Online · {variant.label}", variant.url, variant.headers,
+                          variant.audio_url)
             for variant in online.variants
         )
         return variants, online.audio_tracks, list(online.chapters)
@@ -8131,6 +8133,12 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.mini_title.set_label(item.title)
         self.mini_subtitle.set_label(item.subtitle or item.source.capitalize())
         if self.mpv_player:
+            if (isinstance(stream, ResolvedStream) and stream.resume_position > 0
+                    and not self._synctube_active() and self.pending_sync_state is None):
+                self.resume_position_offer = max(
+                    self.resume_position_offer, stream.resume_position
+                )
+                self.resume_item_id = item.id
             self.mpv_player.load(
                 url,
                 headers,
@@ -8139,6 +8147,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
                 audio_tracks,
                 chapters,
                 default_label,
+                audio_url=stream.audio_url if isinstance(stream, ResolvedStream) else "",
             )
         if item.source == "youtube" and default_label == "Local download":
             run_async(
@@ -8631,7 +8640,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
             if not self.youtube.browser:
                 self.toast_overlay.add_toast(
                     Adw.Toast(
-                        title="Saved locally; YouTube history needs a browser session"
+                        title="Saved locally; YouTube history needs a YouTube sign-in"
                     )
                 )
                 return
@@ -9520,7 +9529,8 @@ class TubeFinWindow(Adw.ApplicationWindow):
             and self.current_item.source == "youtube"
             and self.youtube.browser
             and self.current_item.id not in self.youtube_marked_watched
-            and position >= min(30, duration * 0.5 if duration else 30)
+            and duration > 0
+            and position >= duration - 1
         ):
             item = self.current_item
             self.youtube_marked_watched.add(item.id)
@@ -10621,8 +10631,7 @@ class TubeFinWindow(Adw.ApplicationWindow):
         accounts = Adw.PreferencesGroup(
             title="Accounts",
             description=(
-                "TubeFin opens the real service website. YouTube playback can reuse that "
-                "browser's session cookies."
+                "Sign in to YouTube in TubeFin’s dedicated window or connect your Jellyfin server."
             ),
         )
         youtube_section = Adw.ExpanderRow(
@@ -10632,18 +10641,20 @@ class TubeFinWindow(Adw.ApplicationWindow):
         youtube_section.set_expanded(False)
         self.youtube_settings_status = Adw.ActionRow(
             title="Login",
-            subtitle="Open YouTube to sign in through your browser.",
+            subtitle="Sign in with Google in TubeFin’s dedicated window.",
         )
         self.youtube_settings_status.add_prefix(
             Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
         )
         self.youtube_sign_in_button = Gtk.Button(
             label="Login",
-            icon_name="web-browser-symbolic",
             valign=Gtk.Align.CENTER,
         )
         self.youtube_sign_in_button.connect("clicked", lambda *_: self._open_youtube_sign_in())
         self.youtube_settings_status.add_suffix(self.youtube_sign_in_button)
+        sign_out = Gtk.Button(label="Sign Out", valign=Gtk.Align.CENTER)
+        sign_out.connect("clicked", lambda *_: self._sign_out_youtube())
+        self.youtube_settings_status.add_suffix(sign_out)
         youtube_section.add_row(self.youtube_settings_status)
 
         subscription_sync = Adw.SwitchRow(
@@ -11101,30 +11112,47 @@ class TubeFinWindow(Adw.ApplicationWindow):
         self.open_connection()
 
     def _open_youtube_sign_in(self) -> None:
-        browser = self.youtube.browser or self._detect_cookie_browser()
-        if browser:
-            self.youtube.browser = browser
-            self.downloads.browser = browser
-            if self.mpv_player:
-                self.mpv_player.set_youtube_browser(browser)
-            self.config.save_youtube_browser(browser)
+        existing = getattr(self, "youtube_login_window", None)
+        if existing and existing.get_visible():
+            existing.present()
+            return
+        from tubefin.youtube_login import create_login
+
+        def connected() -> None:
+            self.youtube.browser = "tubefin"
+            self._verify_youtube_browser_session(wait=False)
+
+        self.youtube_login_window = create_login(self, self.youtube.cookie_file, connected)
+
+    def _sign_out_youtube(self) -> None:
+        gi.require_version("WebKit", "6.0")
+        from gi.repository import WebKit
+        root = self.config.directory / "youtube-session"
+        session = getattr(self, "youtube_network_session", None)
+        if session is None:
+            session = WebKit.NetworkSession.new(str(root), str(root / "cache"))
+            self.youtube_network_session = session
+        manager = session.get_website_data_manager()
+
+        def cleared(source, result) -> None:
+            try:
+                source.clear_finish(result)
+                self.youtube.cookie_file.unlink(missing_ok=True)
+            except (GLib.Error, OSError) as error:
+                self.toast_overlay.add_toast(Adw.Toast(title=f"Could not sign out: {error}"))
+                return
+            self.youtube.browser = ""
             self.youtube_browser_session = None
+            self.youtube_browser_checking = False
             self.youtube_browser_error = ""
-            self.youtube_browser_checking = True
-            if hasattr(self, "comment_composer"):
-                self._refresh_comment_composer()
-            self.youtube_settings_status.set_subtitle(
-                f"Waiting for YouTube sign-in in {browser.title()}…"
-            )
-            self.youtube_sign_in_button.set_sensitive(False)
-            self.youtube_sign_in_button.set_label("Checking…")
-        else:
-            self.youtube_settings_status.set_subtitle(
-                "Browser opened; no supported local browser profile was found"
-            )
-        self._launch_youtube_browser()
-        if browser:
-            self._verify_youtube_browser_session(wait=True)
+            self.youtube_settings_status.set_subtitle(self._youtube_connection_status())
+            self.toast_overlay.add_toast(Adw.Toast(title="Signed out of YouTube"))
+            self._refresh_comment_composer()
+            # Retain the network session until its asynchronous clear completes.
+            _ = session
+
+        self.toast_overlay.add_toast(Adw.Toast(title="Signing out of YouTube…"))
+        manager.clear(WebKit.WebsiteDataTypes.ALL, 0, None, cleared)
 
     def _verify_youtube_browser_session(self, *, wait: bool = False) -> None:
         self.youtube_browser_checking = True
@@ -11183,34 +11211,16 @@ class TubeFinWindow(Adw.ApplicationWindow):
 
     def _youtube_connection_status(self) -> str:
         if self.youtube_browser_session:
-            browser = self.youtube_browser_session.browser.title()
+            browser = "TubeFin"
             api = " + API access" if self.active_oauth_account else ""
             return f"{self.youtube_browser_session.display_name} · Signed in through {browser}{api}"
         if self.youtube_browser_checking and self.youtube.browser:
-            return f"Checking the YouTube session in {self.youtube.browser.title()}…"
+            return "Checking your YouTube account…"
         if self.active_oauth_account:
             return f"{self.active_oauth_account.display_name} · API access connected"
         if self.youtube_browser_error and self.youtube.browser:
-            return f"Not signed in through {self.youtube.browser.title()}"
-        return "Open YouTube and sign in there"
-
-    @staticmethod
-    def _detect_cookie_browser() -> str:
-        candidates = (
-            ("firefox", Path.home() / ".mozilla/firefox"),
-            ("chromium", Path.home() / ".config/chromium"),
-            ("chrome", Path.home() / ".config/google-chrome"),
-            ("brave", Path.home() / ".config/BraveSoftware/Brave-Browser"),
-        )
-        return next((name for name, path in candidates if path.exists()), "")
-
-    @staticmethod
-    def _launch_youtube_browser() -> None:
-        # The browser whose cookies yt-dlp can read is not necessarily the
-        # user's preferred browser. Let GIO/xdg-desktop-portal resolve the
-        # registered HTTPS handler instead of launching the cookie source.
-        with suppress(GLib.Error):
-            TubeFinWindow._launch_default_uri("https://www.youtube.com/")
+            return "YouTube sign-in needs attention"
+        return "Sign in to YouTube inside TubeFin"
 
     @staticmethod
     def _launch_default_uri(uri: str) -> None:

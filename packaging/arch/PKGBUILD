@@ -1,5 +1,5 @@
 pkgname=tubefin
-pkgver=1.4.0
+pkgver=1.7.3
 pkgrel=1
 pkgdesc='Native GTK YouTube and Jellyfin client'
 arch=('any')
@@ -20,6 +20,8 @@ depends=(
   'python'
   'python-gobject'
   'python-mpv'
+  'python-pynacl'
+  'webkitgtk-6.0'
   'python-websocket-client'
   'yt-dlp'
 )
@@ -33,10 +35,10 @@ package() {
   cp -a src/tubefin "$pkgdir/usr/lib/tubefin/"
   find "$pkgdir/usr/lib/tubefin" -type d -name __pycache__ -prune -exec rm -rf {} +
   install -Dm755 packaging/arch/tubefin "$pkgdir/usr/bin/tubefin"
-  install -Dm644 data/io.github.doromiert.TubeFin.desktop \
-    "$pkgdir/usr/share/applications/io.github.doromiert.TubeFin.desktop"
-  install -Dm644 data/io.github.doromiert.TubeFin.metainfo.xml \
-    "$pkgdir/usr/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml"
-  install -Dm644 data/io.github.doromiert.TubeFin.svg \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg"
+  install -Dm644 data/com.neg-zero.Tubefin.desktop \
+    "$pkgdir/usr/share/applications/com.neg-zero.Tubefin.desktop"
+  install -Dm644 data/com.neg-zero.Tubefin.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/com.neg-zero.Tubefin.metainfo.xml"
+  install -Dm644 data/com.neg-zero.Tubefin.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.neg-zero.Tubefin.svg"
 }

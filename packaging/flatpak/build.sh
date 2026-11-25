@@ -14,10 +14,10 @@ flatpak-builder \
   --install-deps-from=flathub \
   --repo="$repository_directory" \
   "$build_directory" \
-  "$repository_root/io.github.doromiert.TubeFin.yaml"
+  "$repository_root/com.neg-zero.Tubefin.yaml"
 flatpak build-bundle \
   "$repository_directory" \
   "$output_directory/TubeFin-$version.flatpak" \
-  io.github.doromiert.TubeFin \
+  com.neg-zero.Tubefin \
   stable \
   --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo

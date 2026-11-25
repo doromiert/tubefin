@@ -196,7 +196,7 @@ class MprisService:
             "CanRaise": GLib.Variant("b", True),
             "HasTrackList": GLib.Variant("b", False),
             "Identity": GLib.Variant("s", "TubeFin"),
-            "DesktopEntry": GLib.Variant("s", "io.github.doromiert.TubeFin"),
+            "DesktopEntry": GLib.Variant("s", "com.neg-zero.Tubefin"),
             "SupportedUriSchemes": GLib.Variant("as", ["http", "https"]),
             "SupportedMimeTypes": GLib.Variant("as", ["video/mp4", "video/webm"]),
             "Fullscreen": GLib.Variant("b", self.window._player_is_fullscreen()),

@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,9 +115,11 @@ class YouTubeService:
         "watch_later": "https://www.youtube.com/playlist?list=WL",
     }
 
-    def __init__(self, browser: str = "") -> None:
+    def __init__(self, browser: str = "", *, cookie_file: Path | None = None) -> None:
         self.executable = shutil.which("yt-dlp")
-        self.browser = browser
+        self.cookie_file = cookie_file
+        self.browser = "tubefin" if cookie_file and cookie_file.exists() else browser
+        self.max_height = 1080
         self.avatar_cache = ChannelAvatarCache()
         self._avatar_locks: dict[str, threading.Lock] = {}
         self._avatar_locks_guard = threading.Lock()
@@ -207,12 +209,17 @@ class YouTubeService:
             )
         )
 
-    def _run(self, *arguments: str) -> dict[str, Any]:
+    def _run(self, *arguments: str, authenticated: bool = True) -> dict[str, Any]:
         if not self.executable:
             raise ServiceError("yt-dlp is not installed. Run TubeFin through Nix to include it.")
         snapshot_owner = False
         browser_arguments: list[str] = []
-        if self.browser:
+        if not authenticated:
+            pass
+        elif self.cookie_file is not None:
+            if self.cookie_file.exists():
+                browser_arguments = ["--cookies", str(self.cookie_file)]
+        elif self.browser:
             self.cookie_snapshot_lock.acquire()
             if self.cookie_snapshot_browser != self.browser:
                 self.cookie_snapshot_ready = False
@@ -1302,6 +1309,12 @@ class YouTubeService:
         return walk(data)
 
     def _export_browser_cookies(self) -> str:
+        if self.cookie_file is not None:
+            if not self.cookie_file.exists():
+                raise ServiceError("Sign in to YouTube in TubeFin first.")
+            with tempfile.NamedTemporaryFile(delete=False) as snapshot:
+                snapshot.write(self.cookie_file.read_bytes())
+                return snapshot.name
         if not self.executable:
             raise ServiceError("yt-dlp is not installed.")
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as cookie_file:
@@ -1494,7 +1507,9 @@ class YouTubeService:
             "skip_download": True,
             "socket_timeout": 10,
         }
-        if self.browser and self.cookie_snapshot_ready:
+        if self.cookie_file is not None and self.cookie_file.exists():
+            options["cookiefile"] = str(self.cookie_file)
+        elif self.browser and self.cookie_snapshot_ready:
             options["cookiefile"] = str(self.cookie_snapshot_path)
         with yt_dlp.YoutubeDL(options) as resolver:
             data = resolver.extract_info(video_url, download=False)
@@ -1545,8 +1560,87 @@ class YouTubeService:
         )
         return None
 
+    def resume_position(self, item: MediaItem) -> float:
+        if not self.browser:
+            return 0.0
+        cookie_path = self._export_browser_cookies()
+        try:
+            jar = http.cookiejar.MozillaCookieJar(cookie_path)
+            jar.load(ignore_discard=True, ignore_expires=False)
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+            request = urllib.request.Request(
+                f"https://www.youtube.com/watch?v={urllib.parse.quote(item.id)}",
+                headers={"User-Agent": "Mozilla/5.0 TubeFin", "Accept-Language": "en-US,en;q=0.8"},
+            )
+            with opener.open(request, timeout=6) as response:
+                html = response.read(12 * 1024 * 1024).decode("utf-8", errors="ignore")
+            return self._resume_from_watch_page(html, item.id)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(cookie_path)
+
+    @staticmethod
+    def _resume_from_watch_page(html: str, video_id: str) -> float:
+        import math
+        match = re.search(r"(?:var\s+)?ytInitialPlayerResponse\s*=\s*", html)
+        if not match:
+            return 0.0
+        try:
+            player, _end = json.JSONDecoder().raw_decode(html, match.end())
+            details = player.get("videoDetails") or {}
+            if details.get("videoId") != video_id:
+                return 0.0
+            start = ((player.get("playerConfig") or {}).get("playbackStartConfig") or {})
+            value = start.get("startSeconds")
+            if value is None:
+                milliseconds = (start.get("startPosition") or {}).get("streamTimeMillis") or 0
+                value = float(milliseconds) / 1000
+            position = float(value)
+            duration = float(details.get("lengthSeconds") or 0)
+            if not math.isfinite(position) or position <= 0 or duration and position >= duration:
+                return 0.0
+            return position
+        except (ValueError, TypeError, AttributeError):
+            return 0.0
+
     def resolve(self, item: MediaItem) -> ResolvedStream:
-        return self._resolve_youtube_stream(item, fast=False)
+        if not self.browser:
+            return self._resolve_youtube_stream(item, fast=False)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            resume = pool.submit(self.resume_position, item)
+            stream = self._resolve_youtube_stream(item, fast=False)
+            # A failed account-history request must not prevent video playback.
+            with suppress(OSError, ServiceError, ValueError):
+                stream.resume_position = resume.result()
+        return stream
+
+    def _playback_data(self, arguments: list[str], video_url: str) -> dict[str, Any]:
+        if self.cookie_file is None or not self.cookie_file.exists():
+            return self._run(*arguments, video_url)
+        # Account clients can expose broken adaptive audio while public clients
+        # expose working 4K/HDR. Keep account metadata and both sets of formats.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            account = pool.submit(self._run, *arguments, video_url)
+            public = pool.submit(self._run, *arguments, video_url, authenticated=False)
+            account_error = None
+            try:
+                data = account.result()
+            except ServiceError as error:
+                account_error = error
+                data = None
+            try:
+                public_data = public.result()
+            except ServiceError:
+                if data is None:
+                    raise account_error from None
+                return data
+        if data is None:
+            return public_data
+        public_formats = [dict(value, _tubefin_public=True)
+                          for value in public_data.get("formats") or []]
+        data = dict(data)
+        data["formats"] = [*public_formats, *(data.get("formats") or [])]
+        return data
 
     def _resolve_youtube_stream(
         self, item: MediaItem, *, fast: bool
@@ -1558,7 +1652,7 @@ class YouTubeService:
             "--no-warnings",
             "--no-write-comments",
             "--format",
-            "best[height<=1080][vcodec^=avc1][acodec^=mp4a]/best[height<=1080]/best",
+            f"bestvideo[height<={self.max_height}]+bestaudio/best[height<={self.max_height}]/bestvideo+bestaudio/best",
         ]
         format_selector = arguments[-1]
         if fast:
@@ -1584,7 +1678,7 @@ class YouTubeService:
                     "Fast YouTube stream exceeded its time budget"
                     f" ({self.fast_resolver_status})."
                 )
-            data = self._run(*arguments, str(video_url))
+            data = self._playback_data(arguments, str(video_url))
         formats = list(data.get("formats") or [])
         explicit_original_languages = {
             str(candidate.get("language") or "").casefold()
@@ -1610,126 +1704,89 @@ class YouTubeService:
             # video's original track. Prefer them over an explicitly dubbed mux.
             return 1 if language in {"", "und"} else 0
 
-        muxed_formats = [
-            candidate
-            for candidate in formats
-            if candidate.get("url")
-            and candidate.get("vcodec") not in {None, "none"}
+        audio_formats = [
+            candidate for candidate in formats
+            if candidate.get("url") and candidate.get("vcodec") == "none"
             and candidate.get("acodec") not in {None, "none"}
-            and int(candidate.get("height") or 0) <= 1080
         ]
-        original_muxed = [
-            candidate
-            for candidate in muxed_formats
-            if original_audio_rank(candidate)
+        audio_formats.sort(key=lambda candidate: (
+            original_audio_rank(candidate),
+            float(candidate.get("language_preference") or 0),
+            float(candidate.get("abr") or candidate.get("tbr") or 0),
+        ), reverse=True)
+        audio = next((candidate for candidate in audio_formats if self._youtube_stream_responds(
+            str(candidate["url"]), self._youtube_stream_headers(candidate, data)
+        )), None)
+        video_formats = [
+            candidate for candidate in formats
+            if candidate.get("url") and candidate.get("vcodec") not in {None, "none"}
+            and (candidate.get("acodec") not in {None, "none"} or audio is not None)
         ]
-        ranked_original_muxed = sorted(
-            original_muxed,
-            key=lambda candidate: (
-                original_audio_rank(candidate),
+        # Extraction can return only a selected format (including live streams).
+        if data.get("url") and not any(value["url"] == data["url"] for value in video_formats):
+            video_formats.append(data)
+
+        def rank(candidate: dict[str, Any]) -> tuple:
+            return (
                 int(candidate.get("height") or 0),
-                str(candidate.get("vcodec") or "").startswith("avc1"),
+                str(candidate.get("dynamic_range") or "SDR") not in {"SDR", ""},
+                float(candidate.get("fps") or 0),
+                bool(candidate.get("_tubefin_public")),
+                candidate.get("acodec") in {None, "none"},
                 float(candidate.get("tbr") or 0),
-            ),
-            reverse=True,
-        )
-        selected: dict[str, Any] | None = None
-        if data.get("url"):
-            selected = {
-                "url": data.get("url"),
-                "http_headers": data.get("http_headers") or {},
-                "format_id": data.get("format_id") or "auto",
-            }
-        # Signed media URLs occasionally arrive already unusable. Every resolver
-        # taking part in the race must prove its candidate with a one-byte range
-        # request before it is allowed to claim playback.
-        candidates = (
-            ([selected] if selected else []) + ranked_original_muxed[:3]
-            if fast
-            else ranked_original_muxed[:3] + ([selected] if selected else [])
-        )
-        unique_candidates: list[tuple[dict[str, Any], str, dict[str, str]]] = []
-        seen_urls: set[str] = set()
-        for candidate in candidates:
-            candidate_url = str(candidate.get("url") or "")
-            if not candidate_url or candidate_url in seen_urls:
-                continue
-            seen_urls.add(candidate_url)
-            unique_candidates.append(
-                (
-                    candidate,
-                    candidate_url,
-                    self._youtube_stream_headers(candidate, data),
-                )
             )
 
-        def responds(entry: tuple[dict[str, Any], str, dict[str, str]]) -> bool:
-            _, candidate_url, candidate_headers = entry
-            return self._youtube_stream_responds(candidate_url, candidate_headers)
-
-        # Probe every candidate at once; signed URLs frequently arrive dead and
-        # sequential probes would stack a full round trip per dead candidate.
+        video_formats.sort(key=rank, reverse=True)
+        eligible = [value for value in video_formats
+                    if int(value.get("height") or 0) <= self.max_height]
+        if not eligible and video_formats:
+            smallest = min(int(value.get("height") or 0) for value in video_formats)
+            eligible = [value for value in video_formats
+                        if int(value.get("height") or 0) == smallest]
         chosen_stream = None
-        if len(unique_candidates) == 1:
-            if responds(unique_candidates[0]):
-                chosen_stream = unique_candidates[0][0]
-        elif unique_candidates:
-            pool = ThreadPoolExecutor(
-                max_workers=len(unique_candidates),
-                thread_name_prefix="stream-validate",
+        # A muxed legacy URL can be dead while adaptive video/audio still work.
+        # Validate alternatives in quality order; a faster low-quality probe must not win.
+        for offset in range(0, len(eligible), 4):
+            batch = eligible[offset:offset + 4]
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                valid = list(pool.map(lambda value: self._youtube_stream_responds(
+                    str(value["url"]), self._youtube_stream_headers(value, data)
+                ), batch))
+            chosen_stream = next(
+                (value for value, works in zip(batch, valid, strict=True) if works), None
             )
-            futures = {
-                pool.submit(responds, entry): entry for entry in unique_candidates
-            }
-            try:
-                for future in as_completed(futures):
-                    if future.result():
-                        chosen_stream = futures[future][0]
-                        break
-            finally:
-                for future in futures:
-                    future.cancel()
-                # A dead candidate may still be inside urllib's timeout. Do not
-                # hold playback for it after another candidate has validated.
-                pool.shutdown(wait=chosen_stream is None, cancel_futures=True)
-        if chosen_stream is not None and fast:
-            format_id = str(chosen_stream.get("format_id") or "auto")
-            self.fast_resolver_status += f" · verified format {format_id}"
+            if chosen_stream is not None:
+                break
         if chosen_stream is None:
-            if fast:
-                self.fast_resolver_status += " · media URL validation failed"
             raise ServiceError(
-                f"{'Fast' if fast else 'Reliable'} YouTube stream failed validation."
+                "YouTube returned no playable video stream. Try refreshing the video."
             )
-        stream_url = chosen_stream.get("url") if chosen_stream else data.get("url")
-        if not stream_url:
-            raise ServiceError("No compatible YouTube stream was found.")
-        headers = self._youtube_stream_headers(chosen_stream or {}, data)
+        stream_url = str(chosen_stream["url"])
+        headers = self._youtube_stream_headers(chosen_stream, data)
+
+        def external_audio(candidate: dict[str, Any]) -> str:
+            return str(audio["url"]) if audio and candidate.get("acodec") in {None, "none"} else ""
+
+        def quality_label(candidate: dict[str, Any]) -> str:
+            height = int(candidate.get("height") or 0)
+            fps = float(candidate.get("fps") or 0)
+            dynamic = str(candidate.get("dynamic_range") or "SDR")
+            return (f"{height}p" + (f"{fps:g}" if fps > 30 else "")
+                    + (" HDR" if dynamic not in {"SDR", ""} else "")) if height else "Live"
+
         variants: list[StreamVariant] = []
-        heights = sorted(
-            {int(candidate.get("height") or 0) for candidate in original_muxed},
-            reverse=True,
-        )
-        for height in heights:
-            candidates = [
-                candidate
-                for candidate in original_muxed
-                if int(candidate.get("height") or 0) == height
-            ]
-            candidate = max(
-                candidates,
-                key=lambda value: (
-                    original_audio_rank(value),
-                    str(value.get("vcodec") or "").startswith("avc1"),
-                    float(value.get("tbr") or 0),
-                ),
-            )
-            variant_headers = {
-                str(name): str(value)
-                for name, value in (candidate.get("http_headers") or headers).items()
-                if value is not None
-            }
-            variants.append(StreamVariant(f"{height}p", str(candidate["url"]), variant_headers))
+        seen_qualities: set[str] = set()
+        for candidate in video_formats:
+            if not candidate.get("height") and not data.get("is_live"):
+                continue
+            label = quality_label(candidate)
+            if label in seen_qualities:
+                continue
+            seen_qualities.add(label)
+            variants.append(StreamVariant(
+                label, str(candidate["url"]), self._youtube_stream_headers(candidate, data),
+                external_audio(candidate),
+            ))
 
         subtitles: list[SubtitleTrack] = []
         authored = data.get("subtitles") or {}
@@ -1777,6 +1834,8 @@ class YouTubeService:
                 else ""
             ),
             chapters=self._chapters(data) if not fast else [],
+            default_label=f"Auto · {quality_label(chosen_stream)}",
+            audio_url=external_audio(chosen_stream),
         )
 
     @staticmethod

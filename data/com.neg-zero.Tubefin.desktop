@@ -2,7 +2,7 @@
 Name=TubeFin
 Comment=Watch YouTube and your Jellyfin library
 Exec=tubefin
-Icon=io.github.doromiert.TubeFin
+Icon=com.neg-zero.Tubefin
 Terminal=false
 Type=Application
 Categories=AudioVideo;Video;Player;GTK;

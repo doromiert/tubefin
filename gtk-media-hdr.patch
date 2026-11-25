@@ -1,0 +1,313 @@
+From: Galeria contributors
+Subject: [PATCH] wayland: SDR parent surfaces with independently HDR media
+
+App-scoped backport for GTK 4.22. GDK_MEDIA_ONLY_HDR=1 keeps parent/popup
+surfaces SDR, while graphics-offload subsurfaces retain their media color
+state. HDR memory textures use compositor-advertised RGBA16F shared buffers
+rather than the debug path's SDR 8-bit Cairo conversion. No public ABI change.
+GTK source license: LGPL-2.1-or-later.
+
+--- a/gdk/wayland/gdksurface-wayland.c
++++ b/gdk/wayland/gdksurface-wayland.c
+@@ -892,6 +892,10 @@
+                      "preferred color state, surface %p color state %s",
+                      self, gdk_color_state_get_name (color_state));
+ 
++  /* Keep SDR UI on the parent; offloaded media has its own color state. */
++  if (g_strcmp0 (g_getenv ("GDK_MEDIA_ONLY_HDR"), "1") == 0)
++    color_state = gdk_color_state_get_srgb ();
++
+   gdk_surface_set_color_state (GDK_SURFACE (self), color_state);
+ 
+   self->color_state_changed = TRUE;
+--- a/gdk/wayland/gdkdisplay-wayland.c
++++ b/gdk/wayland/gdkdisplay-wayland.c
+@@ -429,6 +429,9 @@
+                struct wl_shm *wl_shm,
+                uint32_t       format)
+ {
++  if (format == WL_SHM_FORMAT_ABGR16161616F)
++    ((GdkWaylandDisplay *) data)->shm_abgr16f = TRUE;
++
+   GDK_DEBUG (MISC, "supported shm pixel format %.4s (0x%X)",
+              format == 0 ? "ARGB8888"
+                : (format == 1 ? "XRGB8888"
+--- a/gdk/wayland/gdkdisplay-wayland.h
++++ b/gdk/wayland/gdkdisplay-wayland.h
+@@ -104,6 +104,7 @@
+   struct wl_registry *wl_registry;
+   struct wl_compositor *compositor;
+   struct wl_shm *shm;
++  gboolean shm_abgr16f;
+   struct zwp_linux_dmabuf_v1 *linux_dmabuf;
+   DmabufFormatsInfo *dmabuf_formats_info;
+   struct xdg_wm_base *xdg_wm_base;
+--- a/gdk/wayland/gdkshm-private.h
++++ b/gdk/wayland/gdkshm-private.h
+@@ -28,3 +28,7 @@
+ gboolean          _gdk_wayland_is_shm_surface             (cairo_surface_t   *surface);
+ struct wl_buffer *_gdk_wayland_shm_texture_get_wl_buffer  (GdkWaylandDisplay *display,
+                                                            GdkTexture        *texture);
++
++GdkColorState *_gdk_wayland_shm_texture_color_state (GdkTexture *texture);
++gboolean _gdk_wayland_shm_texture_use_hdr (GdkWaylandDisplay *display,
++                                          GdkTexture        *texture);
+--- a/gdk/wayland/gdkshm.c
++++ b/gdk/wayland/gdkshm.c
+@@ -28,6 +28,9 @@
+ #endif
+ 
+ #include "gdkshm-private.h"
++#include "gdkcicpparams.h"
++#include "gdkcolorstate.h"
++#include "gdkmemorytextureprivate.h"
+ 
+ /* {{{ Shm buffer handling */
+ 
+@@ -239,6 +242,84 @@
+ 
+ /* }}} */
+ 
++GdkColorState *
++_gdk_wayland_shm_texture_color_state (GdkTexture *texture)
++{
++  return GDK_IS_MEMORY_TEXTURE (texture) ? gdk_color_state_get_rec2100_pq ()
++                                        : gdk_texture_get_color_state (texture);
++}
++
++/* HDR memory textures need high precision and their actual color state. */
++gboolean
++_gdk_wayland_shm_texture_use_hdr (GdkWaylandDisplay *display,
++                                 GdkTexture        *texture)
++{
++  GdkCicpParams *params;
++  guint transfer;
++
++  if (!display->shm_abgr16f ||
++      g_strcmp0 (g_getenv ("GDK_MEDIA_ONLY_HDR"), "1") != 0)
++    return FALSE;
++
++  params = gdk_color_state_create_cicp_params (gdk_texture_get_color_state (texture));
++  if (!params)
++    return FALSE;
++  transfer = gdk_cicp_params_get_transfer_function (params);
++  g_object_unref (params);
++  return transfer == 16 || transfer == 18;
++}
++
++typedef struct {
++  gpointer pixels;
++  size_t size;
++  struct wl_shm_pool *pool;
++} HdrShmData;
++
++static void
++hdr_shm_release (void *data, struct wl_buffer *buffer)
++{
++  HdrShmData *hdr = data;
++  wl_buffer_destroy (buffer);
++  wl_shm_pool_destroy (hdr->pool);
++  munmap (hdr->pixels, hdr->size);
++  g_free (hdr);
++}
++
++static const struct wl_buffer_listener hdr_shm_listener = { hdr_shm_release };
++
++static struct wl_buffer *
++hdr_shm_buffer (GdkWaylandDisplay *display, GdkTexture *texture)
++{
++  int width = gdk_texture_get_width (texture);
++  int height = gdk_texture_get_height (texture);
++  int stride;
++  HdrShmData *data;
++  GdkTextureDownloader *downloader;
++  struct wl_buffer *buffer;
++
++  if (width > G_MAXINT / 8 || height > G_MAXINT / (width * 8))
++    return NULL;
++  stride = width * 8;
++  data = g_new0 (HdrShmData, 1);
++  data->pool = create_shm_pool (display->shm, height * stride,
++                                &data->size, &data->pixels);
++  if (!data->pool)
++    {
++      g_free (data);
++      return NULL;
++    }
++
++  downloader = gdk_texture_downloader_new (texture);
++  gdk_texture_downloader_set_format (downloader, GDK_MEMORY_R16G16B16A16_FLOAT_PREMULTIPLIED);
++  gdk_texture_downloader_set_color_state (downloader, _gdk_wayland_shm_texture_color_state (texture));
++  gdk_texture_downloader_download_into (downloader, data->pixels, stride);
++  gdk_texture_downloader_free (downloader);
++  buffer = wl_shm_pool_create_buffer (data->pool, 0, width, height, stride,
++                                       WL_SHM_FORMAT_ABGR16161616F);
++  wl_buffer_add_listener (buffer, &hdr_shm_listener, data);
++  return buffer;
++}
++
+ struct wl_buffer *
+ _gdk_wayland_shm_texture_get_wl_buffer (GdkWaylandDisplay *display,
+                                         GdkTexture        *texture)
+@@ -248,11 +329,15 @@
+   GdkTextureDownloader *downloader;
+   struct wl_buffer *buffer;
+ 
++  if (_gdk_wayland_shm_texture_use_hdr (display, texture))
++    return hdr_shm_buffer (display, texture);
++
+   width = gdk_texture_get_width (texture);
+   height = gdk_texture_get_height (texture);
+   surface = gdk_wayland_display_create_shm_surface (display, width, height);
+ 
+   downloader = gdk_texture_downloader_new (texture);
++  gdk_texture_downloader_set_color_state (downloader, gdk_texture_get_color_state (texture));
+ 
+   gdk_texture_downloader_download_into (downloader,
+                                         cairo_image_surface_get_data (surface),
+--- a/gdk/wayland/gdksubsurface-wayland.c
++++ b/gdk/wayland/gdksubsurface-wayland.c
+@@ -20,6 +20,7 @@
+ #include "gdksubsurface-wayland-private.h"
+ 
+ #include "gdkmemoryformatprivate.h"
++#include "gdkmemorytextureprivate.h"
+ #include "gdkdisplay-wayland.h"
+ #include "gdkdmabuftextureprivate.h"
+ #include "gdksurface-wayland-private.h"
+@@ -309,6 +310,12 @@
+       GdkMemoryFormat format = gdk_texture_get_format (texture);
+ 
+       done = TRUE;
++      if (_gdk_wayland_shm_texture_use_hdr (GDK_WAYLAND_DISPLAY (display), texture))
++        {
++          *out_fourcc = DRM_FORMAT_ABGR16161616F;
++          *out_premultiplied = TRUE;
++          return TRUE;
++        }
+       if (format == GDK_MEMORY_G8_B8R8_420)
+         *out_fourcc = DRM_FORMAT_NV12;
+       else if (gdk_memory_format_alpha (format) == GDK_MEMORY_ALPHA_OPAQUE)
+@@ -637,7 +644,7 @@
+     }
+   else if (texture && texture != self->texture &&
+            !gdk_wayland_color_surface_can_set_color_state (self->color,
+-                                                           gdk_texture_get_color_state (texture),
++                                                           _gdk_wayland_shm_texture_use_hdr (display, texture) && GDK_IS_MEMORY_TEXTURE (texture) ? gdk_color_state_get_rec2100_pq () : gdk_texture_get_color_state (texture),
+                                                            fourcc, premultiplied,
+                                                            &error))
+     {
+@@ -742,7 +749,7 @@
+ 
+           if (color_changed)
+             {
+-              GdkColorState *cs = gdk_texture_get_color_state (texture);
++              GdkColorState *cs = _gdk_wayland_shm_texture_use_hdr (display, texture) && GDK_IS_MEMORY_TEXTURE (texture) ? gdk_color_state_get_rec2100_pq () : gdk_texture_get_color_state (texture);
+               GDK_DISPLAY_DEBUG (gdk_surface_get_display (sub->parent), OFFLOAD,
+                                  "[%p] Setting color state %s",
+                                  self, gdk_color_state_get_name (cs));
+--- a/gsk/gpu/gskgpurenderer.c
++++ b/gsk/gpu/gskgpurenderer.c
+@@ -454,6 +454,8 @@
+   gsk_gpu_renderer_make_current (self);
+ 
+   depth = gsk_render_node_get_preferred_depth (root);
++  if (g_strcmp0 (g_getenv ("GDK_MEDIA_ONLY_HDR"), "1") == 0)
++    depth = GDK_MEMORY_U8;
+   frame = gsk_gpu_renderer_get_frame (self);
+   scale = gdk_surface_get_scale (gdk_draw_context_get_surface (priv->context));
+ 
+
+# TubeFin GtkGLArea PQ/float16 extension; GTK source LGPL-2.1-or-later.
+--- a/gtk/gtkglarea.c
++++ b/gtk/gtkglarea.c
+@@ -189,6 +189,7 @@
+   gboolean needs_resize;
+   gboolean needs_render;
+   gboolean auto_render;
++  gboolean media_hdr;
+   gboolean use_es;
+   GdkGLAPI allowed_apis;
+ } GtkGLAreaPrivate;
+@@ -204,6 +205,7 @@
+   PROP_API,
+ 
+   PROP_AUTO_RENDER,
++  PROP_MEDIA_HDR,
+ 
+   LAST_PROP
+ };
+@@ -235,6 +237,15 @@
+ 
+   switch (prop_id)
+     {
++    case PROP_MEDIA_HDR:
++      {
++        GtkGLAreaPrivate *priv = gtk_gl_area_get_instance_private (self);
++        priv->media_hdr = g_value_get_boolean (value);
++        priv->needs_render = TRUE;
++        gtk_widget_queue_draw (GTK_WIDGET (self));
++      }
++      break;
++
+     case PROP_AUTO_RENDER:
+       gtk_gl_area_set_auto_render (self, g_value_get_boolean (value));
+       break;
+@@ -272,6 +283,10 @@
+ 
+   switch (prop_id)
+     {
++    case PROP_MEDIA_HDR:
++      g_value_set_boolean (value, priv->media_hdr);
++      break;
++
+     case PROP_AUTO_RENDER:
+       g_value_set_boolean (value, priv->auto_render);
+       break;
+@@ -547,7 +562,8 @@
+   height = gtk_widget_get_height (widget) * scale;
+ 
+   if (gdk_gl_texture_builder_get_width (priv->texture->builder) != width ||
+-      gdk_gl_texture_builder_get_height (priv->texture->builder) != height)
++      gdk_gl_texture_builder_get_height (priv->texture->builder) != height ||
++      (gdk_gl_texture_builder_get_format (priv->texture->builder) == GDK_MEMORY_R16G16B16A16_FLOAT_PREMULTIPLIED) != priv->media_hdr)
+     {
+       glBindTexture (GL_TEXTURE_2D, gdk_gl_texture_builder_get_id (priv->texture->builder));
+       glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+@@ -555,7 +571,15 @@
+       glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+       glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+ 
+-      if (gdk_gl_context_get_api (priv->context) == GDK_GL_API_GLES)
++      gdk_gl_texture_builder_set_color_state (priv->texture->builder,
++          priv->media_hdr ? gdk_color_state_get_rec2100_pq () : gdk_color_state_get_srgb ());
++      gdk_gl_texture_builder_set_format (priv->texture->builder,
++          priv->media_hdr ? GDK_MEMORY_R16G16B16A16_FLOAT_PREMULTIPLIED :
++          (gdk_gl_context_get_api (priv->context) == GDK_GL_API_GLES ?
++           GDK_MEMORY_R8G8B8A8_PREMULTIPLIED : GDK_MEMORY_B8G8R8A8_PREMULTIPLIED));
++      if (priv->media_hdr)
++        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
++      else if (gdk_gl_context_get_api (priv->context) == GDK_GL_API_GLES)
+         glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+       else
+         glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+@@ -833,6 +857,7 @@
+           gdk_dmabuf_texture_builder_set_width (builder, gdk_texture_get_width (texture->gl_texture));
+           gdk_dmabuf_texture_builder_set_height (builder, gdk_texture_get_height (texture->gl_texture));
+           gdk_dmabuf_texture_builder_set_premultiplied (builder, TRUE);
++          gdk_dmabuf_texture_builder_set_color_state (builder, gdk_texture_get_color_state (texture->gl_texture));
+           gdk_dmabuf_texture_builder_set_dmabuf (builder, &dmabuf);
+ 
+           texture->dmabuf_texture = gdk_dmabuf_texture_builder_build (builder, release_dmabuf_texture, texture, NULL);
+@@ -901,6 +926,11 @@
+    * instance. If you need to render with other kinds of buffers (stencil,
+    * depth, etc), use render buffers.
+    */
++  /* App-local extension: only PQ video areas opt into float16 HDR buffers. */
++  obj_props[PROP_MEDIA_HDR] =
++    g_param_spec_boolean ("media-hdr", NULL, NULL, FALSE,
++                         G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
++
+   obj_props[PROP_CONTEXT] =
+     g_param_spec_object ("context", NULL, NULL,
+                          GDK_TYPE_GL_CONTEXT,

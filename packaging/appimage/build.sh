@@ -24,16 +24,16 @@ python3 -m pip install \
   --target="$appdir/usr/lib/tubefin" \
   --break-system-packages \
   --no-cache-dir \
-  websocket-client python-mpv yt-dlp
+  websocket-client python-mpv yt-dlp PyNaCl
 
 # 3. Install desktop file and icons properly
-install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.desktop" "$appdir/usr/share/applications/io.github.doromiert.TubeFin.desktop"
-install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg"
+install -Dm644 "$repository_root/data/com.neg-zero.Tubefin.desktop" "$appdir/usr/share/applications/com.neg-zero.Tubefin.desktop"
+install -Dm644 "$repository_root/data/com.neg-zero.Tubefin.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/com.neg-zero.Tubefin.svg"
 
 # AppImage root requirements for desktop icon integration
-cp "$repository_root/data/io.github.doromiert.TubeFin.svg" "$appdir/io.github.doromiert.TubeFin.svg"
-cp "$repository_root/data/io.github.doromiert.TubeFin.desktop" "$appdir/io.github.doromiert.TubeFin.desktop"
-ln -s io.github.doromiert.TubeFin.svg "$appdir/.DirIcon"
+cp "$repository_root/data/com.neg-zero.Tubefin.svg" "$appdir/com.neg-zero.Tubefin.svg"
+cp "$repository_root/data/com.neg-zero.Tubefin.desktop" "$appdir/com.neg-zero.Tubefin.desktop"
+ln -s com.neg-zero.Tubefin.svg "$appdir/.DirIcon"
 
 # 4. Launcher entrypoint (export XDG_DATA_DIRS so GTK/libadwaita finds the icon path inside AppDir)
 cat << 'EOF' > "$appdir/AppRun"

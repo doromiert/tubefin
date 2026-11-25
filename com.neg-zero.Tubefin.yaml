@@ -1,4 +1,4 @@
-app-id: io.github.doromiert.TubeFin
+app-id: com.neg-zero.Tubefin
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -38,6 +38,33 @@ modules:
       - type: archive
         url: https://files.pythonhosted.org/packages/77/bc/6aa34c8805ff62e2fefc7d171563c60598aac215d5241186031a2c839935/python_mpv-1.0.8.tar.gz
         sha256: 017fa359da059c831a94c419083491903e6d2f7c81b9841c33c196cabf4b3fe3
+
+  - name: python-pycparser
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/fe/cf/d2d3b9f5699fb1e4615c8e32ff220203e43b248e1dfcc6736ad9057731ca/pycparser-2.23.tar.gz
+        sha256: 78816d4f24add8f10a06d6f05b4d424ad9e96cfebf68a4ddc99c65c0720d00c2
+
+  - name: python-cffi
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz
+        sha256: 44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529
+
+  - name: python-pynacl
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=/app .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/06/c6/a3124dee667a423f2c637cfd262a54d67d8ccf3e160f3c50f622a85b7723/pynacl-1.6.0.tar.gz
+        sha256: cb36deafe6e2bce3b286e5d1f3e1c246e0ccdb8808ddb4550bb2792f2df298f2
 
   - name: websocket-client
     buildsystem: simple
@@ -89,9 +116,9 @@ modules:
     buildsystem: simple
     build-commands:
       - pip3 install --no-deps --no-build-isolation --prefix=/app .
-      - install -Dm644 data/io.github.doromiert.TubeFin.desktop /app/share/applications/io.github.doromiert.TubeFin.desktop
-      - install -Dm644 data/io.github.doromiert.TubeFin.metainfo.xml /app/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml
-      - install -Dm644 data/io.github.doromiert.TubeFin.png /app/share/icons/hicolor/128x128/apps/io.github.doromiert.TubeFin.png
+      - install -Dm644 data/com.neg-zero.Tubefin.desktop /app/share/applications/com.neg-zero.Tubefin.desktop
+      - install -Dm644 data/com.neg-zero.Tubefin.metainfo.xml /app/share/metainfo/com.neg-zero.Tubefin.metainfo.xml
+      - install -Dm644 data/com.neg-zero.Tubefin.png /app/share/icons/hicolor/128x128/apps/com.neg-zero.Tubefin.png
     sources:
       - type: dir
         path: .

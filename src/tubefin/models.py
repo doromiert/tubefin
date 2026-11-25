@@ -45,6 +45,8 @@ class ResolvedStream:
     description: str = ""
     published_date: str = ""
     chapters: list[VideoChapter] = field(default_factory=list)
+    audio_url: str = ""
+    resume_position: float = 0.0
 
 
 @dataclass(slots=True)
@@ -52,6 +54,7 @@ class StreamVariant:
     label: str
     url: str
     headers: dict[str, str] = field(default_factory=dict)
+    audio_url: str = ""
 
 
 @dataclass(slots=True)

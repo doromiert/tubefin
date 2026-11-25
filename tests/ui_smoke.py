@@ -43,7 +43,7 @@ def main() -> int:
                 (
                     "import os; from tubefin.application import TubeFinApplication; "
                     "app = TubeFinApplication("
-                    "f'io.github.doromiert.TubeFin.StartupSmoke{os.getpid()}'); "
+                    "f'com.neg-zero.Tubefin.StartupSmoke{os.getpid()}'); "
                     "raise SystemExit(app.run([]))"
                 ),
             ]

@@ -23,7 +23,7 @@ gi.require_version("GdkWayland", "4.0")
 gi.require_version("GdkX11", "4.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gdk, GdkWayland, GdkX11, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, GdkWayland, GdkX11, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 from tubefin.models import (  # noqa: E402
     AudioTrack,
@@ -100,6 +100,7 @@ class MpvGLArea(Gtk.GLArea):
         self.render_generation = 0
         self.render_error_reported = False
         self.framebuffer = ctypes.c_int()
+        self.hdr = False
         self.proc_address = mpv.MpvGlGetProcAddressFn(
             lambda _instance, name: _egl_get_proc_address(name)
         )
@@ -168,14 +169,67 @@ class MpvGLArea(Gtk.GLArea):
         _gl_get_integer(_gl_framebuffer_binding, self.framebuffer)
         self.context.render(
             flip_y=True,
+            block_for_target_time=False,
             opengl_fbo={
                 "w": width,
                 "h": height,
                 "fbo": self.framebuffer.value,
+                "internal_format": 0x881A if self.hdr else 0x8058,
             },
         )
         return True
 
+
+class VideoSurface(Gtk.Box):
+    """Keep media bounds integral in both Wayland and physical pixels."""
+
+    def __init__(self, child: Gtk.Widget) -> None:
+        super().__init__(hexpand=True, vexpand=True)
+        self.child = child
+        self.set_layout_manager(None)
+        self.append(child)
+        self.origin = None
+        self.add_tick_callback(self._geometry_changed)
+
+    def _geometry_changed(self, _widget, _clock) -> bool:
+        native = self.get_native()
+        if native:
+            ok, bounds = self.compute_bounds(native)
+            if ok:
+                current = (bounds.get_x(), bounds.get_y(), native.get_surface().get_scale())
+                if current != self.origin:
+                    self.origin = current
+                    self.queue_allocate()
+        return GLib.SOURCE_CONTINUE
+
+    def do_measure(self, orientation, for_size):
+        return 0, 0, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        from fractions import Fraction
+        from math import ceil, floor
+        native = self.get_native()
+        # Keep a windowed video clear of the toplevel's rounded corner clip.
+        inset = 0 if self.get_root() and self.get_root().is_fullscreen() else 12
+        x = y = inset
+        width = max(1, width - inset * 2)
+        height = max(1, height - inset * 2)
+        if native and native.get_surface():
+            step = Fraction(native.get_surface().get_scale()).limit_denominator(120).denominator
+            ok, bounds = self.compute_bounds(native)
+            dx, dy = native.get_surface_transform()
+            ox, oy = (bounds.get_x() + dx, bounds.get_y() + dy) if ok else (dx, dy)
+            right = ox + inset + width
+            bottom = oy + inset + height
+            x = ceil((ox + inset) / step - 1e-7) * step - ox
+            y = ceil((oy + inset) / step - 1e-7) * step - oy
+            width = max(step, floor(right / step + 1e-7) * step - ox - x)
+            height = max(step, floor(bottom / step + 1e-7) * step - oy - y)
+        transform = Gsk.Transform.new().translate(Graphene.Point().init(x, y))
+        self.child.allocate(round(width), round(height), baseline, transform)
+
+    def do_snapshot(self, snapshot):
+        self.snapshot_child(self.child, snapshot)
 
 class ChapterSeekBar(Gtk.DrawingArea):
     """One continuous drag target rendered as chapter-sized track pieces."""
@@ -199,8 +253,8 @@ class ChapterSeekBar(Gtk.DrawingArea):
         drag = Gtk.GestureDrag(button=1)
         drag.connect("drag-begin", self._drag_begin)
         drag.connect("drag-update", self._drag_update)
-        drag.group(click)
         self.add_controller(drag)
+        drag.group(click)
 
     def set_value(self, value: float) -> None:
         value = max(0.0, min(float(value), self.duration))
@@ -392,7 +446,7 @@ class MpvPlayer(Gtk.Box):
         on_state_changed: Callable[[float, float, bool], None] | None = None,
         default_caption_language: str = "",
         default_audio_language: str = "",
-        youtube_browser: str = "",
+        youtube_cookie_file: str = "",
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_focusable(True)
@@ -414,6 +468,10 @@ class MpvPlayer(Gtk.Box):
         self.seeking = False
         self.should_play = False
         self.shutting_down = False
+        self.last_position = 0.0
+        self.last_duration = 0.0
+        self.last_paused = True
+        self.known_tracks = []
         self.loop_file = False
         self.variants: list[StreamVariant] = []
         self.subtitles: list[SubtitleTrack] = []
@@ -421,6 +479,7 @@ class MpvPlayer(Gtk.Box):
         self.chapters: list[VideoChapter] = []
         self.original_audio_id = ""
         self.external_audio_ids: dict[str, str] = {}
+        self.default_audio_url = ""
         self.default_url = ""
         self.default_headers: dict[str, str] = {}
         self.default_quality_label = "Auto"
@@ -443,8 +502,8 @@ class MpvPlayer(Gtk.Box):
         self.last_audible_volume = 100.0
         self.last_motion: tuple[float, float] | None = None
         ytdl_raw_options = ["ignore-config=", "js-runtimes=deno"]
-        if youtube_browser:
-            ytdl_raw_options.append(f"cookies-from-browser={youtube_browser}")
+        if youtube_cookie_file:
+            ytdl_raw_options.append(f"cookies={youtube_cookie_file}")
         self.player = mpv.MPV(
             vo="libmpv",
             osc=False,
@@ -455,6 +514,10 @@ class MpvPlayer(Gtk.Box):
             keep_open=True,
             hwdec="no",
             gpu_hwdec_interop="no",
+            target_trc="srgb",
+            target_prim="bt.709",
+            target_peak=203,
+            video_timing_offset=0,
             ytdl=True,
             ytdl_raw_options=",".join(ytdl_raw_options),
             cache_secs=buffer_seconds,
@@ -474,7 +537,10 @@ class MpvPlayer(Gtk.Box):
         self.video_overlay = Gtk.Overlay()
         self.video_overlay.set_hexpand(True)
         self.video_overlay.set_vexpand(True)
-        self.video_overlay.set_child(self.video)
+        self.video_offload = Gtk.GraphicsOffload(child=self.video)
+        self.video_offload.set_black_background(True)
+        self.video_offload.set_enabled(Gtk.GraphicsOffloadEnabled.DISABLED)
+        self.video_overlay.set_child(VideoSurface(self.video_offload))
         self.fullscreen_transport = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=18
         )
@@ -691,6 +757,16 @@ class MpvPlayer(Gtk.Box):
         return controls
 
     def _observe(self) -> None:
+        @self.player.property_observer("track-list")
+        def tracks_changed(_name, tracks) -> None:
+            self.known_tracks = tracks or []
+            GLib.idle_add(self._discover_embedded_audio_tracks)
+
+        @self.player.property_observer("video-params")
+        def video_params_changed(_name: str, params: dict | None) -> None:
+            transfer = (params or {}).get("gamma")
+            GLib.idle_add(self._set_video_hdr, transfer in {"pq", "hlg"})
+
         @self.player.event_callback("file-loaded")
         def file_loaded(_event: object) -> None:
             GLib.idle_add(self._file_loaded)
@@ -717,6 +793,25 @@ class MpvPlayer(Gtk.Box):
         def duration_changed(_name: str, duration: float | None) -> None:
             GLib.idle_add(self._sync_duration, float(duration or 0))
 
+    def _set_video_hdr(self, hdr: bool) -> bool:
+        if self.shutting_down:
+            return GLib.SOURCE_REMOVE
+        # Stock GTK keeps its normal SDR fallback. The packaged runtime exposes
+        # an explicit per-video PQ/float16 property, never an HDR window toggle.
+        hdr = hdr and self.video.find_property("media-hdr") is not None
+        if self.video.hdr == hdr:
+            return GLib.SOURCE_REMOVE
+        self.video.hdr = hdr
+        self.video.set_property("media-hdr", hdr)
+        self.player.command_async("set", "target-trc", "pq" if hdr else "srgb")
+        self.player.command_async("set", "target-prim", "bt.2020" if hdr else "bt.709")
+        self.player.command_async("set", "target-peak", 10000 if hdr else 203)
+        self.video_offload.set_enabled(
+            Gtk.GraphicsOffloadEnabled.ENABLED if hdr else Gtk.GraphicsOffloadEnabled.DISABLED
+        )
+        self.video.queue_render()
+        return GLib.SOURCE_REMOVE
+
     def load(
         self,
         url: str,
@@ -726,8 +821,10 @@ class MpvPlayer(Gtk.Box):
         audio_tracks: list[AudioTrack] | None = None,
         chapters: list[VideoChapter] | None = None,
         default_label: str = "Auto",
+        audio_url: str = "",
     ) -> None:
         self.should_play = True
+        self.default_audio_url = audio_url
         self.default_url = url
         self.default_headers = headers or {}
         self.default_quality_label = default_label
@@ -744,7 +841,7 @@ class MpvPlayer(Gtk.Box):
         self.external_audio_ids.clear()
         self._set_options()
         self.set_loop_file(self.loop_file)
-        self._load_url(url, self.default_headers)
+        self._load_url(url, self.default_headers, self.default_audio_url)
 
     def set_variants(self, variants: list[StreamVariant]) -> None:
         """Publish qualities resolved after playback has already started."""
@@ -791,7 +888,7 @@ class MpvPlayer(Gtk.Box):
             return
         self.should_play = False
         with suppress(mpv.ShutdownError):
-            self.player.stop()
+            self.player.command_async("stop")
 
     def shutdown(self) -> None:
         if self.shutting_down:
@@ -834,7 +931,7 @@ class MpvPlayer(Gtk.Box):
         return True
 
     def resume_at(self, seconds: float) -> None:
-        if float(self.player.duration or 0) > 0:
+        if self.media_duration > 0:
             self.seek_absolute(seconds)
         else:
             self.pending_seek = max(0, seconds)
@@ -842,14 +939,14 @@ class MpvPlayer(Gtk.Box):
     def set_paused(self, paused: bool) -> None:
         if not self.shutting_down:
             with suppress(mpv.ShutdownError):
-                self.player.pause = paused
+                self.player.command_async("set", "pause", "yes" if paused else "no")
 
     def set_loop_file(self, enabled: bool) -> None:
         """Repeat the current file indefinitely via mpv's native loop-file."""
         self.loop_file = enabled
         if not self.shutting_down:
             with suppress(mpv.ShutdownError):
-                self.player["loop-file"] = "inf" if enabled else "no"
+                self.player.command_async("set", "loop-file", "inf" if enabled else "no")
 
     def set_speed(self, speed: float) -> None:
         self.sync_speed = max(0.9, min(speed, 1.1))
@@ -859,9 +956,9 @@ class MpvPlayer(Gtk.Box):
         if self.shutting_down:
             return
         with suppress(mpv.ShutdownError):
-            self.player.speed = self.playback_speed * self.sync_speed
-            self.player.cache_secs = max(
-                1, round(self.buffer_seconds * self.playback_speed)
+            self.player.command_async("set", "speed", self.playback_speed * self.sync_speed)
+            self.player.command_async(
+                "set", "cache-secs", max(1, round(self.buffer_seconds * self.playback_speed))
             )
 
     def set_playback_speed(self, speed: float) -> None:
@@ -892,7 +989,7 @@ class MpvPlayer(Gtk.Box):
         self.subtitle_offset_value.set_label(label)
         if not self.shutting_down:
             with suppress(mpv.ShutdownError):
-                self.player.sub_delay = self.subtitle_offset
+                self.player.command_async("set", "sub-delay", self.subtitle_offset)
 
     def _step_subtitle_offset(self, direction: int) -> None:
         self.set_subtitle_offset(self.subtitle_offset + direction * 0.1)
@@ -905,7 +1002,7 @@ class MpvPlayer(Gtk.Box):
         if self.shutting_down:
             return 0.0
         try:
-            return float(self.player.time_pos or 0)
+            return self.last_position
         except mpv.ShutdownError:
             return 0.0
 
@@ -914,7 +1011,7 @@ class MpvPlayer(Gtk.Box):
         if self.shutting_down:
             return 0.0
         try:
-            return float(self.player.duration or 0)
+            return self.last_duration
         except mpv.ShutdownError:
             return 0.0
 
@@ -923,7 +1020,7 @@ class MpvPlayer(Gtk.Box):
         if self.shutting_down:
             return True
         try:
-            return bool(self.player.pause)
+            return self.last_paused
         except mpv.ShutdownError:
             return True
 
@@ -1217,7 +1314,7 @@ class MpvPlayer(Gtk.Box):
             return GLib.SOURCE_REMOVE
         if self.should_play:
             with suppress(mpv.ShutdownError):
-                self.player.pause = False
+                self.player.command_async("set", "pause", "no")
         if self.pending_seek is not None:
             with suppress(mpv.ShutdownError):
                 self.player.command_async("seek", self.pending_seek, "absolute+exact")
@@ -1227,18 +1324,22 @@ class MpvPlayer(Gtk.Box):
         self._apply_caption_selection()
         return self._ready()
 
-    def set_youtube_browser(self, browser: str) -> None:
-        options = ["ignore-config=", "js-runtimes=deno"]
-        if browser:
-            options.append(f"cookies-from-browser={browser}")
-        self.player.ytdl_raw_options = ",".join(options)
-
-    def _load_url(self, url: str, headers: dict[str, str]) -> None:
+    def _load_url(self, url: str, headers: dict[str, str], audio_url: str = "") -> None:
         self.original_audio_id = ""
         self.external_audio_ids.clear()
         self.player.http_header_fields = [f"{name}: {value}" for name, value in headers.items()]
-        self.player.loadfile(url, "replace")
-        self.player.pause = False
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        # Googlevideo rejects open-ended byte ranges; keep every request bounded.
+        self.player.stream_lavf_o = (
+            {"request_size": "262144", "short_seek_size": "262144"}
+            if host.endswith(".googlevideo.com") else {}
+        )
+        self.player.audio_files = [audio_url] if audio_url else []
+        start = max(0.0, self.pending_seek or 0.0)
+        self.player.command_async("loadfile", url, "replace", -1, f"start={start}")
+        self.pending_seek = None
+        self.player.command_async("set", "pause", "no")
 
     def _set_options(self) -> None:
         self._set_quality_options()
@@ -1265,7 +1366,7 @@ class MpvPlayer(Gtk.Box):
         with suppress(mpv.ShutdownError):
             tracks = [
                 track
-                for track in (self.player.track_list or [])
+                for track in self.known_tracks
                 if track.get("type") == "audio"
             ]
             if not tracks:
@@ -1278,7 +1379,8 @@ class MpvPlayer(Gtk.Box):
                 ),
                 tracks[0],
             )
-            self.original_audio_id = str(original.get("id") or "")
+            if not self.original_audio_id:
+                self.original_audio_id = str(original.get("id") or "")
             if self.audio_tracks:
                 return
             embedded: list[AudioTrack] = []
@@ -1316,46 +1418,36 @@ class MpvPlayer(Gtk.Box):
         selected = self.audio.get_selected()
         if selected == 0:
             with suppress(mpv.ShutdownError):
-                self.player.command("set", "aid", self.original_audio_id or "auto")
+                self.player.command_async("set", "aid", self.original_audio_id or "auto")
             return
         if selected > len(self.audio_tracks):
             return
         track = self.audio_tracks[selected - 1]
         if track.url.startswith("mpv://aid/"):
             with suppress(mpv.ShutdownError):
-                self.player.command("set", "aid", track.url.rpartition("/")[2])
+                self.player.command_async("set", "aid", track.url.rpartition("/")[2])
             return
         known_id = self.external_audio_ids.get(track.url)
         if known_id:
             with suppress(mpv.ShutdownError):
-                self.player.command("set", "aid", known_id)
+                self.player.command_async("set", "aid", known_id)
             return
         if track.headers:
             self.player.http_header_fields = [
                 f"{name}: {value}" for name, value in track.headers.items()
             ]
-        with suppress(mpv.ShutdownError):
-            before = {
-                str(value.get("id"))
-                for value in (self.player.track_list or [])
-                if value.get("type") == "audio" and value.get("id") is not None
-            }
-            self.player.command(
-                "audio-add", track.url, "select", track.label, track.language
-            )
-            audio_tracks = [
-                value
-                for value in (self.player.track_list or [])
-                if value.get("type") == "audio" and value.get("id") is not None
-            ]
-            added = next(
-                (value for value in reversed(audio_tracks) if str(value["id"]) not in before),
-                next((value for value in audio_tracks if value.get("selected")), None),
-            )
-            if added:
-                track_id = str(added["id"])
-                self.external_audio_ids[track.url] = track_id
-                self.player.command("set", "aid", track_id)
+        def added(error, _result):
+            if error:
+                GLib.idle_add(self.on_error, "Could not load the selected audio track.")
+                return
+            with suppress(mpv.ShutdownError):
+                track_id = next((value.get("id") for value in (self.player.track_list or [])
+                                 if value.get("type") == "audio" and value.get("selected")), None)
+                if track_id is not None:
+                    self.external_audio_ids[track.url] = str(track_id)
+
+        self.player.command_async("audio-add", track.url, "select", track.label,
+                                  track.language, callback=added)
 
     def _set_quality_options(self) -> None:
         self.syncing_options = True
@@ -1373,12 +1465,12 @@ class MpvPlayer(Gtk.Box):
         selected = dropdown.get_selected()
         if self.syncing_options or selected > len(self.variants):
             return
-        self.pending_seek = float(self.player.time_pos or 0)
+        self.pending_seek = self.position
         if selected == 0:
-            self._load_url(self.default_url, self.default_headers)
+            self._load_url(self.default_url, self.default_headers, self.default_audio_url)
             return
         variant = self.variants[selected - 1]
-        self._load_url(variant.url, variant.headers)
+        self._load_url(variant.url, variant.headers, variant.audio_url)
 
     def _captions_changed(self, dropdown: Gtk.DropDown, _property: object) -> None:
         if self.syncing_options:
@@ -1406,11 +1498,11 @@ class MpvPlayer(Gtk.Box):
     def _apply_caption_selection(self) -> None:
         selected = self.captions.get_selected()
         if selected == 0:
-            self.player.sub_visibility = False
+            self.player.command_async("set", "sub-visibility", "no")
             self.player.command_async("set", "sid", "no")
             return
         if selected <= len(self.subtitles):
-            self.player.sub_visibility = True
+            self.player.command_async("set", "sub-visibility", "yes")
             url = self.subtitles[selected - 1].url
             if url.startswith("mpv://sid/"):
                 self.player.command_async("set", "sid", url.rpartition("/")[2])
@@ -1496,7 +1588,7 @@ class MpvPlayer(Gtk.Box):
         self.mute_button.set_icon_name(icon)
         self.mute_button.set_tooltip_text(tooltip)
         with suppress(mpv.ShutdownError):
-            self.player.volume = value
+            self.player.command_async("set", "volume", value)
 
     def _volume_change_value(
         self, scale: Gtk.Scale, _scroll: Gtk.ScrollType, value: float
@@ -1513,6 +1605,7 @@ class MpvPlayer(Gtk.Box):
             self.volume.set_value(max(1, self.last_audible_volume))
 
     def _sync_pause(self, paused: bool) -> bool:
+        self.last_paused = paused
         if self.shutting_down:
             return GLib.SOURCE_REMOVE
         self.play_button.set_icon_name(
@@ -1522,6 +1615,7 @@ class MpvPlayer(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _sync_position(self, position: float) -> bool:
+        self.last_position = position
         if self.shutting_down:
             return GLib.SOURCE_REMOVE
         self.progress.set_value(position)
@@ -1531,6 +1625,7 @@ class MpvPlayer(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _sync_duration(self, duration: float) -> bool:
+        self.last_duration = duration
         if self.shutting_down:
             return GLib.SOURCE_REMOVE
         self.progress.set_range(0, max(duration, 1))

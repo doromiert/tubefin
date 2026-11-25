@@ -304,6 +304,8 @@ class PrebufferedStream:
             description=self.stream.description,
             published_date=self.stream.published_date,
             chapters=self.stream.chapters,
+            audio_url=self.stream.audio_url,
+            headers=self.stream.headers,
         )
 
     @property

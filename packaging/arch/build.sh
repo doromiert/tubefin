@@ -13,12 +13,12 @@ install -d "$package_root/usr/lib/tubefin"
 cp -a "$repository_root/src/tubefin" "$package_root/usr/lib/tubefin/"
 find "$package_root/usr/lib/tubefin" -type d -name __pycache__ -prune -exec rm -rf {} +
 install -Dm755 "$repository_root/packaging/arch/tubefin" "$package_root/usr/bin/tubefin"
-install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.desktop" \
-  "$package_root/usr/share/applications/io.github.doromiert.TubeFin.desktop"
-install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.metainfo.xml" \
-  "$package_root/usr/share/metainfo/io.github.doromiert.TubeFin.metainfo.xml"
-install -Dm644 "$repository_root/data/io.github.doromiert.TubeFin.svg" \
-  "$package_root/usr/share/icons/hicolor/scalable/apps/io.github.doromiert.TubeFin.svg"
+install -Dm644 "$repository_root/data/com.neg-zero.Tubefin.desktop" \
+  "$package_root/usr/share/applications/com.neg-zero.Tubefin.desktop"
+install -Dm644 "$repository_root/data/com.neg-zero.Tubefin.metainfo.xml" \
+  "$package_root/usr/share/metainfo/com.neg-zero.Tubefin.metainfo.xml"
+install -Dm644 "$repository_root/data/com.neg-zero.Tubefin.svg" \
+  "$package_root/usr/share/icons/hicolor/scalable/apps/com.neg-zero.Tubefin.svg"
 
 size=$(du -sb "$package_root" | cut -f1)
 cat > "$package_root/.PKGINFO" <<EOF
@@ -46,6 +46,8 @@ depend = mpv
 depend = python
 depend = python-gobject
 depend = python-mpv
+depend = python-pynacl
+depend = webkitgtk-6.0
 depend = python-websocket-client
 depend = yt-dlp
 EOF

@@ -31,7 +31,7 @@ jobs:
       - name: Install system runtime deps
         run: |
           sudo apt-get update
-          sudo apt-get install --yes python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+          sudo apt-get install --yes python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
 
       - name: Build AppImage
         env:

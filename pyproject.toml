@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tubefin"
-version = "1.6.4"
+version = "1.7.3"
 description = "A native YouTube and Jellyfin client for GNOME"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
 authors = [{ name = "TubeFin contributors" }]
-dependencies = ["websocket-client>=1.8"]
+dependencies = ["websocket-client>=1.8", "PyNaCl>=1.5"]
 
 [project.scripts]
 tubefin = "tubefin.main:main"
